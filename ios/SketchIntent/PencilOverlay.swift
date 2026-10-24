@@ -95,8 +95,8 @@ final class SketchCanvas: ObservableObject {
 /// Black pen strokes over the Mac picture, with a white halo so a line stays
 /// visible on light and dark desktops. When a pen stroke ends it is smoothed
 /// lightly, and the halo is redrawn from that smoothed ink. Strokes and voice
-/// notes stay on the iPad. When Control the Mac with Pencil is on, the Pencil
-/// clicks and drags on the Mac instead of drawing or recording.
+/// notes stay on the iPad. The pointer tool uses the Pencil as one finger on the Mac.
+/// When Control the Mac with Pencil is on, every tool does the same instead of drawing or recording.
 struct PencilOverlay: UIViewRepresentable {
     var spaceID: String?
     var canvas: SketchCanvas

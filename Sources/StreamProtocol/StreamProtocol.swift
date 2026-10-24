@@ -72,12 +72,22 @@ public enum PointerPhase: UInt8, Equatable {
     case up = 3
 }
 
+/// How one Pencil contact should drive the Mac.
+/// A missing byte on the wire is `button`, so older clients keep click-and-drag.
+public enum PointerContact: UInt8, Equatable {
+    /// Left-button down, drag, and up. The explicit mouse path.
+    case button = 1
+    /// One finger, as TN3212 emulates a Sidecar touch for apps that are not touch-native.
+    case finger = 2
+}
+
 /// Something the iPad asks the Mac to do. The Mac is the only side that reads these.
 /// Kind byte 1 is `switchDesktop` (`[1, direction]`). Kind byte 2 is `pointer`, so older packets still decode.
 public enum RemoteInput: Equatable {
     case switchDesktop(DesktopDirection)
     /// Pencil point in captured-frame pixels. `x` and `y` are inside the video frame, not the iPad view.
-    case pointer(PointerPhase, x: UInt16, y: UInt16)
+    /// One packet is one contact. `button` click-drags; `finger` is the Sidecar-style pan.
+    case pointer(PointerPhase, x: UInt16, y: UInt16, contact: PointerContact = .button)
 }
 
 /// Maps a point in the iPad's video view into captured-frame pixels.
@@ -301,10 +311,11 @@ private extension RemoteInput {
         switch self {
         case .switchDesktop(let direction):
             return Data([1, direction.rawValue])
-        case .pointer(let phase, let x, let y):
+        case .pointer(let phase, let x, let y, let contact):
             var payload = Data([2, phase.rawValue])
             payload.appendBE(x)
             payload.appendBE(y)
+            payload.append(contact.rawValue)
             return payload
         }
     }
@@ -316,10 +327,17 @@ private extension RemoteInput {
             guard payload.count == 2, let direction = DesktopDirection(rawValue: payload[1]) else { return nil }
             self = .switchDesktop(direction)
         case 2:
-            guard payload.count == 6, let phase = PointerPhase(rawValue: payload[1]) else { return nil }
+            guard payload.count == 6 || payload.count == 7, let phase = PointerPhase(rawValue: payload[1]) else { return nil }
             let x = UInt16(payload[2]) << 8 | UInt16(payload[3])
             let y = UInt16(payload[4]) << 8 | UInt16(payload[5])
-            self = .pointer(phase, x: x, y: y)
+            let contact: PointerContact
+            if payload.count == 6 {
+                contact = .button
+            } else {
+                guard let decoded = PointerContact(rawValue: payload[6]) else { return nil }
+                contact = decoded
+            }
+            self = .pointer(phase, x: x, y: y, contact: contact)
         default:
             return nil
         }

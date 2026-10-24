@@ -53,7 +53,10 @@ struct ContentView: View {
                 frameWidth: client.frameWidth,
                 frameHeight: client.frameHeight,
                 onPencilPointer: { phase, x, y in
-                    client.send(.pointer(phase, x: x, y: y))
+                    // The pointer tool is one finger: a tap clicks, a drag scrolls, a hold right-clicks.
+                    // Control the Mac with Pencil uses that same finger path for every other tool.
+                    let contact: PointerContact = (pencilControlsMac || tool == .pointer) ? .finger : .button
+                    client.send(.pointer(phase, x: x, y: y, contact: contact))
                 },
                 onTap: { canvasTapped() },
                 onFingerSwipe: { swipe in
@@ -278,9 +281,9 @@ private struct SettingsSheet: View {
 
     private var pencilDetail: String {
         if pencilControlsMac {
-            return "On, the Pencil clicks and drags on the Mac instead of drawing. The pen, eraser, and voice notes apply only while this is off."
+            return "On, the Pencil is a finger on the Mac for every tool, including the pointer: a tap clicks, a drag scrolls, and a hold right-clicks. Drawing and voice notes stay off while this is on."
         }
-        return "Off, the Pencil draws, and the voice tool records while the Pencil is held. The pen, eraser, and voice notes apply only while this is off."
+        return "Off, the Pencil draws, and the voice tool records while the Pencil is held. The pointer tool is still a finger: a tap clicks, a drag scrolls, and a hold right-clicks."
     }
 }
 

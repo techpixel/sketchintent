@@ -318,6 +318,106 @@ final class ServerTests: XCTestCase {
             throw XCTSkip("usbmuxd is not reachable: \(error)")
         }
     }
+
+    func testFingerTapIsAClickAndNotAScroll() {
+        var tracker = FingerContactTracker()
+        let origin = CGPoint(x: 10, y: 20)
+        XCTAssertEqual(tracker.handle(phase: .down, point: origin, time: 0), [
+            .move(origin),
+            .directTouch(DirectTouchEvent(point: origin, phase: .began))
+        ])
+        let wobble = CGPoint(x: 12, y: 21)
+        XCTAssertEqual(tracker.handle(phase: .move, point: wobble, time: 0.1), [])
+        XCTAssertEqual(tracker.fireLongPress(time: 0.4), [])
+        XCTAssertEqual(tracker.handle(phase: .up, point: wobble, time: 0.3), [
+            .leftClick(origin),
+            .directTouch(DirectTouchEvent(point: wobble, phase: .ended))
+        ])
+        XCTAssertNil(tracker.longPressDeadline)
+    }
+
+    func testFingerDragIsOneScrollAndNotAButton() {
+        var tracker = FingerContactTracker()
+        let origin = CGPoint(x: 100, y: 80)
+        _ = tracker.handle(phase: .down, point: origin, time: 0)
+        let moved = CGPoint(x: origin.x + 30, y: origin.y - 10)
+        XCTAssertEqual(
+            tracker.handle(phase: .move, point: moved, time: 0.1),
+            [
+                .scroll(ScrollWheelPayload(point: origin, deltaX: 30, deltaY: -10, phase: .began)),
+                .directTouch(DirectTouchEvent(point: moved, phase: .changed))
+            ]
+        )
+        XCTAssertNil(tracker.longPressDeadline)
+        XCTAssertEqual(tracker.fireLongPress(time: 2), [])
+        let next = CGPoint(x: moved.x + 0.4, y: moved.y)
+        XCTAssertEqual(tracker.handle(phase: .move, point: next, time: 0.2), [])
+        let further = CGPoint(x: moved.x + 1.2, y: moved.y + 4)
+        XCTAssertEqual(
+            tracker.handle(phase: .move, point: further, time: 0.3),
+            [
+                .scroll(ScrollWheelPayload(point: origin, deltaX: 1, deltaY: 4, phase: .changed)),
+                .directTouch(DirectTouchEvent(point: further, phase: .changed))
+            ]
+        )
+        XCTAssertEqual(
+            tracker.handle(phase: .up, point: further, time: 0.4),
+            [
+                .scroll(ScrollWheelPayload(point: origin, deltaX: 0, deltaY: 0, phase: .ended)),
+                .directTouch(DirectTouchEvent(point: further, phase: .ended))
+            ]
+        )
+    }
+
+    func testFingerHoldIsARightClickThenARightDrag() {
+        var tracker = FingerContactTracker()
+        let origin = CGPoint(x: 4, y: 9)
+        _ = tracker.handle(phase: .down, point: origin, time: 5)
+        XCTAssertEqual(tracker.longPressDeadline, 5.5)
+        XCTAssertEqual(tracker.fireLongPress(time: 5.5), [
+            .rightDown(origin),
+            .directTouch(DirectTouchEvent(point: origin, phase: .changed))
+        ])
+        let dragged = CGPoint(x: 18, y: 9)
+        XCTAssertEqual(tracker.handle(phase: .move, point: dragged, time: 5.7), [
+            .rightDrag(dragged),
+            .directTouch(DirectTouchEvent(point: dragged, phase: .changed))
+        ])
+        XCTAssertEqual(tracker.handle(phase: .up, point: dragged, time: 5.8), [
+            .rightUp(dragged),
+            .directTouch(DirectTouchEvent(point: dragged, phase: .ended))
+        ])
+    }
+
+    func testScrollWheelPayloadUsesContinuousPixelPhase() throws {
+        let payload = ScrollWheelPayload(
+            point: CGPoint(x: 12.5, y: 34),
+            deltaX: -3,
+            deltaY: 8,
+            phase: .began
+        )
+        let event = try XCTUnwrap(payload.makeEvent())
+        XCTAssertEqual(event.type, .scrollWheel)
+        XCTAssertEqual(event.location.x, 12.5, accuracy: 0.01)
+        XCTAssertEqual(event.location.y, 34, accuracy: 0.01)
+        XCTAssertEqual(
+            event.getIntegerValueField(.scrollWheelEventScrollPhase),
+            Int64(CGScrollPhase.began.rawValue)
+        )
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventIsContinuous), 1)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventMomentumPhase), 0)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1), 8)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2), -3)
+        XCTAssertNotEqual(event.type, .leftMouseDragged)
+    }
+
+    func testDirectTouchEventUsesTheTouchTypeAndSubtype() throws {
+        let event = try XCTUnwrap(DirectTouchEvent(point: CGPoint(x: 8, y: 9), phase: .began).makeEvent())
+        XCTAssertEqual(event.type, DirectTouchEvent.eventType)
+        XCTAssertEqual(event.type.rawValue, 37)
+        XCTAssertEqual(event.location.x, 8, accuracy: 0.01)
+        XCTAssertEqual(event.location.y, 9, accuracy: 0.01)
+    }
 }
 
 private func spaceRecord(id: UInt64, uuid: String?, type: Int = 0) -> [String: Any] {

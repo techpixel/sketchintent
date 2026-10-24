@@ -61,8 +61,8 @@ final class StreamProtocolTests: XCTestCase {
     func testPointerRoundTrip() throws {
         let down = StreamFraming.encode(.input(.pointer(.down, x: 0x0102, y: 0x0304)))
         XCTAssertEqual(Array(down), [
-            0x00, 0x00, 0x00, 0x07,
-            5, 2, PointerPhase.down.rawValue, 0x01, 0x02, 0x03, 0x04
+            0x00, 0x00, 0x00, 0x08,
+            5, 2, PointerPhase.down.rawValue, 0x01, 0x02, 0x03, 0x04, PointerContact.button.rawValue
         ])
         let packet = down
             + StreamFraming.encode(.input(.pointer(.move, x: 65535, y: 0)))
@@ -88,6 +88,33 @@ final class StreamProtocolTests: XCTestCase {
         packet.append(1)
         packet.append(StreamFraming.encode(.input(.switchDesktop(.left))))
         XCTAssertEqual(try StreamParser().append(packet), [.input(.switchDesktop(.left))])
+    }
+
+    func testFingerContactRoundTripAndLegacyButtonPacket() throws {
+        let finger = StreamFraming.encode(.input(.pointer(.move, x: 4, y: 5, contact: .finger)))
+        XCTAssertEqual(Array(finger.suffix(7)), [
+            2, PointerPhase.move.rawValue, 0x00, 0x04, 0x00, 0x05, PointerContact.finger.rawValue
+        ])
+        XCTAssertEqual(
+            try StreamParser().append(finger),
+            [.input(.pointer(.move, x: 4, y: 5, contact: .finger))]
+        )
+
+        var length = UInt32(7).bigEndian
+        var legacy = Data()
+        withUnsafeBytes(of: &length) { legacy.append(contentsOf: $0) }
+        legacy.append(contentsOf: [5, 2, PointerPhase.down.rawValue, 0x00, 0x0a, 0x00, 0x0b])
+        XCTAssertEqual(
+            try StreamParser().append(legacy),
+            [.input(.pointer(.down, x: 10, y: 11, contact: .button))]
+        )
+
+        var badLength = UInt32(8).bigEndian
+        var bad = Data()
+        withUnsafeBytes(of: &badLength) { bad.append(contentsOf: $0) }
+        bad.append(contentsOf: [5, 2, PointerPhase.up.rawValue, 0, 1, 0, 2, 9])
+        bad.append(StreamFraming.encode(.heartbeat))
+        XCTAssertEqual(try StreamParser().append(bad), [.heartbeat])
     }
 
     func testLetterboxedPictureMapsAndBlackBarsAreIgnored() {

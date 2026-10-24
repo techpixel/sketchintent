@@ -109,8 +109,8 @@ public final class Server {
             switch input {
             case .switchDesktop(let direction):
                 DesktopSwitcher.switchDesktop(direction)
-            case .pointer(let phase, let x, let y):
-                pointer.post(phase: phase, x: x, y: y)
+            case .pointer(let phase, let x, let y, let contact):
+                pointer.post(phase: phase, x: x, y: y, contact: contact)
             }
         }
         hub.add(session)
