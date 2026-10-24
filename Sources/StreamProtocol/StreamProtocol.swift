@@ -65,9 +65,70 @@ public enum DesktopDirection: UInt8, Equatable {
     case right = 2
 }
 
+/// Phase of a Pencil pointer on the streamed picture.
+public enum PointerPhase: UInt8, Equatable {
+    case down = 1
+    case move = 2
+    case up = 3
+}
+
 /// Something the iPad asks the Mac to do. The Mac is the only side that reads these.
+/// Kind byte 1 is `switchDesktop` (`[1, direction]`). Kind byte 2 is `pointer`, so older packets still decode.
 public enum RemoteInput: Equatable {
     case switchDesktop(DesktopDirection)
+    /// Pencil point in captured-frame pixels. `x` and `y` are inside the video frame, not the iPad view.
+    case pointer(PointerPhase, x: UInt16, y: UInt16)
+}
+
+/// Maps a point in the iPad's video view into captured-frame pixels.
+/// The picture uses the same aspect fit as `AVSampleBufferDisplayLayer` videoGravity `.resizeAspect`.
+public enum FrameCoordinates {
+    public struct Rect: Equatable {
+        public var x: Double
+        public var y: Double
+        public var width: Double
+        public var height: Double
+    }
+
+    /// Letterboxed (or pillarboxed) picture inside the view. The origin is the view's top left.
+    public static func pictureRect(viewWidth: Double, viewHeight: Double, frameWidth: Int, frameHeight: Int) -> Rect? {
+        guard viewWidth > 0, viewHeight > 0, frameWidth > 0, frameHeight > 0 else { return nil }
+        let frameAspect = Double(frameWidth) / Double(frameHeight)
+        let viewAspect = viewWidth / viewHeight
+        if viewAspect > frameAspect {
+            let width = viewHeight * frameAspect
+            return Rect(x: (viewWidth - width) / 2, y: 0, width: width, height: viewHeight)
+        }
+        let height = viewWidth / frameAspect
+        return Rect(x: 0, y: (viewHeight - height) / 2, width: viewWidth, height: height)
+    }
+
+    /// Nil when the point is in a black bar, or when the sizes are empty.
+    public static func pixel(
+        viewX: Double,
+        viewY: Double,
+        viewWidth: Double,
+        viewHeight: Double,
+        frameWidth: Int,
+        frameHeight: Int
+    ) -> (x: UInt16, y: UInt16)? {
+        guard let picture = pictureRect(
+            viewWidth: viewWidth,
+            viewHeight: viewHeight,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        ), picture.width > 0, picture.height > 0 else { return nil }
+        let dx = viewX - picture.x
+        let dy = viewY - picture.y
+        guard dx >= 0, dy >= 0, dx <= picture.width, dy <= picture.height else { return nil }
+        let nx = dx / picture.width
+        let ny = dy / picture.height
+        let maxX = min(frameWidth, Int(UInt16.max) + 1) - 1
+        let maxY = min(frameHeight, Int(UInt16.max) + 1) - 1
+        let x = min(max(Int(nx * Double(frameWidth)), 0), maxX)
+        let y = min(max(Int(ny * Double(frameHeight)), 0), maxY)
+        return (UInt16(x), UInt16(y))
+    }
 }
 
 public enum StreamMessage: Equatable {
@@ -240,14 +301,28 @@ private extension RemoteInput {
         switch self {
         case .switchDesktop(let direction):
             return Data([1, direction.rawValue])
+        case .pointer(let phase, let x, let y):
+            var payload = Data([2, phase.rawValue])
+            payload.appendBE(x)
+            payload.appendBE(y)
+            return payload
         }
     }
 
     init?(payload: Data) {
-        guard payload.count == 2, payload[0] == 1, let direction = DesktopDirection(rawValue: payload[1]) else {
+        guard let kind = payload.first else { return nil }
+        switch kind {
+        case 1:
+            guard payload.count == 2, let direction = DesktopDirection(rawValue: payload[1]) else { return nil }
+            self = .switchDesktop(direction)
+        case 2:
+            guard payload.count == 6, let phase = PointerPhase(rawValue: payload[1]) else { return nil }
+            let x = UInt16(payload[2]) << 8 | UInt16(payload[3])
+            let y = UInt16(payload[4]) << 8 | UInt16(payload[5])
+            self = .pointer(phase, x: x, y: y)
+        default:
             return nil
         }
-        self = .switchDesktop(direction)
     }
 }
 

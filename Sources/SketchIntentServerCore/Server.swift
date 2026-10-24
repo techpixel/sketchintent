@@ -5,6 +5,7 @@ public final class Server {
     private let config: ServerConfig
     private let hub: FrameHub
     private let capturer: ScreenCapturer
+    private let pointer: MacPointer
     private let listener = TCPListener()
     private let advertiser = ServiceAdvertiser()
     private var usb: USBWatcher?
@@ -18,6 +19,7 @@ public final class Server {
             ?? ProcessInfo.processInfo.hostName
         hub = FrameHub(hostName: host.hasSuffix(".local") ? String(host.dropLast(".local".count)) : host)
         capturer = ScreenCapturer(fps: config.fps)
+        pointer = MacPointer(displayIndex: config.displayIndex)
     }
 
     public func run() throws {
@@ -38,8 +40,12 @@ public final class Server {
         capturer.onVideo = { [hub] config, frame in
             hub.broadcast(config: config, frame: frame)
         }
-        capturer.onSize = { [hub] width, height in
+        capturer.onDisplay = { [pointer] id in
+            pointer.noteDisplay(id)
+        }
+        capturer.onSize = { [hub, pointer] width, height in
             hub.updateDisplay(width: width, height: height)
+            pointer.noteFrame(width: width, height: height)
             print("[sketchintent] Display \(width)×\(height).")
         }
 
@@ -47,14 +53,14 @@ public final class Server {
             hub.updateSpace(id)
         }
 
-        try listener.start(port: config.tcpPort) { [hub] fd in
-            Server.attach(fd: fd, label: "tcp", hub: hub)
+        try listener.start(port: config.tcpPort) { [hub, pointer] fd in
+            Server.attach(fd: fd, label: "tcp", hub: hub, pointer: pointer)
         }
 
         let watcher = USBWatcher(port: config.usbPort)
         usb = watcher
-        watcher.onSession = { [hub] fd, label, onDisconnect in
-            Server.attach(fd: fd, label: label, hub: hub, onDisconnect: onDisconnect)
+        watcher.onSession = { [hub, pointer] fd, label, onDisconnect in
+            Server.attach(fd: fd, label: label, hub: hub, pointer: pointer, onDisconnect: onDisconnect)
         }
         watcher.start()
         advertiser.start(name: hostName, port: Int(config.tcpPort))
@@ -86,7 +92,13 @@ public final class Server {
         }
     }
 
-    private static func attach(fd: Int32, label: String, hub: FrameHub, onDisconnect: (() -> Void)? = nil) {
+    private static func attach(
+        fd: Int32,
+        label: String,
+        hub: FrameHub,
+        pointer: MacPointer,
+        onDisconnect: (() -> Void)? = nil
+    ) {
         let session = StreamSession(fd: fd, label: label)
         print("[sketchintent] Client connected (\(label)).")
         session.onStop = {
@@ -97,6 +109,8 @@ public final class Server {
             switch input {
             case .switchDesktop(let direction):
                 DesktopSwitcher.switchDesktop(direction)
+            case .pointer(let phase, let x, let y):
+                pointer.post(phase: phase, x: x, y: y)
             }
         }
         hub.add(session)

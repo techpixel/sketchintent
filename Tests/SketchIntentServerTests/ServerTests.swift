@@ -136,6 +136,42 @@ final class ServerTests: XCTestCase {
         session.stop()
     }
 
+    func testPointerPixelsDivideByDisplayScale() {
+        let bounds = CGRect(x: -100, y: 40, width: 1000, height: 500)
+        let point = PointerGeometry.globalPoint(
+            x: 1000, y: 500,
+            frameWidth: 2000, frameHeight: 1000,
+            bounds: bounds,
+            pixelWidth: 2000, pixelHeight: 1000
+        )
+        XCTAssertEqual(point?.x ?? 0, 400, accuracy: 0.001)
+        XCTAssertEqual(point?.y ?? 0, 290, accuracy: 0.001)
+    }
+
+    func testDownscaledFrameStillCoversTheDisplay() {
+        let bounds = CGRect(x: 0, y: 0, width: 1000, height: 500)
+        let point = PointerGeometry.globalPoint(
+            x: 500, y: 250,
+            frameWidth: 1000, frameHeight: 500,
+            bounds: bounds,
+            pixelWidth: 2000, pixelHeight: 1000
+        )
+        XCTAssertEqual(point?.x ?? 0, 500, accuracy: 0.001)
+        XCTAssertEqual(point?.y ?? 0, 250, accuracy: 0.001)
+    }
+
+    func testPointerUsesBoundsWhenPixelSizeIsUnknown() {
+        let bounds = CGRect(x: 10, y: 20, width: 200, height: 100)
+        let point = PointerGeometry.globalPoint(
+            x: 50, y: 25,
+            frameWidth: 100, frameHeight: 50,
+            bounds: bounds,
+            pixelWidth: 0, pixelHeight: 0
+        )
+        XCTAssertEqual(point?.x ?? 0, 110, accuracy: 0.001)
+        XCTAssertEqual(point?.y ?? 0, 70, accuracy: 0.001)
+    }
+
     func testDesktopSwitchMovesToTheNeighboringSpace() {
         let layout = DesktopLayout(display: "Main", spaceIDs: [4, 252, 648], currentIndex: 1, spaceID: "middle")
         XCTAssertEqual(DesktopSwitcher.neighbor(of: .right, in: layout), 648)
