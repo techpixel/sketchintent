@@ -27,6 +27,7 @@ struct ContentView: View {
     @State private var showsToolDial = false
     @State private var showsChrome = true
     @State private var showsSettings = false
+    @State private var showsTrackpad = false
     @State private var sharedSketch: SharedSketch?
     @State private var desktopHint: DesktopDirection?
     @State private var hintToken = 0
@@ -59,6 +60,7 @@ struct ContentView: View {
                     client.send(.pointer(phase, x: x, y: y, contact: contact))
                 },
                 onTap: { canvasTapped() },
+                onDoubleTap: { fingerDoubleTapped() },
                 onFingerSwipe: { swipe in
                     switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
                 },
@@ -79,6 +81,19 @@ struct ContentView: View {
                 .padding(.trailing, 72)
                 .padding(.top, 12)
                 .allowsHitTesting(false)
+            }
+
+            if showsTrackpad && client.hasFrame {
+                VirtualTrackpad(
+                    onScroll: { dx, dy, phase in
+                        client.send(.trackpadScroll(dx: dx, dy: dy, phase: phase))
+                    },
+                    onClick: { button, phase in
+                        client.send(.trackpadClick(button, phase))
+                    }
+                )
+                .ignoresSafeArea()
+                .transition(.opacity)
             }
 
             if let desktopHint {
@@ -108,6 +123,7 @@ struct ContentView: View {
         .statusBarHidden(client.hasFrame && !showsChrome)
         .persistentSystemOverlays(client.hasFrame && !showsChrome ? .hidden : .visible)
         .animation(.easeOut(duration: 0.18), value: desktopHint)
+        .animation(.easeOut(duration: 0.16), value: showsTrackpad)
         .sheet(isPresented: $showsSettings) {
             SettingsSheet()
         }
@@ -121,6 +137,9 @@ struct ContentView: View {
         }
         .onChange(of: client.hasFrame) { _, hasFrame in
             UIApplication.shared.isIdleTimerDisabled = hasFrame
+            if !hasFrame {
+                showsTrackpad = false
+            }
         }
     }
 
@@ -130,12 +149,24 @@ struct ContentView: View {
     }
 
     /// One-finger tap. Shows or hides the status badge. While the tool dial is up,
-    /// the same tap also dismisses the dial. It is not a second gesture.
+    /// the same tap also dismisses the dial. While the trackpad is up, that tap
+    /// only dismisses the trackpad. A finger double-tap is a different gesture.
     private func canvasTapped() {
+        if showsTrackpad {
+            showsTrackpad = false
+            return
+        }
         if showsToolDial {
             showsToolDial = false
         }
         showsChrome.toggle()
+    }
+
+    /// Finger double-tap on the stream. The Pencil barrel double-tap does not come here,
+    /// and this still shows the pad while the Pencil is drawing, erasing, or recording.
+    private func fingerDoubleTapped() {
+        guard client.hasFrame else { return }
+        showsTrackpad = true
     }
 
     /// Apple Pencil barrel double-tap. The first one shows the tool dial.

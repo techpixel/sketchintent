@@ -16,6 +16,7 @@
 		F00000000000000000000021 /* PencilOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000020 /* PencilOverlay.swift */; };
 		F00000000000000000000023 /* MarkupChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000022 /* MarkupChrome.swift */; };
 		F00000000000000000000025 /* VoiceAnnotation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000024 /* VoiceAnnotation.swift */; };
+		F00000000000000000000027 /* VirtualTrackpad.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000026 /* VirtualTrackpad.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -30,6 +31,7 @@
 		F00000000000000000000020 /* PencilOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilOverlay.swift; sourceTree = "<group>"; };
 		F00000000000000000000022 /* MarkupChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkupChrome.swift; sourceTree = "<group>"; };
 		F00000000000000000000024 /* VoiceAnnotation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceAnnotation.swift; sourceTree = "<group>"; };
+		F00000000000000000000026 /* VirtualTrackpad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VirtualTrackpad.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -71,6 +73,7 @@
 				F00000000000000000000020 /* PencilOverlay.swift */,
 				F00000000000000000000022 /* MarkupChrome.swift */,
 				F00000000000000000000024 /* VoiceAnnotation.swift */,
+				F00000000000000000000026 /* VirtualTrackpad.swift */,
 				F00000000000000000000019 /* Assets.xcassets */,
 			);
 			path = SketchIntent;
@@ -160,6 +163,7 @@
 				F00000000000000000000021 /* PencilOverlay.swift in Sources */,
 				F00000000000000000000023 /* MarkupChrome.swift in Sources */,
 				F00000000000000000000025 /* VoiceAnnotation.swift in Sources */,
+				F00000000000000000000027 /* VirtualTrackpad.swift in Sources */,
 				F00000000000000000000008 /* StreamProtocol.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -81,13 +81,35 @@ public enum PointerContact: UInt8, Equatable {
     case finger = 2
 }
 
+/// Phase of one continuous trackpad scroll. These are not `CGScrollPhase` raw values:
+/// ended is 4 there, so the wire uses its own small set and the Mac maps it.
+public enum TrackpadScrollPhase: UInt8, Equatable {
+    case began = 1
+    case changed = 2
+    case ended = 3
+    case cancelled = 4
+}
+
+/// Which mouse button a virtual-trackpad cell presses. The click lands on the
+/// Mac cursor. The pad is not a point on the streamed picture.
+public enum TrackpadButton: UInt8, Equatable {
+    case left = 1
+    case right = 2
+}
+
 /// Something the iPad asks the Mac to do. The Mac is the only side that reads these.
 /// Kind byte 1 is `switchDesktop` (`[1, direction]`). Kind byte 2 is `pointer`, so older packets still decode.
+/// Kind byte 3 is a trackpad scroll. Kind byte 4 is a trackpad click.
 public enum RemoteInput: Equatable {
     case switchDesktop(DesktopDirection)
     /// Pencil point in captured-frame pixels. `x` and `y` are inside the video frame, not the iPad view.
     /// One packet is one contact. `button` click-drags; `finger` is the Sidecar-style pan.
     case pointer(PointerPhase, x: UInt16, y: UInt16, contact: PointerContact = .button)
+    /// One-finger travel on the virtual trackpad, in pixels. Positive `dx` is right.
+    /// Positive `dy` is down. This does not move the pointer to a picture point.
+    case trackpadScroll(dx: Int16, dy: Int16, phase: TrackpadScrollPhase)
+    /// Left or right button at the current cursor. `move` is not a click phase.
+    case trackpadClick(TrackpadButton, PointerPhase)
 }
 
 /// Maps a point in the iPad's video view into captured-frame pixels.
@@ -317,6 +339,13 @@ private extension RemoteInput {
             payload.appendBE(y)
             payload.append(contact.rawValue)
             return payload
+        case .trackpadScroll(let dx, let dy, let phase):
+            var payload = Data([3, phase.rawValue])
+            payload.appendBE(dx)
+            payload.appendBE(dy)
+            return payload
+        case .trackpadClick(let button, let phase):
+            return Data([4, button.rawValue, phase.rawValue])
         }
     }
 
@@ -338,6 +367,17 @@ private extension RemoteInput {
                 contact = decoded
             }
             self = .pointer(phase, x: x, y: y, contact: contact)
+        case 3:
+            guard payload.count == 6, let phase = TrackpadScrollPhase(rawValue: payload[1]) else { return nil }
+            let dx = Int16(bitPattern: UInt16(payload[2]) << 8 | UInt16(payload[3]))
+            let dy = Int16(bitPattern: UInt16(payload[4]) << 8 | UInt16(payload[5]))
+            self = .trackpadScroll(dx: dx, dy: dy, phase: phase)
+        case 4:
+            guard payload.count == 3,
+                  let button = TrackpadButton(rawValue: payload[1]),
+                  let phase = PointerPhase(rawValue: payload[2]),
+                  phase != .move else { return nil }
+            self = .trackpadClick(button, phase)
         default:
             return nil
         }

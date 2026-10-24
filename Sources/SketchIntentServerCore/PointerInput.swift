@@ -228,6 +228,18 @@ struct FingerContactTracker {
     }
 }
 
+extension TrackpadScrollPhase {
+    /// `kCGScrollPhaseEnded` is 4, so the wire value cannot be passed through raw.
+    var cgScrollPhase: CGScrollPhase {
+        switch self {
+        case .began: return .began
+        case .changed: return .changed
+        case .ended: return .ended
+        case .cancelled: return .cancelled
+        }
+    }
+}
+
 /// Posts pointer events for Pencil messages. Desktop switching does not come through here.
 ///
 /// `contact == .button` stays a left-button drag so sliders, window moves, and
@@ -245,6 +257,9 @@ final class MacPointer {
     private var buttonDown = false
     private var lastPoint: CGPoint?
     private var finger = FingerContactTracker()
+    /// Cursor location where the open virtual-trackpad scroll began. Later samples
+    /// stay there so the gesture keeps hitting the view that received `began`.
+    private var trackpadScrollOrigin: CGPoint?
     private var longPressTimer: DispatchSourceTimer?
     private var longPressToken: UInt = 0
     private let longPressQueue = DispatchQueue(label: "sketchintent.pointer.longpress")
@@ -278,6 +293,78 @@ final class MacPointer {
         let events = lockedEvents(phase: phase, x: x, y: y, contact: contact)
         lock.unlock()
         deliver(events)
+    }
+
+    /// Relative trackpad drag. Pixel scroll at the cursor, not a mapped picture point,
+    /// and not a second finger-contact tracker. Positive `dy` is down, as on the pad.
+    func postTrackpadScroll(dx: Int16, dy: Int16, phase: TrackpadScrollPhase) {
+        lock.lock()
+        guard accessibilityTrusted() else {
+            lock.unlock()
+            return
+        }
+        let source = CGEventSource(stateID: .hidSystemState)
+        let cursor = CGEvent(source: source)?.location
+        let point: CGPoint
+        switch phase {
+        case .began:
+            guard let cursor else {
+                lock.unlock()
+                return
+            }
+            trackpadScrollOrigin = cursor
+            point = cursor
+        case .changed, .ended, .cancelled:
+            if trackpadScrollOrigin == nil {
+                trackpadScrollOrigin = cursor
+            }
+            guard let origin = trackpadScrollOrigin else {
+                lock.unlock()
+                return
+            }
+            point = origin
+            if phase == .ended || phase == .cancelled {
+                trackpadScrollOrigin = nil
+            }
+        }
+        lock.unlock()
+        ScrollWheelPayload(
+            point: point,
+            deltaX: Int32(dx),
+            deltaY: Int32(dy),
+            phase: phase.cgScrollPhase
+        ).makeEvent(source: source)?.post(tap: .cghidEventTap)
+    }
+
+    /// Left or right click where the cursor already is. A tap is down then up.
+    func postTrackpadClick(button: TrackpadButton, phase: PointerPhase) {
+        lock.lock()
+        guard accessibilityTrusted() else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let cursor = CGEvent(source: source)?.location else { return }
+        let type: CGEventType
+        let mouse: CGMouseButton
+        switch (button, phase) {
+        case (.left, .down):
+            type = .leftMouseDown
+            mouse = .left
+        case (.left, .up):
+            type = .leftMouseUp
+            mouse = .left
+        case (.right, .down):
+            type = .rightMouseDown
+            mouse = .right
+        case (.right, .up):
+            type = .rightMouseUp
+            mouse = .right
+        case (_, .move):
+            return
+        }
+        postMouse(type, point: cursor, button: mouse, source: source, touch: false)
     }
 
     private func lockedEvents(phase: PointerPhase, x: UInt16, y: UInt16, contact: PointerContact) -> [PointerInjection] {

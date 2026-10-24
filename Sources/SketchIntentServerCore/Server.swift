@@ -111,6 +111,10 @@ public final class Server {
                 DesktopSwitcher.switchDesktop(direction)
             case .pointer(let phase, let x, let y, let contact):
                 pointer.post(phase: phase, x: x, y: y, contact: contact)
+            case .trackpadScroll(let dx, let dy, let phase):
+                pointer.postTrackpadScroll(dx: dx, dy: dy, phase: phase)
+            case .trackpadClick(let button, let phase):
+                pointer.postTrackpadClick(button: button, phase: phase)
             }
         }
         hub.add(session)

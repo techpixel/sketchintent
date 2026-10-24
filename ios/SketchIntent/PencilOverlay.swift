@@ -108,6 +108,7 @@ struct PencilOverlay: UIViewRepresentable {
     var frameHeight: Int
     var onPencilPointer: (PointerPhase, UInt16, UInt16) -> Void
     var onTap: () -> Void
+    var onDoubleTap: () -> Void
     var onFingerSwipe: (FingerSwipe) -> Void
     var onToggleTool: () -> Void
 
@@ -115,6 +116,7 @@ struct PencilOverlay: UIViewRepresentable {
         Coordinator(
             acceptsTap: acceptsTap,
             onTap: onTap,
+            onDoubleTap: onDoubleTap,
             onFingerSwipe: onFingerSwipe,
             onToggleTool: onToggleTool
         )
@@ -141,6 +143,7 @@ struct PencilOverlay: UIViewRepresentable {
     func updateUIView(_ uiView: PencilOverlayView, context: Context) {
         context.coordinator.acceptsTap = acceptsTap
         context.coordinator.onTap = onTap
+        context.coordinator.onDoubleTap = onDoubleTap
         context.coordinator.onFingerSwipe = onFingerSwipe
         context.coordinator.onToggleTool = onToggleTool
         uiView.onInkChange = { [weak canvas] hasInk in
@@ -162,6 +165,7 @@ struct PencilOverlay: UIViewRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
         var acceptsTap: Bool
         var onTap: () -> Void
+        var onDoubleTap: () -> Void
         var onFingerSwipe: (FingerSwipe) -> Void
         var onToggleTool: () -> Void
         private var reportedDesktopSwipe = false
@@ -169,11 +173,13 @@ struct PencilOverlay: UIViewRepresentable {
         init(
             acceptsTap: Bool,
             onTap: @escaping () -> Void,
+            onDoubleTap: @escaping () -> Void,
             onFingerSwipe: @escaping (FingerSwipe) -> Void,
             onToggleTool: @escaping () -> Void
         ) {
             self.acceptsTap = acceptsTap
             self.onTap = onTap
+            self.onDoubleTap = onDoubleTap
             self.onFingerSwipe = onFingerSwipe
             self.onToggleTool = onToggleTool
         }
@@ -200,6 +206,13 @@ struct PencilOverlay: UIViewRepresentable {
                 }
             }
             onTap()
+        }
+
+        /// Finger double-tap. The single-tap recognizer waits for this to fail,
+        /// so the status badge does not toggle on the way to the trackpad.
+        @objc func fingerDoubleTapped(_ recognizer: UITapGestureRecognizer) {
+            guard recognizer.state == .ended, acceptsTap else { return }
+            onDoubleTap()
         }
 
         @objc func desktopPanned(_ recognizer: UIPanGestureRecognizer) {
@@ -233,7 +246,8 @@ struct PencilOverlay: UIViewRepresentable {
             toggleToolFromPencilDoubleTap()
         }
 
-        /// Barrel double-tap. A finger tap never arrives here; that gesture shows the status badge.
+        /// Barrel double-tap. A finger never arrives here.
+        /// A finger single tap shows the status badge. A finger double-tap shows the trackpad.
         private func toggleToolFromPencilDoubleTap() {
             guard pencilDoubleTapSwitchesTools() else { return }
             onToggleTool()
@@ -476,10 +490,18 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
         ]
 
+        let doubleTap = UITapGestureRecognizer(target: target, action: #selector(PencilOverlay.Coordinator.fingerDoubleTapped(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.numberOfTouchesRequired = 1
+        doubleTap.allowedTouchTypes = finger
+        doubleTap.delegate = target
+
         let tap = UITapGestureRecognizer(target: target, action: #selector(PencilOverlay.Coordinator.tapped(_:)))
         tap.numberOfTouchesRequired = 1
         tap.allowedTouchTypes = finger
         tap.delegate = target
+        tap.require(toFail: doubleTap)
+        canvas.addGestureRecognizer(doubleTap)
         canvas.addGestureRecognizer(tap)
 
         let desktopPan = ThreeFingerDesktopPan(target: target, action: #selector(PencilOverlay.Coordinator.desktopPanned(_:)))

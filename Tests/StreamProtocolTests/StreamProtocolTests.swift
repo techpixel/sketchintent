@@ -117,6 +117,33 @@ final class StreamProtocolTests: XCTestCase {
         XCTAssertEqual(try StreamParser().append(bad), [.heartbeat])
     }
 
+    func testTrackpadScrollAndClickRoundTrip() throws {
+        let scroll = StreamFraming.encode(.input(.trackpadScroll(dx: -300, dy: 20, phase: .changed)))
+        XCTAssertEqual(Array(scroll.suffix(6)), [
+            3, TrackpadScrollPhase.changed.rawValue, 0xfe, 0xd4, 0x00, 0x14
+        ])
+        let packet = scroll
+            + StreamFraming.encode(.input(.trackpadClick(.right, .down)))
+            + StreamFraming.encode(.input(.trackpadClick(.left, .up)))
+            + StreamFraming.encode(.input(.pointer(.down, x: 1, y: 2)))
+        XCTAssertEqual(
+            try StreamParser().append(packet),
+            [
+                .input(.trackpadScroll(dx: -300, dy: 20, phase: .changed)),
+                .input(.trackpadClick(.right, .down)),
+                .input(.trackpadClick(.left, .up)),
+                .input(.pointer(.down, x: 1, y: 2))
+            ]
+        )
+
+        var length = UInt32(4).bigEndian
+        var skipped = Data()
+        withUnsafeBytes(of: &length) { skipped.append(contentsOf: $0) }
+        skipped.append(contentsOf: [5, 4, TrackpadButton.left.rawValue, PointerPhase.move.rawValue])
+        skipped.append(StreamFraming.encode(.heartbeat))
+        XCTAssertEqual(try StreamParser().append(skipped), [.heartbeat])
+    }
+
     func testLetterboxedPictureMapsAndBlackBarsAreIgnored() {
         XCTAssertNil(FrameCoordinates.pixel(
             viewX: 40, viewY: 10,

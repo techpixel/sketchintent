@@ -418,6 +418,14 @@ final class ServerTests: XCTestCase {
         XCTAssertEqual(event.location.x, 8, accuracy: 0.01)
         XCTAssertEqual(event.location.y, 9, accuracy: 0.01)
     }
+
+    func testTrackpadScrollPhaseMapsOntoContinuousScroll() {
+        XCTAssertEqual(TrackpadScrollPhase.began.cgScrollPhase, .began)
+        XCTAssertEqual(TrackpadScrollPhase.changed.cgScrollPhase, .changed)
+        XCTAssertEqual(TrackpadScrollPhase.ended.cgScrollPhase, .ended)
+        XCTAssertEqual(TrackpadScrollPhase.cancelled.cgScrollPhase, .cancelled)
+        XCTAssertNotEqual(Int(TrackpadScrollPhase.ended.rawValue), Int(CGScrollPhase.ended.rawValue))
+    }
 }
 
 private func spaceRecord(id: UInt64, uuid: String?, type: Int = 0) -> [String: Any] {
