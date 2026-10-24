@@ -7,6 +7,9 @@ import UIKit
 /// The simulator and a Mac on the same network connect the other way.
 final class StreamClient: ObservableObject {
     @Published var hasFrame = false
+    /// Captured frame size from the latest hello or video config. Pointer mapping uses this.
+    @Published var frameWidth = 0
+    @Published var frameHeight = 0
     /// Mission Control id of the desktop on screen. Sketches are stored under this.
     @Published var spaceID: String?
     #if targetEnvironment(simulator)
@@ -294,6 +297,8 @@ final class StreamClient: ObservableObject {
         guard width > 0, height > 0 else { return }
         let size = "\(width)×\(height)"
         DispatchQueue.main.async {
+            self.frameWidth = width
+            self.frameHeight = height
             self.resolution = size
             self.updateBadge()
         }

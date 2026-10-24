@@ -5,6 +5,16 @@ private enum SwipeSettings {
     static let naturalKey = "naturalSwiping"
 }
 
+/// UserDefaults keys the pointer-mode setting may use. The toggle writes `key`.
+private enum PencilMacControl {
+    static let key = "pencilControlsMac"
+    static let storageKeys = [
+        key,
+        "controlMacWithPencil",
+        "controlsMacWithPencil"
+    ]
+}
+
 private struct SharedSketch: Identifiable {
     let id = UUID()
     let image: UIImage
@@ -14,12 +24,15 @@ struct ContentView: View {
     @StateObject private var client = StreamClient()
     @StateObject private var sketch = SketchCanvas()
     @State private var tool = SketchTool.pen
+    @State private var showsToolDial = false
     @State private var showsChrome = true
     @State private var showsSettings = false
     @State private var sharedSketch: SharedSketch?
     @State private var desktopHint: DesktopDirection?
     @State private var hintToken = 0
+    @State private var toolSelection = UISelectionFeedbackGenerator()
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
+    @AppStorage(PencilMacControl.key) private var pencilControlsMacStored = false
 
     private var showsStatusChrome: Bool {
         !client.hasFrame || showsChrome
@@ -30,11 +43,24 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
             ScreenDisplay(client: client)
                 .ignoresSafeArea()
-            PencilOverlay(spaceID: client.spaceID, canvas: sketch, tool: tool, acceptsTap: client.hasFrame) {
-                showsChrome.toggle()
-            } onFingerSwipe: { swipe in
-                switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
-            }
+            PencilOverlay(
+                spaceID: client.spaceID,
+                canvas: sketch,
+                tool: tool,
+                acceptsTap: client.hasFrame,
+                drawsWithPencil: !pencilControlsMac && tool != .pointer,
+                sendsPointer: (pencilControlsMac || tool == .pointer) && client.hasFrame,
+                frameWidth: client.frameWidth,
+                frameHeight: client.frameHeight,
+                onPencilPointer: { phase, x, y in
+                    client.send(.pointer(phase, x: x, y: y))
+                },
+                onTap: { canvasTapped() },
+                onFingerSwipe: { swipe in
+                    switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
+                },
+                onToggleTool: { toggleToolFromPencil() }
+            )
             .ignoresSafeArea()
             .accessibilityHidden(true)
             if !client.hasFrame {
@@ -64,12 +90,14 @@ struct ContentView: View {
 
             MarkupChrome(
                 showsTools: client.hasFrame,
+                showsDial: showsToolDial,
                 showsGear: showsStatusChrome,
                 tool: tool,
                 canSend: sketch.hasInk,
                 onTool: { tool = $0 },
                 onSend: sendSketch,
-                onSettings: { showsSettings = true }
+                onSettings: { showsSettings = true },
+                onDismissDial: { showsToolDial = false }
             )
             .ignoresSafeArea()
         }
@@ -85,6 +113,7 @@ struct ContentView: View {
         }
         .onAppear {
             client.start()
+            toolSelection.prepare()
             UIApplication.shared.isIdleTimerDisabled = false
         }
         .onChange(of: client.hasFrame) { _, hasFrame in
@@ -95,6 +124,42 @@ struct ContentView: View {
     private func sendSketch() {
         guard let image = sketch.snapshot() else { return }
         sharedSketch = SharedSketch(image: image)
+    }
+
+    /// One-finger tap. Shows or hides the status badge. While the tool dial is up,
+    /// the same tap also dismisses the dial. It is not a second gesture.
+    private func canvasTapped() {
+        if showsToolDial {
+            showsToolDial = false
+        }
+        showsChrome.toggle()
+    }
+
+    /// Apple Pencil barrel double-tap. The first one shows the tool dial.
+    /// Another, while the dial is up, moves clockwise to the next tool and leaves the dial up.
+    /// When Settings is using the Pencil as a pointer on the Mac, the double-tap is ignored.
+    private func toggleToolFromPencil() {
+        guard !pencilControlsMac else { return }
+        toolSelection.selectionChanged()
+        toolSelection.prepare()
+        if showsToolDial {
+            tool = tool.nextOnDial
+        } else {
+            showsToolDial = true
+        }
+    }
+
+    /// True when "Control the Mac with Pencil" is on. Default is off until a key is stored.
+    /// Once `pencilControlsMac` is written, that value wins over any alias key.
+    private var pencilControlsMac: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: PencilMacControl.key) != nil {
+            return pencilControlsMacStored
+        }
+        for key in PencilMacControl.storageKeys where key != PencilMacControl.key && defaults.object(forKey: key) != nil {
+            if defaults.bool(forKey: key) { return true }
+        }
+        return pencilControlsMacStored
     }
 
     /// Opens the desktop `direction` points at, and flashes a chevron that way.
@@ -174,6 +239,7 @@ struct ContentView: View {
 private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
+    @AppStorage(PencilMacControl.key) private var pencilControlsMac = false
 
     var body: some View {
         NavigationStack {
@@ -182,6 +248,11 @@ private struct SettingsSheet: View {
                     Toggle("Natural swiping", isOn: $naturalSwiping)
                 } footer: {
                     Text(detail)
+                }
+                Section {
+                    Toggle("Control the Mac with Pencil", isOn: $pencilControlsMac)
+                } footer: {
+                    Text(pencilDetail)
                 }
             }
             .navigationTitle("Settings")
@@ -202,6 +273,13 @@ private struct SettingsSheet: View {
             return "On, this matches the Mac trackpad. A three-finger swipe left opens the desktop on the right, and a swipe right opens the desktop on the left."
         }
         return "Off, swiping is inverted. A three-finger swipe left opens the desktop on the left, and a swipe right opens the desktop on the right."
+    }
+
+    private var pencilDetail: String {
+        if pencilControlsMac {
+            return "On, the Pencil clicks and drags on the Mac instead of drawing. The pen and eraser apply only while this is off."
+        }
+        return "Off, the Pencil draws. The pen and eraser apply only while this is off."
     }
 }
 
