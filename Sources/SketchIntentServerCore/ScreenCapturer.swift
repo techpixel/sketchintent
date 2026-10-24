@@ -30,6 +30,8 @@ enum CaptureError: Error, CustomStringConvertible {
 final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
     var onVideo: ((VideoConfig?, VideoFrame) -> Void)?
     var onSize: ((Int, Int) -> Void)?
+    /// The display this capture is reading. Pointer clicks land on this display.
+    var onDisplay: ((CGDirectDisplayID) -> Void)?
 
     private let captureQueue = DispatchQueue(label: "sketchintent.capture")
     private var stream: SCStream?
@@ -98,6 +100,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
         try await stream.startCapture()
         self.stream = stream
+        onDisplay?(display.displayID)
         onSize?(width, height)
         return (width, height)
     }
