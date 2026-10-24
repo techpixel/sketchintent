@@ -6,5 +6,9 @@
 	<array>
 		<string>_sketchintent._tcp</string>
 	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>SketchIntent uses the microphone to transcribe a voice note while you hold the Pencil on the canvas.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>SketchIntent turns that voice note into text and keeps it with the point you marked.</string>
 </dict>
 </plist>

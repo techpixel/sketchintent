@@ -217,7 +217,7 @@ final class MarkupChromeController: UIViewController {
     }
 }
 
-/// Glass ring for pen, pointer, and eraser. Symbols stay upright. The center
+/// Glass ring for pen, pointer, eraser, and voice. Symbols stay upright. The center
 /// hole and the square corners pass touches through to the canvas.
 private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
     static let diameter: CGFloat = 176
@@ -230,6 +230,8 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
     private var commitToken = 0
     private var selectionSettlesAt = Date.distantPast
     private var dragChangedTool = false
+    /// Unwrapped wedge angle so a step to the next tool animates the short way.
+    private var wedgeAngle: CGFloat = 0
     private static let wedgeSpringDuration: TimeInterval = 0.32
 
     private let ring = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
@@ -244,7 +246,8 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
     private static let symbolRadius: CGFloat = 65
     private static let bandWidth: CGFloat = 46
     /// Half the stroked arc, before the round caps widen it.
-    private static let wedgeHalfAngle: CGFloat = 0.52
+    /// Kept narrower than the gap so four tools do not share one pill.
+    private static let wedgeHalfAngle: CGFloat = 0.32
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -271,12 +274,14 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
         wedge.contentView.addSubview(wedgeTint)
         addSubview(wedge)
 
-        for tool in [SketchTool.eraser, .pen, .pointer] {
+        for tool in SketchTool.dialOrder {
             let button = UIButton(type: .system)
             button.automaticallyUpdatesConfiguration = false
             button.accessibilityLabel = tool.accessibilityName
             if tool == .pointer {
                 button.accessibilityHint = "Clicks and drags on the Mac"
+            } else if tool == .voice {
+                button.accessibilityHint = "Records a voice note while the Pencil is held"
             }
             var configuration = UIButton.Configuration.plain()
             configuration.image = UIImage(systemName: tool.symbolName)
@@ -287,7 +292,7 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
             buttons[tool] = button
             addSubview(button)
         }
-        accessibilityElements = [SketchTool.eraser, .pen, .pointer].compactMap { buttons[$0] }
+        accessibilityElements = SketchTool.dialOrder.compactMap { buttons[$0] }
 
         let tap = UITapGestureRecognizer(target: self, action: #selector(ringTapped(_:)))
         tap.delegate = self
@@ -340,7 +345,13 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
         selectedTool = tool
         refreshButtons()
         guard changed else { return }
-        let angle = tool.dialAngle
+        let target = tool.dialAngle
+        if animated, window != nil {
+            wedgeAngle += Self.wrapped(target - wedgeAngle)
+        } else {
+            wedgeAngle = target
+        }
+        let angle = wedgeAngle
         let apply = { self.wedge.transform = CGAffineTransform(rotationAngle: angle) }
         if animated, window != nil {
             selectionSettlesAt = Date().addingTimeInterval(Self.wedgeSpringDuration)
@@ -398,7 +409,7 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
         for (tool, button) in buttons {
             let selected = tool == selectedTool
             var configuration = button.configuration ?? .plain()
-            let pointSize: CGFloat = tool == .eraser ? 20 : 22
+            let pointSize: CGFloat = (tool == .eraser || tool == .voice) ? 20 : 22
             configuration.image = UIImage(systemName: tool.symbolName)
             configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(
                 pointSize: pointSize,

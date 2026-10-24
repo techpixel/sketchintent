@@ -11,14 +11,15 @@ enum SketchTool: Equatable, CaseIterable {
     case pen
     case pointer
     case eraser
+    case voice
 
-    /// Clockwise detent. Pen sits on the right, the pointer below it, the eraser above it.
+    /// Clockwise around the dial, starting with the pen on the right.
+    static let dialOrder: [SketchTool] = [.pen, .pointer, .eraser, .voice]
+
     var nextOnDial: SketchTool {
-        switch self {
-        case .pen: return .pointer
-        case .pointer: return .eraser
-        case .eraser: return .pen
-        }
+        let order = Self.dialOrder
+        guard let index = order.firstIndex(of: self) else { return .pen }
+        return order[(index + 1) % order.count]
     }
 
     var symbolName: String {
@@ -26,6 +27,7 @@ enum SketchTool: Equatable, CaseIterable {
         case .pen: return "pencil.and.outline"
         case .pointer: return "hand.point.up.fill"
         case .eraser: return "eraser.fill"
+        case .voice: return "mic.fill"
         }
     }
 
@@ -34,16 +36,15 @@ enum SketchTool: Equatable, CaseIterable {
         case .pen: return "Pencil"
         case .pointer: return "Pointer"
         case .eraser: return "Eraser"
+        case .voice: return "Voice note"
         }
     }
 
-    /// Radians from the right side of the dial. Positive angles run clockwise.
+    /// Radians clockwise from the right side of the dial. UIKit's y axis points down.
     var dialAngle: CGFloat {
-        switch self {
-        case .pen: return 0
-        case .pointer: return 2 * .pi / 3
-        case .eraser: return -2 * .pi / 3
-        }
+        let order = Self.dialOrder
+        let index = CGFloat(order.firstIndex(of: self) ?? 0)
+        return index * (2 * .pi / CGFloat(order.count))
     }
 
     var rawTag: Int {
@@ -51,6 +52,7 @@ enum SketchTool: Equatable, CaseIterable {
         case .pen: return 1
         case .pointer: return 2
         case .eraser: return 3
+        case .voice: return 4
         }
     }
 
@@ -59,6 +61,7 @@ enum SketchTool: Equatable, CaseIterable {
         case 1: self = .pen
         case 2: self = .pointer
         case 3: self = .eraser
+        case 4: self = .voice
         default: return nil
         }
     }
@@ -91,9 +94,9 @@ final class SketchCanvas: ObservableObject {
 
 /// Black pen strokes over the Mac picture, with a white halo so a line stays
 /// visible on light and dark desktops. When a pen stroke ends it is smoothed
-/// lightly, and the halo is redrawn from that smoothed ink. Strokes stay on the
-/// iPad. When Control the Mac with Pencil is on, the Pencil clicks and drags
-/// on the Mac instead of drawing.
+/// lightly, and the halo is redrawn from that smoothed ink. Strokes and voice
+/// notes stay on the iPad. When Control the Mac with Pencil is on, the Pencil
+/// clicks and drags on the Mac instead of drawing or recording.
 struct PencilOverlay: UIViewRepresentable {
     var spaceID: String?
     var canvas: SketchCanvas
@@ -188,8 +191,14 @@ struct PencilOverlay: UIViewRepresentable {
             gestureRecognizer is ThreeFingerDesktopPan || otherGestureRecognizer is ThreeFingerDesktopPan
         }
 
-        @objc func tapped() {
+        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
             guard acceptsTap else { return }
+            if let host = recognizer.view?.superview as? PencilOverlayView {
+                let point = recognizer.location(in: host)
+                if host.handleCanvasTap(at: point) {
+                    return
+                }
+            }
             onTap()
         }
 
@@ -297,6 +306,29 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var strokeCountAtPenDown = 0
     /// Set while a smoothed stroke is written back, so that write is not smoothed again.
     private var isApplyingSmoothedStroke = false
+    /// Voice notes for the desktop on screen, and the notes kept for every other space.
+    private var notes: [VoiceNote] = []
+    private var notesBySpace: [String: [VoiceNote]] = [:]
+    private var openNoteID: UUID?
+    private let noteLayer = VoiceNoteLayer()
+    private let voicePermissions = VoicePermissionGate()
+    private let voiceTranscriber = VoiceTranscriber()
+    private var voiceHold: VoiceHold?
+    private var voiceHoldItem: DispatchWorkItem?
+    private var voiceArmed = false
+    private var noticeToken = 0
+    private let recordHaptic = UIImpactFeedbackGenerator(style: .soft)
+
+    private struct VoiceHold {
+        let token: UUID
+        let anchor: CGPoint
+        var armed = false
+        var recording = false
+    }
+
+    /// A hold shorter than this, or a move past the slop before it, does not record.
+    private static let voiceHoldDelay: TimeInterval = 0.5
+    private static let voiceSlop: CGFloat = 12
 
     /// Half of the old 32-point bitmap tip. Touching ink deletes that whole stroke.
     private static let eraserRadius: CGFloat = 16
@@ -322,19 +354,31 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         sendsPointer = sends
     }
 
-    /// Pen and eraser take effect only while the Pencil is drawing. Pointer mode,
-    /// and Control the Mac with Pencil, leave the page alone and send clicks instead.
+    /// Pen, eraser, and voice notes take effect only while the Pencil is drawing.
+    /// Pointer mode, and Control the Mac with Pencil, leave the page alone and send clicks instead.
     func apply(tool: SketchTool, drawsWithPencil: Bool) {
         let sendsPencilAsPointer = !drawsWithPencil || tool == .pointer
         let erasing = drawsWithPencil && tool == .eraser
+        let annotating = drawsWithPencil && tool == .voice && !sendsPencilAsPointer
         canvas.forwardsPencilAsPointer = sendsPencilAsPointer
         canvas.erasesWholeStrokes = erasing
+        canvas.capturesVoiceHold = annotating
         if !erasing {
             lastEraserPoint = nil
         }
-        // The stroke eraser handles Pencil touches itself. PencilKit's vector eraser
-        // waits until lift, and its bitmap eraser only clears the pixels underneath.
-        canvas.drawingGestureRecognizer.isEnabled = drawsWithPencil && !erasing && !sendsPencilAsPointer
+        if annotating != voiceArmed {
+            if annotating {
+                voicePermissions.promptIfUndetermined()
+                recordHaptic.prepare()
+            } else {
+                endVoiceHold(commit: false)
+            }
+            voiceArmed = annotating
+        }
+        // The stroke eraser and the voice hold handle Pencil touches themselves.
+        // PencilKit's vector eraser waits until lift, and its bitmap eraser only
+        // clears the pixels underneath. The voice tool must not lay down ink.
+        canvas.drawingGestureRecognizer.isEnabled = drawsWithPencil && !erasing && !sendsPencilAsPointer && !annotating
         canvas.drawingGestureRecognizer.allowedTouchTypes = [
             NSNumber(value: UITouch.TouchType.pencil.rawValue)
         ]
@@ -344,12 +388,13 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         switch tool {
         case .pen:
             canvas.tool = PKInkingTool(.pen, color: .black, width: 4)
-        case .eraser:
+        case .eraser, .voice:
             break
         case .pointer:
             canvas.drawingGestureRecognizer.isEnabled = false
             canvas.forwardsPencilAsPointer = true
             canvas.erasesWholeStrokes = false
+            canvas.capturesVoiceHold = false
             lastEraserPoint = nil
         }
     }
@@ -382,6 +427,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         canvas.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         canvas.delegate = self
         addSubview(canvas)
+        noteLayer.frame = bounds
+        noteLayer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        noteLayer.isUserInteractionEnabled = false
+        addSubview(noteLayer)
         canvas.onPencilPointer = { [weak self] phase, point in
             guard let self else { return }
             self.handlePencil(phase: phase, at: self.canvas.convert(point, to: self))
@@ -389,6 +438,31 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         canvas.onPencilErase = { [weak self] phase, samples in
             self?.eraseStrokes(phase: phase, samples: samples)
         }
+        canvas.onPencilVoice = { [weak self] phase, samples in
+            guard let self else { return }
+            let points = samples.map { self.canvas.convert($0, to: self) }
+            switch phase {
+            case .began:
+                guard let anchor = points.first else { return }
+                self.beginVoiceTouch(at: anchor)
+                self.moveVoiceTouch(points)
+            case .moved:
+                self.moveVoiceTouch(points)
+            case .ended:
+                self.endVoiceTouch()
+            case .cancelled:
+                self.endVoiceHold(commit: false)
+            default:
+                break
+            }
+        }
+    }
+
+    deinit {
+        voiceHoldItem?.cancel()
+        voiceTranscriber.onPartial = nil
+        voiceTranscriber.onFailure = nil
+        _ = voiceTranscriber.stop()
     }
 
     required init?(coder: NSCoder) {
@@ -402,7 +476,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
         ]
 
-        let tap = UITapGestureRecognizer(target: target, action: #selector(PencilOverlay.Coordinator.tapped))
+        let tap = UITapGestureRecognizer(target: target, action: #selector(PencilOverlay.Coordinator.tapped(_:)))
         tap.numberOfTouchesRequired = 1
         tap.allowedTouchTypes = finger
         tap.delegate = target
@@ -429,28 +503,180 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         addInteraction(interaction)
     }
 
-    /// Keeps each desktop's strokes with that desktop. The first id adopts whatever
-    /// is already on the page, so a stroke started before the Mac checks in is not dropped.
+    /// Keeps each desktop's strokes and voice notes with that desktop. The first id
+    /// adopts whatever is already on the page, so a stroke or note started before
+    /// the Mac checks in is not dropped.
     func showSpace(_ id: String) {
         guard id != currentSpaceID else { return }
+        if voiceHold?.recording == true {
+            endVoiceHold(commit: true)
+        } else if voiceHold != nil {
+            endVoiceHold(commit: false)
+        }
         lastEraserPoint = nil
         penStrokeOpen = false
         if let currentSpaceID {
             drawings[currentSpaceID] = canvas.drawing
+            notesBySpace[currentSpaceID] = notes
         }
         let adoptingExistingInk = currentSpaceID == nil && !canvas.drawing.strokes.isEmpty
+        let adoptingNotes = currentSpaceID == nil && !notes.isEmpty
         currentSpaceID = id
         if adoptingExistingInk {
             drawings[id] = canvas.drawing
-            return
+        } else {
+            canvas.drawing = drawings[id] ?? PKDrawing()
+            canvasViewDrawingDidChange(canvas)
         }
-        canvas.drawing = drawings[id] ?? PKDrawing()
-        canvasViewDrawingDidChange(canvas)
+        if adoptingNotes {
+            notesBySpace[id] = notes
+        } else {
+            notes = notesBySpace[id] ?? []
+        }
+        openNoteID = nil
+        noticeToken += 1
+        noteLayer.setLive(anchor: nil, text: "")
+        noteLayer.setNotice(anchor: nil, text: "")
+        noteLayer.setSaved(notes: notes, openID: nil)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         canvas.frame = bounds
+        noteLayer.frame = bounds
+        noteLayer.relayout()
+    }
+
+    /// Finger taps on a dot open its note. A tap on the open bubble leaves it up.
+    /// Anywhere else closes it and lets the status-badge tap run.
+    func handleCanvasTap(at point: CGPoint) -> Bool {
+        switch noteLayer.hit(at: convert(point, to: noteLayer)) {
+        case .bubble:
+            return true
+        case .dot(let id):
+            openNoteID = id
+            noteLayer.setSaved(notes: notes, openID: id)
+            return true
+        case .none:
+            guard openNoteID != nil else { return false }
+            openNoteID = nil
+            noteLayer.setSaved(notes: notes, openID: nil)
+            return false
+        }
+    }
+
+    private func beginVoiceTouch(at anchor: CGPoint) {
+        if voiceHold?.recording == true {
+            endVoiceHold(commit: true)
+        } else if voiceHold != nil {
+            endVoiceHold(commit: false)
+        }
+        recordHaptic.prepare()
+        let token = UUID()
+        voiceHold = VoiceHold(token: token, anchor: anchor)
+        let work = DispatchWorkItem { [weak self] in
+            self?.armVoiceHold(token: token)
+        }
+        voiceHoldItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.voiceHoldDelay, execute: work)
+    }
+
+    private func moveVoiceTouch(_ samples: [CGPoint]) {
+        guard let hold = voiceHold, !hold.armed else { return }
+        let broke = samples.contains { hypot($0.x - hold.anchor.x, $0.y - hold.anchor.y) > Self.voiceSlop }
+        guard broke else { return }
+        endVoiceHold(commit: false)
+    }
+
+    private func endVoiceTouch() {
+        let commit = voiceHold?.recording == true
+        endVoiceHold(commit: commit)
+    }
+
+    private func armVoiceHold(token: UUID) {
+        guard var hold = voiceHold, hold.token == token, !hold.armed else { return }
+        hold.armed = true
+        voiceHold = hold
+        let anchor = hold.anchor
+        voicePermissions.authorize { [weak self] result in
+            guard let self, self.voiceHold?.token == token else { return }
+            switch result {
+            case .failure(let reason):
+                self.voiceHold = nil
+                self.showVoiceNotice(reason.message, at: anchor)
+            case .success:
+                self.startVoiceRecording(token: token, anchor: anchor)
+            }
+        }
+    }
+
+    private func startVoiceRecording(token: UUID, anchor: CGPoint) {
+        guard voiceHold?.token == token, voiceHold?.recording == false else { return }
+        openNoteID = nil
+        noteLayer.setSaved(notes: notes, openID: nil)
+        noteLayer.setLive(anchor: anchor, text: "")
+        voiceTranscriber.onPartial = { [weak self] text in
+            guard let self, self.voiceHold?.token == token else { return }
+            self.noteLayer.setLive(anchor: anchor, text: text)
+        }
+        voiceTranscriber.onFailure = { [weak self] in
+            guard let self, self.voiceHold?.token == token else { return }
+            let point = self.voiceHold?.anchor ?? anchor
+            self.endVoiceHold(commit: false)
+            self.showVoiceNotice(VoiceCaptureBlock.unavailable.message, at: point)
+        }
+        do {
+            try voiceTranscriber.start()
+        } catch {
+            voiceTranscriber.onPartial = nil
+            voiceTranscriber.onFailure = nil
+            voiceHold = nil
+            noteLayer.setLive(anchor: nil, text: "")
+            showVoiceNotice(VoiceCaptureBlock.unavailable.message, at: anchor)
+            return
+        }
+        guard var hold = voiceHold, hold.token == token else {
+            _ = voiceTranscriber.stop()
+            return
+        }
+        hold.recording = true
+        voiceHold = hold
+        recordHaptic.impactOccurred()
+        recordHaptic.prepare()
+    }
+
+    private func endVoiceHold(commit: Bool) {
+        guard let hold = voiceHold else { return }
+        voiceHoldItem?.cancel()
+        voiceHoldItem = nil
+        voiceHold = nil
+        voiceTranscriber.onPartial = nil
+        voiceTranscriber.onFailure = nil
+        let text = hold.recording
+            ? voiceTranscriber.stop().trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        noteLayer.setLive(anchor: nil, text: "")
+        guard commit, hold.recording, !text.isEmpty else { return }
+        addVoiceNote(VoiceNote(id: UUID(), anchor: hold.anchor, text: text))
+    }
+
+    private func addVoiceNote(_ note: VoiceNote) {
+        notes.append(note)
+        if let currentSpaceID {
+            notesBySpace[currentSpaceID] = notes
+        }
+        openNoteID = nil
+        noteLayer.setSaved(notes: notes, openID: nil)
+    }
+
+    private func showVoiceNotice(_ text: String, at anchor: CGPoint) {
+        noticeToken += 1
+        let token = noticeToken
+        noteLayer.setNotice(anchor: anchor, text: text)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
+            guard let self, self.noticeToken == token else { return }
+            self.noteLayer.setNotice(anchor: nil, text: "")
+        }
     }
 
     /// One sample per touch callback. Coalesced history is not forwarded, so the
@@ -696,6 +922,9 @@ final class InkCanvasView: PKCanvasView {
     /// When set, a Pencil touch deletes each stroke it meets. Finger touches still draw nothing.
     var erasesWholeStrokes = false
     var onPencilErase: ((UITouch.Phase, [CGPoint]) -> Void)?
+    /// When set, a Pencil hold can record a voice note. Finger touches still draw nothing.
+    var capturesVoiceHold = false
+    var onPencilVoice: ((UITouch.Phase, [CGPoint]) -> Void)?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         deliver(touches, phase: .began, event: event)
@@ -753,6 +982,26 @@ final class InkCanvasView: PKCanvasView {
             }
             return
         }
+        if capturesVoiceHold {
+            drawingGestureRecognizer.isEnabled = false
+            var pencil: UITouch?
+            var others = Set<UITouch>()
+            for touch in touches {
+                if touch.type == .pencil, pencil == nil {
+                    pencil = touch
+                } else if touch.type != .pencil {
+                    others.insert(touch)
+                }
+            }
+            if let pencil {
+                let history = event?.coalescedTouches(for: pencil) ?? [pencil]
+                onPencilVoice?(phase, history.map { $0.preciseLocation(in: self) })
+            }
+            if !others.isEmpty {
+                pass(others, phase: phase, event: event)
+            }
+            return
+        }
         pass(touches, phase: phase, event: event)
     }
 
@@ -795,6 +1044,7 @@ final class InkCanvasView: PKCanvasView {
         set { super.backgroundColor = .clear }
     }
 }
+
 /// One light pass over a finished pen stroke. PencilKit has no smoothing API, so the
 /// stroke's own control points are averaged and the stroke is replaced.
 ///

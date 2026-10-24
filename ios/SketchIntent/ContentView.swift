@@ -136,7 +136,7 @@ struct ContentView: View {
     }
 
     /// Apple Pencil barrel double-tap. The first one shows the tool dial.
-    /// Another, while the dial is up, moves clockwise to the next tool and dismisses the dial.
+    /// Another, while the dial is up, moves clockwise through pen, pointer, eraser, and voice, then dismisses the dial.
     /// When Settings is using the Pencil as a pointer on the Mac, the double-tap is ignored.
     private func toggleToolFromPencil() {
         guard !pencilControlsMac else { return }
@@ -278,9 +278,9 @@ private struct SettingsSheet: View {
 
     private var pencilDetail: String {
         if pencilControlsMac {
-            return "On, the Pencil clicks and drags on the Mac instead of drawing. The pen and eraser apply only while this is off."
+            return "On, the Pencil clicks and drags on the Mac instead of drawing. The pen, eraser, and voice notes apply only while this is off."
         }
-        return "Off, the Pencil draws. The pen and eraser apply only while this is off."
+        return "Off, the Pencil draws, and the voice tool records while the Pencil is held. The pen, eraser, and voice notes apply only while this is off."
     }
 }
 

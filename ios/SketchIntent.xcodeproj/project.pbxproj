@@ -15,6 +15,7 @@
 		F0000000000000000000001D /* VideoDisplay.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000001C /* VideoDisplay.swift */; };
 		F00000000000000000000021 /* PencilOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000020 /* PencilOverlay.swift */; };
 		F00000000000000000000023 /* MarkupChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000022 /* MarkupChrome.swift */; };
+		F00000000000000000000025 /* VoiceAnnotation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000024 /* VoiceAnnotation.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -28,6 +29,7 @@
 		F0000000000000000000001C /* VideoDisplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoDisplay.swift; sourceTree = "<group>"; };
 		F00000000000000000000020 /* PencilOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilOverlay.swift; sourceTree = "<group>"; };
 		F00000000000000000000022 /* MarkupChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkupChrome.swift; sourceTree = "<group>"; };
+		F00000000000000000000024 /* VoiceAnnotation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceAnnotation.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -68,6 +70,7 @@
 				F0000000000000000000001C /* VideoDisplay.swift */,
 				F00000000000000000000020 /* PencilOverlay.swift */,
 				F00000000000000000000022 /* MarkupChrome.swift */,
+				F00000000000000000000024 /* VoiceAnnotation.swift */,
 				F00000000000000000000019 /* Assets.xcassets */,
 			);
 			path = SketchIntent;
@@ -156,6 +159,7 @@
 				F0000000000000000000001D /* VideoDisplay.swift in Sources */,
 				F00000000000000000000021 /* PencilOverlay.swift in Sources */,
 				F00000000000000000000023 /* MarkupChrome.swift in Sources */,
+				F00000000000000000000025 /* VoiceAnnotation.swift in Sources */,
 				F00000000000000000000008 /* StreamProtocol.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -215,6 +219,8 @@
 				INFOPLIST_FILE = Support/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = SketchIntent;
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "SketchIntent finds your Mac on the local network when the USB connection is not available.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "SketchIntent uses the microphone to transcribe a voice note while you hold the Pencil on the canvas.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "SketchIntent turns that voice note into text and keeps it with the point you marked.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -249,6 +255,8 @@
 				INFOPLIST_FILE = Support/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = SketchIntent;
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "SketchIntent finds your Mac on the local network when the USB connection is not available.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "SketchIntent uses the microphone to transcribe a voice note while you hold the Pencil on the canvas.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "SketchIntent turns that voice note into text and keeps it with the point you marked.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
