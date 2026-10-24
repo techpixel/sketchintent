@@ -7,6 +7,8 @@ import StreamProtocol
 struct DesktopLayout: Equatable {
     var display: String
     var spaceIDs: [UInt64]
+    /// Index into `spaceIDs`. `-1` when the active space is missing from that list
+    /// (a fullscreen app can be current before it shows up beside the desktops).
     var currentIndex: Int
     /// Mission Control UUID for the desktop on screen. Stable across a login session.
     var spaceID: String
@@ -48,6 +50,7 @@ enum DesktopSwitcher {
 
     /// The space immediately to the left or right of the current one, if it exists.
     static func neighbor(of direction: DesktopDirection, in layout: DesktopLayout) -> UInt64? {
+        guard layout.spaceIDs.indices.contains(layout.currentIndex) else { return nil }
         let next = direction == .right ? layout.currentIndex + 1 : layout.currentIndex - 1
         guard layout.spaceIDs.indices.contains(next) else { return nil }
         return layout.spaceIDs[next]
@@ -57,29 +60,38 @@ enum DesktopSwitcher {
         guard skyLight != nil else { return nil }
         let connection = connectionID()
         guard let displays = copySpaces(connection) as? [[String: Any]] else { return nil }
-        let wanted = mainDisplayUUID()
-        let display = displays.first { wanted != nil && $0["Display Identifier"] as? String == wanted } ?? displays.first
+        return layout(from: displays, mainDisplayID: mainDisplayUUID())
+    }
+
+    /// Reads one display's Mission Control snapshot. The active space keeps its own id
+    /// even when that space is not in the ordered desktop list.
+    static func layout(from displays: [[String: Any]], mainDisplayID: String?) -> DesktopLayout? {
+        let display = displays.first { mainDisplayID != nil && $0["Display Identifier"] as? String == mainDisplayID }
+            ?? displays.first
         guard let display, let name = display["Display Identifier"] as? String else { return nil }
         let spaces = display["Spaces"] as? [[String: Any]] ?? []
-        let ids = spaces.compactMap { ($0["id64"] as? NSNumber)?.uint64Value }
+        let ids = spaces.compactMap { uint64($0["id64"]) }
         guard let current = display["Current Space"] as? [String: Any],
-              let currentNumber = (current["id64"] as? NSNumber)?.uint64Value,
-              let index = ids.firstIndex(of: currentNumber),
-              !ids.isEmpty,
               let spaceID = Self.spaceID(in: current) else { return nil }
+        let index = uint64(current["id64"]).flatMap { ids.firstIndex(of: $0) } ?? -1
         return DesktopLayout(display: name, spaceIDs: ids, currentIndex: index, spaceID: spaceID)
     }
 
     private static func spaceID(in space: [String: Any]) -> String? {
         if let uuid = space["uuid"] as? String, !uuid.isEmpty { return uuid }
-        if let number = space["id64"] as? NSNumber { return String(number.uint64Value) }
+        if let number = uint64(space["id64"]) { return String(number) }
         return nil
+    }
+
+    private static func uint64(_ value: Any?) -> UInt64? {
+        (value as? NSNumber)?.uint64Value
     }
 
     private static func activate(_ spaceID: UInt64, on display: String) -> Bool {
         guard skyLight != nil else { return false }
         setCurrentSpace(connectionID(), display as CFString, spaceID)
-        guard let layout = currentLayout() else { return false }
+        guard let layout = currentLayout(),
+              layout.spaceIDs.indices.contains(layout.currentIndex) else { return false }
         return layout.spaceIDs[layout.currentIndex] == spaceID
     }
 

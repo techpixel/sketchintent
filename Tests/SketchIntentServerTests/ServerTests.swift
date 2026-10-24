@@ -153,6 +153,91 @@ final class ServerTests: XCTestCase {
         XCTAssertLessThan(layout.currentIndex, layout.spaceIDs.count)
     }
 
+    func testCurrentSpaceUsesItsUUID() throws {
+        let display = displayRecord(
+            identifier: "Main",
+            spaces: [
+                spaceRecord(id: 4, uuid: "left"),
+                spaceRecord(id: 252, uuid: "middle"),
+                spaceRecord(id: 648, uuid: "right")
+            ],
+            current: spaceRecord(id: 252, uuid: "middle")
+        )
+        let layout = try XCTUnwrap(DesktopSwitcher.layout(from: [display], mainDisplayID: "Main"))
+        XCTAssertEqual(layout.spaceID, "middle")
+        XCTAssertEqual(layout.currentIndex, 1)
+        XCTAssertEqual(layout.spaceIDs, [4, 252, 648])
+        XCTAssertEqual(DesktopSwitcher.neighbor(of: .left, in: layout), 4)
+        XCTAssertEqual(DesktopSwitcher.neighbor(of: .right, in: layout), 648)
+    }
+
+    func testFullscreenSpaceKeepsItsIdentityWhenMissingFromTheDesktopList() throws {
+        let display = displayRecord(
+            identifier: "Main",
+            spaces: [
+                spaceRecord(id: 4, uuid: "desktop-a"),
+                spaceRecord(id: 252, uuid: "desktop-b")
+            ],
+            current: spaceRecord(id: 700, uuid: "FULLSCREEN-APP", type: 4)
+        )
+        let layout = try XCTUnwrap(DesktopSwitcher.layout(from: [display], mainDisplayID: "Main"))
+        XCTAssertEqual(layout.spaceID, "FULLSCREEN-APP")
+        XCTAssertEqual(layout.currentIndex, -1)
+        XCTAssertEqual(layout.spaceIDs, [4, 252])
+        XCTAssertNil(DesktopSwitcher.neighbor(of: .left, in: layout))
+        XCTAssertNil(DesktopSwitcher.neighbor(of: .right, in: layout))
+    }
+
+    func testSpaceIDFallsBackToTheID64String() throws {
+        let current = spaceRecord(id: 445, uuid: "")
+        let display = displayRecord(identifier: "Main", spaces: [current], current: current)
+        let layout = try XCTUnwrap(DesktopSwitcher.layout(from: [display], mainDisplayID: nil))
+        XCTAssertEqual(layout.spaceID, "445")
+        let parser = StreamParser()
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.space(layout.spaceID))), [.space("445")])
+    }
+
+    func testLayoutFollowsTheStreamedDisplay() throws {
+        let other = displayRecord(
+            identifier: "Other",
+            spaces: [spaceRecord(id: 1, uuid: "other-space")],
+            current: spaceRecord(id: 1, uuid: "other-space")
+        )
+        let main = displayRecord(
+            identifier: "Main",
+            spaces: [spaceRecord(id: 2, uuid: "main-space")],
+            current: spaceRecord(id: 2, uuid: "main-space")
+        )
+        let matched = try XCTUnwrap(DesktopSwitcher.layout(from: [other, main], mainDisplayID: "Main"))
+        XCTAssertEqual(matched.display, "Main")
+        XCTAssertEqual(matched.spaceID, "main-space")
+        let fallback = try XCTUnwrap(DesktopSwitcher.layout(from: [other, main], mainDisplayID: "missing"))
+        XCTAssertEqual(fallback.display, "Other")
+        XCTAssertEqual(fallback.spaceID, "other-space")
+    }
+
+    func testSpaceIsBroadcastWhenTheDesktopChangesAndCachedForNewSessions() throws {
+        let hub = FrameHub(hostName: "Test")
+        let first = try SessionPipe()
+        defer { first.stop() }
+        hub.add(first.session)
+        hub.updateSpace("3991F2FD-B350-68E9-D174-1414C0D927A7")
+        hub.updateSpace("3991F2FD-B350-68E9-D174-1414C0D927A7")
+        hub.updateSpace("4F909C74-F54F-1359-7777-414FEE8BA3FC")
+        XCTAssertEqual(
+            try readSpaces(from: first.client, count: 2),
+            ["3991F2FD-B350-68E9-D174-1414C0D927A7", "4F909C74-F54F-1359-7777-414FEE8BA3FC"]
+        )
+
+        let second = try SessionPipe()
+        defer { second.stop() }
+        hub.add(second.session)
+        XCTAssertEqual(
+            try readSpaces(from: second.client, count: 1),
+            ["4F909C74-F54F-1359-7777-414FEE8BA3FC"]
+        )
+    }
+
     func testHardwareEncoderEmitsDecodableKeyframe() throws {
         let encoder = H264Encoder(fps: 30)
         let delivered = DispatchSemaphore(value: 0)
@@ -196,6 +281,87 @@ final class ServerTests: XCTestCase {
         } catch {
             throw XCTSkip("usbmuxd is not reachable: \(error)")
         }
+    }
+}
+
+private func spaceRecord(id: UInt64, uuid: String?, type: Int = 0) -> [String: Any] {
+    var record: [String: Any] = [
+        "id64": NSNumber(value: id),
+        "type": NSNumber(value: type),
+        "ManagedSpaceID": NSNumber(value: id)
+    ]
+    if let uuid {
+        record["uuid"] = uuid
+    }
+    return record
+}
+
+private func displayRecord(identifier: String, spaces: [[String: Any]], current: [String: Any]) -> [String: Any] {
+    [
+        "Display Identifier": identifier,
+        "Spaces": spaces,
+        "Current Space": current
+    ]
+}
+
+private func readSpaces(from fd: Int32, count: Int, timeout: TimeInterval = 2) throws -> [String] {
+    let parser = StreamParser()
+    var spaces: [String] = []
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline && spaces.count < count {
+        var pollState = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        let readyCount = poll(&pollState, 1, 200)
+        guard readyCount > 0 else { continue }
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let readCount = Darwin.read(fd, &buffer, buffer.count)
+        guard readCount > 0 else { break }
+        for message in try parser.append(Data(buffer.prefix(readCount))) {
+            if case .space(let id) = message {
+                spaces.append(id)
+            }
+        }
+    }
+    return spaces
+}
+
+/// A connected client/server pair. The session owns the accepted socket.
+private final class SessionPipe {
+    let client: Int32
+    let session: StreamSession
+
+    init() throws {
+        let listener = try POSIX.listenTCP(port: 0)
+        let port = try POSIX.boundPort(listener)
+        let accepted = FDBox()
+        let ready = DispatchSemaphore(value: 0)
+        Thread {
+            accepted.fd = Darwin.accept(listener, nil, nil)
+            ready.signal()
+        }.start()
+
+        let clientFD: Int32
+        do {
+            clientFD = try POSIX.connectTCP(host: "127.0.0.1", port: port)
+        } catch {
+            POSIX.close(listener)
+            _ = ready.wait(timeout: .now() + 2)
+            throw error
+        }
+        guard ready.wait(timeout: .now() + 2) == .success, accepted.fd >= 0 else {
+            POSIX.close(clientFD)
+            POSIX.close(listener)
+            throw SocketError.failed("accept", EAGAIN)
+        }
+        POSIX.close(listener)
+        POSIX.configure(accepted.fd)
+        client = clientFD
+        session = StreamSession(fd: accepted.fd, label: "space")
+        session.start()
+    }
+
+    func stop() {
+        session.stop()
+        POSIX.close(client)
     }
 }
 
