@@ -88,6 +88,9 @@ struct ContentView: View {
                     let contact: PointerContact = (pencilControlsMac || tool == .pointer) ? .finger : .button
                     client.send(.pointer(phase, x: x, y: y, contact: contact))
                 },
+                onInk: { png, width, height, spaceID in
+                    client.sendInk(png: png, width: width, height: height, spaceID: spaceID)
+                },
                 onTap: { canvasTapped() },
                 onDoubleTap: { fingerDoubleTapped() },
                 onFingerSwipe: { swipe in

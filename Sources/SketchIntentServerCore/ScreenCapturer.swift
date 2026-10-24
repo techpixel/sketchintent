@@ -34,7 +34,9 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
     var onDisplay: ((CGDirectDisplayID) -> Void)?
 
     private let captureQueue = DispatchQueue(label: "sketchintent.capture")
+    private let exclusionLock = NSLock()
     private var stream: SCStream?
+    private var capturedDisplay: SCDisplay?
     private var encoder: H264Encoder?
     private let fps: Int
 
@@ -51,6 +53,47 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
 
     func requestKeyframe() {
         encoder?.requestKeyframe()
+    }
+
+    /// Drops the ink window from the capture so its pixels are not encoded.
+    /// Ink is never drawn into the sample buffers. Returns whether a filter
+    /// that excludes the window was installed.
+    func excludeOverlayWindow(_ windowID: CGWindowID, completion: @escaping (Bool) -> Void) {
+        exclusionLock.lock()
+        let display = capturedDisplay
+        let stream = self.stream
+        exclusionLock.unlock()
+        Task { [weak self] in
+            let excluded = await self?.installExclusion(windowID: windowID, display: display, stream: stream) ?? false
+            DispatchQueue.main.async {
+                completion(excluded)
+            }
+        }
+    }
+
+    private func installExclusion(windowID: CGWindowID, display: SCDisplay?, stream: SCStream?) async -> Bool {
+        guard let display, let stream else { return false }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            let pid = ProcessInfo.processInfo.processIdentifier
+            let matched = content.windows.filter { window in
+                window.windowID == windowID || window.owningApplication?.processID == pid
+            }
+            let filter: SCContentFilter
+            if !matched.isEmpty {
+                filter = SCContentFilter(display: display, excludingWindows: matched)
+            } else if let application = content.applications.first(where: { $0.processID == pid }) {
+                filter = SCContentFilter(display: display, excludingApplications: [application], exceptingWindows: [])
+            } else {
+                return false
+            }
+            try await stream.updateContentFilter(filter)
+            fputs("[sketchintent] Ink overlay excluded from screen capture.\n", stderr)
+            return true
+        } catch {
+            fputs("[sketchintent] Could not exclude the ink overlay from capture: \(error.localizedDescription)\n", stderr)
+            return false
+        }
     }
 
     func start(bitrate: Int, maxWidth: Int, displayIndex: Int?) async throws -> (width: Int, height: Int) {
@@ -99,7 +142,10 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
         try await stream.startCapture()
+        exclusionLock.lock()
         self.stream = stream
+        capturedDisplay = display
+        exclusionLock.unlock()
         onDisplay?(display.displayID)
         onSize?(width, height)
         return (width, height)

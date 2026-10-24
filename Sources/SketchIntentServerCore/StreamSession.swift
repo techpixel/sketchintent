@@ -15,6 +15,7 @@ final class StreamSession {
     var onStop: (() -> Void)?
     var onBehind: (() -> Void)?
     var onInput: ((RemoteInput) -> Void)?
+    var onInk: ((InkSnapshot) -> Void)?
 
     /// Steady state keeps one frame in flight and one waiting. A third means the link is behind.
     private let maxQueuedFrames = 2
@@ -123,7 +124,7 @@ final class StreamSession {
     /// Gestures travel iPad → Mac on the same socket the video uses in the other direction.
     private func readInbound() {
         let parser = StreamParser()
-        var buffer = [UInt8](repeating: 0, count: 4096)
+        var buffer = [UInt8](repeating: 0, count: 256 * 1024)
         while true {
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count == 0 { break }
@@ -134,8 +135,13 @@ final class StreamSession {
             do {
                 let messages = try parser.append(Data(buffer.prefix(count)))
                 for message in messages {
-                    if case .input(let input) = message {
+                    switch message {
+                    case .input(let input):
                         onInput?(input)
+                    case .ink(let ink):
+                        onInk?(ink)
+                    default:
+                        break
                     }
                 }
             } catch {

@@ -163,6 +163,26 @@ public enum FrameCoordinates {
     }
 }
 
+/// Pen ink for one desktop, already mapped into captured-frame pixels.
+/// The PNG is the whole frame with alpha, so the Mac can stretch it onto the display.
+/// An empty PNG clears the overlay. Voice notes are not included.
+public struct InkSnapshot: Equatable {
+    public var width: Int
+    public var height: Int
+    /// Mission Control id this ink belongs to. Empty until the iPad has heard one.
+    public var spaceID: String
+    public var png: Data
+
+    public init(width: Int, height: Int, spaceID: String, png: Data) {
+        self.width = width
+        self.height = height
+        self.spaceID = spaceID
+        self.png = png
+    }
+
+    public static let pngSignature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+}
+
 public enum StreamMessage: Equatable {
     case hello(StreamHello)
     case videoConfig(VideoConfig)
@@ -171,6 +191,8 @@ public enum StreamMessage: Equatable {
     case input(RemoteInput)
     /// The macOS desktop currently on the streamed display. Sketches stay with this id.
     case space(String)
+    /// Pen ink drawn on the iPad, in captured-frame pixels. Not a video frame.
+    case ink(InkSnapshot)
 }
 
 public enum StreamProtocolError: Error, Equatable, CustomStringConvertible {
@@ -197,6 +219,7 @@ enum StreamMessageType: UInt8 {
     case videoFrame = 4
     case input = 5
     case space = 6
+    case ink = 7
 }
 
 public enum StreamFraming {
@@ -225,6 +248,9 @@ public enum StreamFraming {
         case .space(let id):
             type = .space
             payload = Data(id.utf8)
+        case .ink(let ink):
+            type = .ink
+            payload = ink.encodedPayload()
         }
 
         var packet = Data(capacity: 5 + payload.count)
@@ -299,6 +325,10 @@ public final class StreamParser {
                 if let id = DesktopSpace.id(from: payload) {
                     messages.append(.space(id))
                 }
+            case .ink:
+                if let ink = InkSnapshot(payload: payload) {
+                    messages.append(.ink(ink))
+                }
             }
         }
 
@@ -325,6 +355,41 @@ enum DesktopSpace {
               let id = String(data: payload, encoding: .utf8),
               id.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else { return nil }
         return id
+    }
+}
+
+private extension InkSnapshot {
+    func encodedPayload() -> Data {
+        let space = Data(spaceID.utf8.prefix(80))
+        var payload = Data(capacity: 9 + space.count + png.count)
+        payload.appendBE(UInt32(clamping: max(0, width)))
+        payload.appendBE(UInt32(clamping: max(0, height)))
+        payload.append(UInt8(space.count))
+        payload.append(space)
+        payload.append(png)
+        return payload
+    }
+
+    init?(payload: Data) {
+        var cursor = PayloadCursor(payload)
+        guard let width = cursor.u32(),
+              let height = cursor.u32(),
+              let spaceCount = cursor.u8(),
+              let spaceBytes = cursor.bytes(Int(spaceCount)) else { return nil }
+        let spaceID: String
+        if spaceCount == 0 {
+            spaceID = ""
+        } else {
+            guard let id = DesktopSpace.id(from: spaceBytes) else { return nil }
+            spaceID = id
+        }
+        let png = cursor.remaining()
+        if png.isEmpty {
+            self.init(width: Int(width), height: Int(height), spaceID: spaceID, png: Data())
+            return
+        }
+        guard width > 0, height > 0, png.starts(with: Self.pngSignature) else { return nil }
+        self.init(width: Int(width), height: Int(height), spaceID: spaceID, png: png)
     }
 }
 

@@ -86,17 +86,20 @@ final class FrameHub {
     }
 
     /// Tells every iPad which desktop is on screen. Repeated ids are not sent again.
-    func updateSpace(_ id: String) {
+    /// True when this id is new.
+    @discardableResult
+    func updateSpace(_ id: String) -> Bool {
         lock.lock()
         let changed = lastSpaceID != id
         if changed { lastSpaceID = id }
         let current = changed ? Array(sessions.values) : []
         lock.unlock()
-        guard changed else { return }
+        guard changed else { return false }
         let packet = StreamFraming.encode(.space(id))
         for session in current {
             session.offer(packet, kind: .control)
         }
+        return true
     }
 
     func takeStats() -> (frames: Int, bytes: Int, clients: Int) {

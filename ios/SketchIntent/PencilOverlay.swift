@@ -94,9 +94,10 @@ final class SketchCanvas: ObservableObject {
 
 /// Black pen strokes over the Mac picture, with a white halo so a line stays
 /// visible on light and dark desktops. When a pen stroke ends it is smoothed
-/// lightly, and the halo is redrawn from that smoothed ink. Strokes and voice
-/// notes stay on the iPad. The pointer tool uses the Pencil as one finger on the Mac.
-/// When Control the Mac with Pencil is on, every tool does the same instead of drawing or recording.
+/// lightly, and the halo is redrawn from that smoothed ink. The same pen ink is
+/// sent to the Mac. Voice notes stay on the iPad. The pointer tool uses the Pencil
+/// as one finger on the Mac. When Control the Mac with Pencil is on, every tool
+/// does the same instead of drawing or recording.
 struct PencilOverlay: UIViewRepresentable {
     var spaceID: String?
     var canvas: SketchCanvas
@@ -107,6 +108,7 @@ struct PencilOverlay: UIViewRepresentable {
     var frameWidth: Int
     var frameHeight: Int
     var onPencilPointer: (PointerPhase, UInt16, UInt16) -> Void
+    var onInk: (Data, Int, Int, String) -> Void
     var onTap: () -> Void
     var onDoubleTap: () -> Void
     var onFingerSwipe: (FingerSwipe) -> Void
@@ -129,6 +131,7 @@ struct PencilOverlay: UIViewRepresentable {
         view.onInkChange = { [weak canvas] hasInk in
             canvas?.noteInk(hasInk)
         }
+        view.onInk = onInk
         canvas.attach(view)
         view.setPointer(
             sends: sendsPointer,
@@ -149,6 +152,7 @@ struct PencilOverlay: UIViewRepresentable {
         uiView.onInkChange = { [weak canvas] hasInk in
             canvas?.noteInk(hasInk)
         }
+        uiView.onInk = onInk
         canvas.attach(uiView)
         uiView.setPointer(
             sends: sendsPointer,
@@ -306,6 +310,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var currentSpaceID: String?
     private var appliedTool: SketchTool?
     var onInkChange: ((Bool) -> Void)?
+    /// PNG of this space's pen ink in captured-frame pixels. Empty data clears the Mac.
+    var onInk: (Data, Int, Int, String) -> Void = { _, _, _, _ in }
     var frameWidth = 0
     var frameHeight = 0
     var sendsPointer = false
@@ -316,6 +322,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var lastEraserPoint: CGPoint?
     /// True from pencil-down to lift while the pen tool is inking. Eraser, pointer, and Mac-control touches never set this.
     private var penStrokeOpen = false
+    private var inkWork: DispatchWorkItem?
+    private var inkLayoutSize = CGSize.zero
+    private var lastSentInk: (png: Data, width: Int, height: Int, spaceID: String)?
     /// How many strokes were already stored when the current pen stroke began. Earlier strokes are left as they are.
     private var strokeCountAtPenDown = 0
     /// Set while a smoothed stroke is written back, so that write is not smoothed again.
@@ -348,6 +357,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private static let eraserRadius: CGFloat = 16
     /// Distance between path samples, in stroke space. Shorter than the tip, so a graze between samples still hits.
     private static let eraserSampleDistance: CGFloat = 2
+    /// Live ink while a stroke is down stays under this width so the link is not flooded.
+    private static let liveInkMaxWidth = 1280
+    private static let liveInkMaxBytes = 400_000
 
     var hasInk: Bool {
         !canvas.drawing.strokes.isEmpty
@@ -360,8 +372,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         onPencil: @escaping (PointerPhase, UInt16, UInt16) -> Void
     ) {
         onPencilPointer = onPencil
+        let sizeChanged = self.frameWidth != frameWidth || self.frameHeight != frameHeight
         self.frameWidth = frameWidth
         self.frameHeight = frameHeight
+        if sizeChanged {
+            publishInk(immediate: true)
+        }
         if sendsPointer && !sends {
             endPointer()
         }
@@ -369,7 +385,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     /// Pen, eraser, and voice notes take effect only while the Pencil is drawing.
-    /// Pointer mode, and Control the Mac with Pencil, leave the page alone and send clicks instead.
+    /// Pointer mode, and Control the Mac with Pencil, leave the page alone and forward the Pencil.
     func apply(tool: SketchTool, drawsWithPencil: Bool) {
         let sendsPencilAsPointer = !drawsWithPencil || tool == .pointer
         let erasing = drawsWithPencil && tool == .eraser
@@ -537,6 +553,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
         lastEraserPoint = nil
         penStrokeOpen = false
+        inkWork?.cancel()
+        inkWork = nil
         if let currentSpaceID {
             drawings[currentSpaceID] = canvas.drawing
             notesBySpace[currentSpaceID] = notes
@@ -560,6 +578,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         noteLayer.setLive(anchor: nil, text: "")
         noteLayer.setNotice(anchor: nil, text: "")
         noteLayer.setSaved(notes: notes, openID: nil)
+        publishInk(immediate: true)
     }
 
     override func layoutSubviews() {
@@ -567,6 +586,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         canvas.frame = bounds
         noteLayer.frame = bounds
         noteLayer.relayout()
+        if bounds.width > 1, bounds.height > 1, bounds.size != inkLayoutSize {
+            inkLayoutSize = bounds.size
+            publishInk(immediate: true)
+        }
     }
 
     /// Finger taps on a dot open its note. A tap on the open bubble leaves it up.
@@ -792,6 +815,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         guard !strokeBounds.isNull, !strokeBounds.isInfinite, strokeBounds.width > 0, strokeBounds.height > 0 else {
             halo.image = nil
             onInkChange?(false)
+            publishInk(immediate: !penStrokeOpen)
             return
         }
         let rect = strokeBounds.insetBy(dx: -12, dy: -12)
@@ -799,6 +823,104 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         halo.image = canvasView.drawing.image(from: rect, scale: scale)
         halo.frame = rect
         onInkChange?(hasInk)
+        publishInk(immediate: !penStrokeOpen)
+    }
+
+    /// Sends this desktop's pen ink. Stroke end, erase, and a space change go immediately.
+    /// While the Pencil is down, updates are throttled and kept small.
+    private func publishInk(immediate: Bool) {
+        guard frameWidth > 1, frameHeight > 1 else { return }
+        if immediate || !penStrokeOpen {
+            inkWork?.cancel()
+            inkWork = nil
+            renderAndSend(live: false)
+            return
+        }
+        guard inkWork == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.inkWork = nil
+            self.renderAndSend(live: self.penStrokeOpen)
+        }
+        inkWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
+    }
+
+    private func renderAndSend(live: Bool) {
+        let spaceID = currentSpaceID ?? ""
+        if canvas.drawing.strokes.isEmpty {
+            emitInk(Data(), width: 0, height: 0, spaceID: spaceID)
+            return
+        }
+        guard let drawingRect = pictureDrawingRect(), drawingRect.width > 0, drawingRect.height > 0 else { return }
+        let budget = min(live ? Self.liveInkMaxBytes : Int.max, protocolInkBudget(spaceID: spaceID))
+        var cap = live ? min(frameWidth, Self.liveInkMaxWidth) : frameWidth
+        for _ in 0..<6 {
+            guard let raster = rasterize(drawingRect: drawingRect, maxPixelWidth: cap) else { return }
+            if raster.png.count <= budget {
+                emitInk(raster.png, width: raster.width, height: raster.height, spaceID: spaceID)
+                return
+            }
+            if cap <= 480 { break }
+            cap = max(480, cap / 2)
+        }
+    }
+
+    private func emitInk(_ png: Data, width: Int, height: Int, spaceID: String) {
+        if let lastSentInk,
+           lastSentInk.png == png,
+           lastSentInk.width == width,
+           lastSentInk.height == height,
+           lastSentInk.spaceID == spaceID {
+            return
+        }
+        lastSentInk = (png, width, height, spaceID)
+        onInk(png, width, height, spaceID)
+    }
+
+    /// The letterboxed picture, in PencilKit drawing coordinates. Same fit as `FrameCoordinates`.
+    private func pictureDrawingRect() -> CGRect? {
+        guard frameWidth > 1, frameHeight > 1, bounds.width > 1, bounds.height > 1 else { return nil }
+        guard let picture = FrameCoordinates.pictureRect(
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height),
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        ), picture.width > 0, picture.height > 0 else { return nil }
+        let scale = canvas.zoomScale > 0 ? canvas.zoomScale : 1
+        return CGRect(
+            x: (CGFloat(picture.x) + canvas.contentOffset.x) / scale,
+            y: (CGFloat(picture.y) + canvas.contentOffset.y) / scale,
+            width: CGFloat(picture.width) / scale,
+            height: CGFloat(picture.height) / scale
+        )
+    }
+
+    private func protocolInkBudget(spaceID: String) -> Int {
+        let header = 1 + 8 + 1 + spaceID.utf8.count
+        return max(0, StreamFraming.maxPayloadLength - header)
+    }
+
+    /// Frame-sized PNG of the ink inside the picture, with the same white halo the iPad draws.
+    private func rasterize(drawingRect: CGRect, maxPixelWidth: Int) -> (png: Data, width: Int, height: Int)? {
+        let pixelWidth = min(frameWidth, max(2, maxPixelWidth))
+        let pixelHeight = max(2, Int((Double(frameHeight) * Double(pixelWidth) / Double(frameWidth)).rounded()))
+        let renderScale = max(CGFloat(pixelWidth) / drawingRect.width, 0.5)
+        let ink = canvas.drawing.image(from: drawingRect, scale: renderScale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let renderer = UIGraphicsImageRenderer(
+            size: CGSize(width: pixelWidth, height: pixelHeight),
+            format: format
+        )
+        let image = renderer.image { context in
+            let blur = max(renderScale * 2.5, 1)
+            context.cgContext.setShadow(offset: .zero, blur: blur, color: UIColor.white.cgColor)
+            ink.draw(in: CGRect(x: 0, y: 0, width: CGFloat(pixelWidth), height: CGFloat(pixelHeight)))
+        }
+        guard let png = image.pngData(), !png.isEmpty else { return nil }
+        return (png, pixelWidth, pixelHeight)
     }
 
     /// Deletes every stroke the eraser touches on the way down and while it moves.

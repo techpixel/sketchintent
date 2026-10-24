@@ -6,11 +6,12 @@ public final class Server {
     private let hub: FrameHub
     private let capturer: ScreenCapturer
     private let pointer: MacPointer
+    private let ink = InkOverlay()
     private let listener = TCPListener()
     private let advertiser = ServiceAdvertiser()
     private var usb: USBWatcher?
-    /// Dispatch sources, not run-loop timers. `main.swift` parks the process with
-    /// `dispatchMain()`, which does not fire `Timer`.
+    /// Dispatch sources, not run-loop timers. `main.swift` parks on `NSApplication.run()`,
+    /// which services this queue. `Timer` is not used.
     private var mainQueueTimers: [DispatchSourceTimer] = []
 
     public init(config: ServerConfig) {
@@ -40,8 +41,11 @@ public final class Server {
         capturer.onVideo = { [hub] config, frame in
             hub.broadcast(config: config, frame: frame)
         }
-        capturer.onDisplay = { [pointer] id in
+        capturer.onDisplay = { [pointer, ink, capturer] id in
             pointer.noteDisplay(id)
+            ink.place(on: id) { windowID, completion in
+                capturer.excludeOverlayWindow(windowID, completion: completion)
+            }
         }
         capturer.onSize = { [hub, pointer] width, height in
             hub.updateDisplay(width: width, height: height)
@@ -49,25 +53,27 @@ public final class Server {
             print("[sketchintent] Display \(width)×\(height).")
         }
 
-        if let id = DesktopSwitcher.currentLayout()?.spaceID {
-            hub.updateSpace(id)
+        if let id = DesktopSwitcher.currentLayout()?.spaceID, hub.updateSpace(id) {
+            ink.noteSpace(id)
         }
 
-        try listener.start(port: config.tcpPort) { [hub, pointer] fd in
-            Server.attach(fd: fd, label: "tcp", hub: hub, pointer: pointer)
+        try listener.start(port: config.tcpPort) { [hub, pointer, ink] fd in
+            Server.attach(fd: fd, label: "tcp", hub: hub, pointer: pointer, ink: ink)
         }
 
         let watcher = USBWatcher(port: config.usbPort)
         usb = watcher
-        watcher.onSession = { [hub, pointer] fd, label, onDisconnect in
-            Server.attach(fd: fd, label: label, hub: hub, pointer: pointer, onDisconnect: onDisconnect)
+        watcher.onSession = { [hub, pointer, ink] fd, label, onDisconnect in
+            Server.attach(fd: fd, label: label, hub: hub, pointer: pointer, ink: ink, onDisconnect: onDisconnect)
         }
         watcher.start()
         advertiser.start(name: hostName, port: Int(config.tcpPort))
 
-        scheduleOnMainQueue(every: 0.2) { [hub] in
+        scheduleOnMainQueue(every: 0.2) { [hub, ink] in
             guard let id = DesktopSwitcher.currentLayout()?.spaceID else { return }
-            hub.updateSpace(id)
+            if hub.updateSpace(id) {
+                ink.noteSpace(id)
+            }
         }
 
         scheduleOnMainQueue(every: 2) { [hub] in
@@ -97,6 +103,7 @@ public final class Server {
         label: String,
         hub: FrameHub,
         pointer: MacPointer,
+        ink: InkOverlay,
         onDisconnect: (() -> Void)? = nil
     ) {
         let session = StreamSession(fd: fd, label: label)
@@ -116,6 +123,9 @@ public final class Server {
             case .trackpadClick(let button, let phase):
                 pointer.postTrackpadClick(button: button, phase: phase)
             }
+        }
+        session.onInk = { snapshot in
+            ink.show(snapshot)
         }
         hub.add(session)
         session.start()

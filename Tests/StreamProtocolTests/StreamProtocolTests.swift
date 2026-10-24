@@ -201,4 +201,43 @@ final class StreamProtocolTests: XCTestCase {
         XCTAssertEqual(USBMuxPorts.plistValue(for: 2345), 10505)
         XCTAssertEqual(USBMuxPorts.plistValue(for: 22), 5632)
     }
+
+    func testInkRoundTripSkipsUnknownAndMalformed() throws {
+        let space = "3991F2FD-B350-68E9-D174-1414C0D927A7"
+        let png = InkSnapshot.pngSignature + Data([0x11, 0x22])
+        let ink = InkSnapshot(width: 1920, height: 1080, spaceID: space, png: png)
+        let clear = InkSnapshot(width: 0, height: 0, spaceID: space, png: Data())
+        let encoded = StreamFraming.encode(.ink(ink))
+        XCTAssertLessThanOrEqual(encoded.count, 4 + StreamFraming.maxPayloadLength)
+        XCTAssertEqual(encoded[4], 7)
+        XCTAssertEqual(Array(encoded[5..<9]), [0x00, 0x00, 0x07, 0x80])
+        XCTAssertEqual(Array(encoded[9..<13]), [0x00, 0x00, 0x04, 0x38])
+        XCTAssertEqual(encoded[13], UInt8(space.utf8.count))
+
+        var unknownLength = UInt32(2).bigEndian
+        var unknown = Data()
+        withUnsafeBytes(of: &unknownLength) { unknown.append(contentsOf: $0) }
+        unknown.append(0x7f)
+        unknown.append(0xAB)
+
+        var shortLength = UInt32(5).bigEndian
+        var short = Data()
+        withUnsafeBytes(of: &shortLength) { short.append(contentsOf: $0) }
+        short.append(7)
+        short.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+
+        let bogus = StreamFraming.encode(.ink(InkSnapshot(width: 8, height: 8, spaceID: "", png: Data([1, 2, 3, 4]))))
+        let parser = StreamParser()
+        XCTAssertEqual(try parser.append(Data(encoded.prefix(6))), [])
+        let rest = Data(encoded.dropFirst(6))
+            + unknown
+            + short
+            + bogus
+            + StreamFraming.encode(.ink(clear))
+            + StreamFraming.encode(.heartbeat)
+        XCTAssertEqual(
+            try parser.append(rest),
+            [.ink(ink), .ink(clear), .heartbeat]
+        )
+    }
 }

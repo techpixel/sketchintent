@@ -40,6 +40,10 @@ final class StreamClient: ObservableObject {
     private var parameterSets: [Data] = []
     private weak var display: SampleDisplayView?
     private let stateLock = NSLock()
+    private var latestInk: Data?
+    private var lastSentInk: Data?
+    private var inkSending = false
+    private var inkGeneration = 0
     private var pendingSamples: [CMSampleBuffer] = []
     private var pendingParameterFlush = false
     private var pendingReceivedAt = Date()
@@ -69,6 +73,37 @@ final class StreamClient: ObservableObject {
             guard let self, let connection = self.connection, self.connectionWasReady else { return }
             connection.send(content: packet, completion: .contentProcessed { _ in })
         }
+    }
+
+    /// Latest pen-ink PNG for the active desktop. An empty PNG clears the Mac overlay.
+    /// Only one ink packet is in flight; a newer drawing replaces one that has not been sent.
+    func sendInk(png: Data, width: Int, height: Int, spaceID: String) {
+        let snapshot = InkSnapshot(width: width, height: height, spaceID: spaceID, png: png)
+        let packet = StreamFraming.encode(.ink(snapshot))
+        guard packet.count <= 4 + StreamFraming.maxPayloadLength else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.latestInk = packet
+            self.flushInk()
+        }
+    }
+
+    /// Called on `queue`. Keeps the newest ink and does not queue a stack of PNGs behind the video.
+    private func flushInk() {
+        guard !inkSending, connectionWasReady, let connection, let latestInk, latestInk != lastSentInk else { return }
+        inkSending = true
+        let packet = latestInk
+        let generation = inkGeneration
+        connection.send(content: packet, completion: .contentProcessed { [weak self] error in
+            self?.queue.async {
+                guard let self, self.inkGeneration == generation else { return }
+                self.inkSending = false
+                if error == nil {
+                    self.lastSentInk = packet
+                }
+                self.flushInk()
+            }
+        })
     }
 
     private func startListener() {
@@ -145,6 +180,9 @@ final class StreamClient: ObservableObject {
         format = nil
         parameterSets = []
         connectionWasReady = false
+        inkGeneration += 1
+        inkSending = false
+        lastSentInk = nil
         self.connection = connection
         connectionPriority = priority
         connection.stateUpdateHandler = { [weak self] state in
@@ -158,6 +196,8 @@ final class StreamClient: ObservableObject {
         switch state {
         case .ready:
             connectionWasReady = true
+            lastSentInk = nil
+            flushInk()
             setConnected(true)
             setBadge("Connected over \(label)")
         case .failed(let error):
@@ -238,7 +278,7 @@ final class StreamClient: ObservableObject {
                 noteFrame()
             case .space(let id):
                 announcedSpace = id
-            case .heartbeat, .input:
+            case .heartbeat, .input, .ink:
                 break
             }
         }
