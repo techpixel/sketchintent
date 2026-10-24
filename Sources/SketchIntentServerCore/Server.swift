@@ -8,6 +8,9 @@ public final class Server {
     private let listener = TCPListener()
     private let advertiser = ServiceAdvertiser()
     private var usb: USBWatcher?
+    /// Dispatch sources, not run-loop timers. `main.swift` parks the process with
+    /// `dispatchMain()`, which does not fire `Timer`.
+    private var mainQueueTimers: [DispatchSourceTimer] = []
 
     public init(config: ServerConfig) {
         self.config = config
@@ -40,6 +43,10 @@ public final class Server {
             print("[sketchintent] Display \(width)×\(height).")
         }
 
+        if let id = DesktopSwitcher.currentLayout()?.spaceID {
+            hub.updateSpace(id)
+        }
+
         try listener.start(port: config.tcpPort) { [hub] fd in
             Server.attach(fd: fd, label: "tcp", hub: hub)
         }
@@ -52,12 +59,12 @@ public final class Server {
         watcher.start()
         advertiser.start(name: hostName, port: Int(config.tcpPort))
 
-        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [hub] _ in
+        scheduleOnMainQueue(every: 0.2) { [hub] in
             guard let id = DesktopSwitcher.currentLayout()?.spaceID else { return }
             hub.updateSpace(id)
         }
 
-        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [hub] _ in
+        scheduleOnMainQueue(every: 2) { [hub] in
             let stats = hub.takeStats()
             guard stats.frames > 0 || stats.clients > 0 else { return }
             let fps = stats.frames / 2
@@ -94,5 +101,15 @@ public final class Server {
         }
         hub.add(session)
         session.start()
+    }
+
+    /// Repeating work on the main queue. The source is retained so it is not cancelled.
+    private func scheduleOnMainQueue(every seconds: TimeInterval, _ handler: @escaping () -> Void) {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let interval = DispatchTimeInterval.milliseconds(Int((seconds * 1000).rounded()))
+        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(40))
+        timer.setEventHandler(handler: handler)
+        mainQueueTimers.append(timer)
+        timer.resume()
     }
 }
