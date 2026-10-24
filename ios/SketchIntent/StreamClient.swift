@@ -12,6 +12,8 @@ final class StreamClient: ObservableObject {
     @Published var frameHeight = 0
     /// Mission Control id of the desktop on screen. Sketches are stored under this.
     @Published var spaceID: String?
+    /// True once the socket to the Mac is ready. Blank canvas uses this before any picture arrives.
+    @Published var isConnected = false
     #if targetEnvironment(simulator)
     @Published var badge = "Looking for SketchIntent Server"
     #else
@@ -156,6 +158,7 @@ final class StreamClient: ObservableObject {
         switch state {
         case .ready:
             connectionWasReady = true
+            setConnected(true)
             setBadge("Connected over \(label)")
         case .failed(let error):
             let message = connectionWasReady ? "\(label) failed: \(error.localizedDescription)" : nil
@@ -177,8 +180,17 @@ final class StreamClient: ObservableObject {
             setBadge(badge)
         }
         DispatchQueue.main.async {
+            self.isConnected = false
             self.isLive = false
             self.updateBadge()
+        }
+    }
+
+    private func setConnected(_ connected: Bool) {
+        DispatchQueue.main.async {
+            if self.isConnected != connected {
+                self.isConnected = connected
+            }
         }
     }
 

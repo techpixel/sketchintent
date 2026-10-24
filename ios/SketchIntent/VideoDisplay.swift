@@ -38,6 +38,17 @@ final class SampleDisplayView: UIView {
         needsKeyframe = true
     }
 
+    /// Keeps the decoder attached while the picture is covered. Blank canvas hides the
+    /// layer; it does not tear down the stream, so a later unhide still has frames.
+    func setPictureHidden(_ hidden: Bool) {
+        isHidden = hidden
+        alpha = hidden ? 0 : 1
+        videoLayer.isHidden = hidden
+        videoLayer.opacity = hidden ? 0 : 1
+        isAccessibilityElement = !hidden
+        accessibilityElementsHidden = hidden
+    }
+
     /// Shows frames in decode order. A backlog is flushed back to the newest keyframe.
     @discardableResult
     func present(_ samples: [CMSampleBuffer], parameterSetsChanged: Bool) -> Bool {
@@ -211,14 +222,17 @@ enum H264Display {
 
 struct ScreenDisplay: UIViewRepresentable {
     let client: StreamClient
+    var showsPicture: Bool
 
     func makeUIView(context: Context) -> SampleDisplayView {
         let view = SampleDisplayView()
+        view.setPictureHidden(!showsPicture)
         client.attachDisplay(view)
         return view
     }
 
     func updateUIView(_ view: SampleDisplayView, context: Context) {
+        view.setPictureHidden(!showsPicture)
         client.attachDisplay(view)
     }
 }

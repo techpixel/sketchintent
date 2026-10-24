@@ -5,6 +5,10 @@ private enum SwipeSettings {
     static let naturalKey = "naturalSwiping"
 }
 
+private enum CanvasSettings {
+    static let blankKey = "blankCanvas"
+}
+
 /// UserDefaults keys the pointer-mode setting may use. The toggle writes `key`.
 private enum PencilMacControl {
     static let key = "pencilControlsMac"
@@ -34,23 +38,48 @@ struct ContentView: View {
     @State private var toolSelection = UISelectionFeedbackGenerator()
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(PencilMacControl.key) private var pencilControlsMacStored = false
+    @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
 
     private var showsStatusChrome: Bool {
-        !client.hasFrame || showsChrome
+        !canvasReady || showsChrome
+    }
+
+    /// The page accepts drawing and chrome once a picture is up, and immediately in blank-canvas mode.
+    private var canvasReady: Bool {
+        blankCanvas || client.hasFrame
+    }
+
+    /// Pointer mapping needs the captured size. Without it a click would land on a bogus origin.
+    private var hasCapturedFrameSize: Bool {
+        client.frameWidth > 0 && client.frameHeight > 0
+    }
+
+    private var sendsPencilPointer: Bool {
+        (pencilControlsMac || tool == .pointer) && hasCapturedFrameSize && canvasReady
+    }
+
+    /// Searching chrome stays while the Mac is disconnected. Blank canvas is black before the first frame.
+    private var showsWaiting: Bool {
+        if blankCanvas {
+            return !client.isConnected
+        }
+        return !client.hasFrame
     }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            ScreenDisplay(client: client)
+            ScreenDisplay(client: client, showsPicture: !blankCanvas)
                 .ignoresSafeArea()
+                .opacity(blankCanvas ? 0 : 1)
+                .accessibilityHidden(blankCanvas)
             PencilOverlay(
                 spaceID: client.spaceID,
                 canvas: sketch,
                 tool: tool,
-                acceptsTap: client.hasFrame,
+                acceptsTap: canvasReady,
                 drawsWithPencil: !pencilControlsMac && tool != .pointer,
-                sendsPointer: (pencilControlsMac || tool == .pointer) && client.hasFrame,
+                sendsPointer: sendsPencilPointer,
                 frameWidth: client.frameWidth,
                 frameHeight: client.frameHeight,
                 onPencilPointer: { phase, x, y in
@@ -68,8 +97,9 @@ struct ContentView: View {
             )
             .ignoresSafeArea()
             .accessibilityHidden(true)
-            if !client.hasFrame {
+            if showsWaiting {
                 waiting
+                    .allowsHitTesting(!blankCanvas)
             }
 
             if showsStatusChrome {
@@ -83,7 +113,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
-            if showsTrackpad && client.hasFrame {
+            if showsTrackpad && canvasReady {
                 VirtualTrackpad(
                     onScroll: { dx, dy, phase in
                         client.send(.trackpadScroll(dx: dx, dy: dy, phase: phase))
@@ -107,7 +137,7 @@ struct ContentView: View {
             }
 
             MarkupChrome(
-                showsTools: client.hasFrame,
+                showsTools: canvasReady,
                 showsDial: showsToolDial,
                 showsGear: showsStatusChrome,
                 tool: tool,
@@ -120,8 +150,8 @@ struct ContentView: View {
             .ignoresSafeArea()
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden(client.hasFrame && !showsChrome)
-        .persistentSystemOverlays(client.hasFrame && !showsChrome ? .hidden : .visible)
+        .statusBarHidden(canvasReady && !showsChrome)
+        .persistentSystemOverlays(canvasReady && !showsChrome ? .hidden : .visible)
         .animation(.easeOut(duration: 0.18), value: desktopHint)
         .animation(.easeOut(duration: 0.16), value: showsTrackpad)
         .sheet(isPresented: $showsSettings) {
@@ -133,14 +163,23 @@ struct ContentView: View {
         .onAppear {
             client.start()
             toolSelection.prepare()
-            UIApplication.shared.isIdleTimerDisabled = false
+            updateIdleTimer()
         }
-        .onChange(of: client.hasFrame) { _, hasFrame in
-            UIApplication.shared.isIdleTimerDisabled = hasFrame
-            if !hasFrame {
+        .onChange(of: client.hasFrame) { _, _ in
+            updateIdleTimer()
+        }
+        .onChange(of: blankCanvas) { _, _ in
+            updateIdleTimer()
+        }
+        .onChange(of: canvasReady) { _, ready in
+            if !ready {
                 showsTrackpad = false
             }
         }
+    }
+
+    private func updateIdleTimer() {
+        UIApplication.shared.isIdleTimerDisabled = client.hasFrame || blankCanvas
     }
 
     private func sendSketch() {
@@ -165,7 +204,7 @@ struct ContentView: View {
     /// Finger double-tap on the stream. The Pencil barrel double-tap does not come here,
     /// and this still shows the pad while the Pencil is drawing, erasing, or recording.
     private func fingerDoubleTapped() {
-        guard client.hasFrame else { return }
+        guard canvasReady else { return }
         showsTrackpad = true
     }
 
@@ -199,7 +238,7 @@ struct ContentView: View {
 
     /// Opens the desktop `direction` points at, and flashes a chevron that way.
     private func switchDesktop(_ direction: DesktopDirection) {
-        guard client.hasFrame else { return }
+        guard client.hasFrame || (blankCanvas && client.isConnected) else { return }
         client.send(.switchDesktop(direction))
         desktopHint = direction
         hintToken += 1
@@ -264,7 +303,9 @@ struct ContentView: View {
         [
             "Run SketchIntent Server on the Mac.",
             "Connect this iPad with a USB cable and tap Trust.",
-            "Leave SketchIntent open. The Mac screen appears here.",
+            blankCanvas
+                ? "Leave SketchIntent open. This page stays black while the Mac stays connected."
+                : "Leave SketchIntent open. The Mac screen appears here.",
             "Swipe left or right with three fingers to move between desktops."
         ]
         #endif
@@ -275,6 +316,7 @@ private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(PencilMacControl.key) private var pencilControlsMac = false
+    @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
 
     var body: some View {
         NavigationStack {
@@ -288,6 +330,11 @@ private struct SettingsSheet: View {
                     Toggle("Control the Mac with Pencil", isOn: $pencilControlsMac)
                 } footer: {
                     Text(pencilDetail)
+                }
+                Section {
+                    Toggle("Blank canvas", isOn: $blankCanvas)
+                } footer: {
+                    Text(blankCanvasDetail)
                 }
             }
             .navigationTitle("Settings")
@@ -315,6 +362,13 @@ private struct SettingsSheet: View {
             return "On, the Pencil is a finger on the Mac for every tool, including the pointer: a tap clicks, a drag scrolls, and a hold right-clicks. Drawing and voice notes stay off while this is on."
         }
         return "Off, the Pencil draws, and the voice tool records while the Pencil is held. The pointer tool is still a finger: a tap clicks, a drag scrolls, and a hold right-clicks."
+    }
+
+    private var blankCanvasDetail: String {
+        if blankCanvas {
+            return "On, the page is black and the Mac picture stays hidden. Drawing, voice notes, desktop swipes, and Pencil clicks keep working while the connection stays up."
+        }
+        return "Off, the live Mac screen shows here."
     }
 }
 
