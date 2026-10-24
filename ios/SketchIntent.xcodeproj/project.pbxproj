@@ -17,6 +17,9 @@
 		F00000000000000000000023 /* MarkupChrome.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000022 /* MarkupChrome.swift */; };
 		F00000000000000000000025 /* VoiceAnnotation.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000024 /* VoiceAnnotation.swift */; };
 		F00000000000000000000027 /* VirtualTrackpad.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000026 /* VirtualTrackpad.swift */; };
+		F00000000000000000000029 /* StrokeSmoothing.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000028 /* StrokeSmoothing.swift */; };
+		F0000000000000000000002B /* ShapeFit.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000002A /* ShapeFit.swift */; };
+		F0000000000000000000002D /* LiquidGlassPlate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000002C /* LiquidGlassPlate.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +35,9 @@
 		F00000000000000000000022 /* MarkupChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkupChrome.swift; sourceTree = "<group>"; };
 		F00000000000000000000024 /* VoiceAnnotation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceAnnotation.swift; sourceTree = "<group>"; };
 		F00000000000000000000026 /* VirtualTrackpad.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VirtualTrackpad.swift; sourceTree = "<group>"; };
+		F00000000000000000000028 /* StrokeSmoothing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrokeSmoothing.swift; sourceTree = "<group>"; };
+		F0000000000000000000002A /* ShapeFit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShapeFit.swift; sourceTree = "<group>"; };
+		F0000000000000000000002C /* LiquidGlassPlate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlassPlate.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -71,6 +77,9 @@
 				F00000000000000000000017 /* StreamClient.swift */,
 				F0000000000000000000001C /* VideoDisplay.swift */,
 				F00000000000000000000020 /* PencilOverlay.swift */,
+				F00000000000000000000028 /* StrokeSmoothing.swift */,
+				F0000000000000000000002A /* ShapeFit.swift */,
+				F0000000000000000000002C /* LiquidGlassPlate.swift */,
 				F00000000000000000000022 /* MarkupChrome.swift */,
 				F00000000000000000000024 /* VoiceAnnotation.swift */,
 				F00000000000000000000026 /* VirtualTrackpad.swift */,
@@ -161,6 +170,9 @@
 				F00000000000000000000016 /* StreamClient.swift in Sources */,
 				F0000000000000000000001D /* VideoDisplay.swift in Sources */,
 				F00000000000000000000021 /* PencilOverlay.swift in Sources */,
+				F00000000000000000000029 /* StrokeSmoothing.swift in Sources */,
+				F0000000000000000000002B /* ShapeFit.swift in Sources */,
+				F0000000000000000000002D /* LiquidGlassPlate.swift in Sources */,
 				F00000000000000000000023 /* MarkupChrome.swift in Sources */,
 				F00000000000000000000025 /* VoiceAnnotation.swift in Sources */,
 				F00000000000000000000027 /* VirtualTrackpad.swift in Sources */,
@@ -230,7 +242,7 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UIRequiresFullScreen = YES;
 				INFOPLIST_KEY_UIStatusBarStyle = UIStatusBarStyleLightContent;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -266,7 +278,7 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UIRequiresFullScreen = YES;
 				INFOPLIST_KEY_UIStatusBarStyle = UIStatusBarStyleLightContent;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
