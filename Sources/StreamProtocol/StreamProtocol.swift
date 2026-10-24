@@ -97,19 +97,38 @@ public enum TrackpadButton: UInt8, Equatable {
     case right = 2
 }
 
+/// Where a one-finger tap landed on the virtual trackpad.
+/// Corner values match `TrackpadCornerSecondaryClick`: 1 is bottom right, 2 is bottom left.
+public enum TrackpadTapZone: UInt8, Equatable {
+    case other = 0
+    case bottomRight = 1
+    case bottomLeft = 2
+}
+
 /// Something the iPad asks the Mac to do. The Mac is the only side that reads these.
 /// Kind byte 1 is `switchDesktop` (`[1, direction]`). Kind byte 2 is `pointer`, so older packets still decode.
 /// Kind byte 3 is a trackpad scroll. Kind byte 4 is a trackpad click.
+/// Kind byte 5 is a one-finger pointer move. Kind byte 6 is a trackpad tap.
+/// Kind byte 7 is a three-finger drag. The Mac applies it only when three-finger drag is on.
 public enum RemoteInput: Equatable {
     case switchDesktop(DesktopDirection)
     /// Pencil point in captured-frame pixels. `x` and `y` are inside the video frame, not the iPad view.
     /// One packet is one contact. `button` click-drags; `finger` is the Sidecar-style pan.
     case pointer(PointerPhase, x: UInt16, y: UInt16, contact: PointerContact = .button)
-    /// One-finger travel on the virtual trackpad, in pixels. Positive `dx` is right.
-    /// Positive `dy` is down. This does not move the pointer to a picture point.
+    /// Two-finger travel on the virtual trackpad, in points. Positive `dx` is right.
+    /// Positive `dy` is down. The Mac applies scrolling direction and axis preferences.
     case trackpadScroll(dx: Int16, dy: Int16, phase: TrackpadScrollPhase)
     /// Left or right button at the current cursor. `move` is not a click phase.
     case trackpadClick(TrackpadButton, PointerPhase)
+    /// One-finger travel on the virtual trackpad, in points. Positive `dx` is right
+    /// and positive `dy` is down. Moves the pointer and does not scroll.
+    case trackpadMove(dx: Int16, dy: Int16)
+    /// A finger tap on the pad. `fingers` is 1 or 2. The Mac chooses the button from
+    /// the trackpad's tap-to-click and secondary-click preferences.
+    case trackpadTap(fingers: UInt8, zone: TrackpadTapZone)
+    /// Three-finger travel on the pad. `phase` is down, move, or up. The Mac holds
+    /// the left button only when three-finger drag is enabled.
+    case trackpadDrag(dx: Int16, dy: Int16, phase: PointerPhase, fingers: UInt8)
 }
 
 /// Maps a point in the iPad's video view into captured-frame pixels.
@@ -411,6 +430,18 @@ private extension RemoteInput {
             return payload
         case .trackpadClick(let button, let phase):
             return Data([4, button.rawValue, phase.rawValue])
+        case .trackpadMove(let dx, let dy):
+            var payload = Data([5])
+            payload.appendBE(dx)
+            payload.appendBE(dy)
+            return payload
+        case .trackpadTap(let fingers, let zone):
+            return Data([6, fingers, zone.rawValue])
+        case .trackpadDrag(let dx, let dy, let phase, let fingers):
+            var payload = Data([7, phase.rawValue, fingers])
+            payload.appendBE(dx)
+            payload.appendBE(dy)
+            return payload
         }
     }
 
@@ -443,6 +474,23 @@ private extension RemoteInput {
                   let phase = PointerPhase(rawValue: payload[2]),
                   phase != .move else { return nil }
             self = .trackpadClick(button, phase)
+        case 5:
+            guard payload.count == 5 else { return nil }
+            let dx = Int16(bitPattern: UInt16(payload[1]) << 8 | UInt16(payload[2]))
+            let dy = Int16(bitPattern: UInt16(payload[3]) << 8 | UInt16(payload[4]))
+            self = .trackpadMove(dx: dx, dy: dy)
+        case 6:
+            guard payload.count == 3,
+                  payload[1] == 1 || payload[1] == 2,
+                  let zone = TrackpadTapZone(rawValue: payload[2]) else { return nil }
+            self = .trackpadTap(fingers: payload[1], zone: zone)
+        case 7:
+            guard payload.count == 7,
+                  let phase = PointerPhase(rawValue: payload[1]),
+                  payload[2] >= 1, payload[2] <= 5 else { return nil }
+            let dx = Int16(bitPattern: UInt16(payload[3]) << 8 | UInt16(payload[4]))
+            let dy = Int16(bitPattern: UInt16(payload[5]) << 8 | UInt16(payload[6]))
+            self = .trackpadDrag(dx: dx, dy: dy, phase: phase, fingers: payload[2])
         default:
             return nil
         }

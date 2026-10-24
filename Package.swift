@@ -10,8 +10,17 @@ let package = Package(
     targets: [
         .target(name: "StreamProtocol"),
         .target(
+            name: "HIDAcceleration",
+            path: "Sources/HIDAcceleration",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("IOKit"),
+                .linkedFramework("CoreFoundation")
+            ]
+        ),
+        .target(
             name: "SketchIntentServerCore",
-            dependencies: ["StreamProtocol"]
+            dependencies: ["StreamProtocol", "HIDAcceleration"]
         ),
         .executableTarget(
             name: "SketchIntentServer",

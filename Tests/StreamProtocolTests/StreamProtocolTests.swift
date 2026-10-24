@@ -144,6 +144,33 @@ final class StreamProtocolTests: XCTestCase {
         XCTAssertEqual(try StreamParser().append(skipped), [.heartbeat])
     }
 
+    func testTrackpadMoveAndTapRoundTrip() throws {
+        let move = StreamFraming.encode(.input(.trackpadMove(dx: -2, dy: 30)))
+        XCTAssertEqual(Array(move.suffix(5)), [5, 0xff, 0xfe, 0x00, 0x1e])
+        let drag = StreamFraming.encode(.input(.trackpadDrag(dx: 4, dy: -1, phase: .move, fingers: 3)))
+        XCTAssertEqual(Array(drag.suffix(7)), [7, PointerPhase.move.rawValue, 3, 0x00, 0x04, 0xff, 0xff])
+        let packet = move
+            + StreamFraming.encode(.input(.trackpadTap(fingers: 2, zone: .bottomLeft)))
+            + StreamFraming.encode(.input(.trackpadTap(fingers: 1, zone: .bottomRight)))
+            + drag
+        XCTAssertEqual(
+            try StreamParser().append(packet),
+            [
+                .input(.trackpadMove(dx: -2, dy: 30)),
+                .input(.trackpadTap(fingers: 2, zone: .bottomLeft)),
+                .input(.trackpadTap(fingers: 1, zone: .bottomRight)),
+                .input(.trackpadDrag(dx: 4, dy: -1, phase: .move, fingers: 3))
+            ]
+        )
+
+        var badLength = UInt32(4).bigEndian
+        var bad = Data()
+        withUnsafeBytes(of: &badLength) { bad.append(contentsOf: $0) }
+        bad.append(contentsOf: [5, 6, 3, 9])
+        bad.append(StreamFraming.encode(.heartbeat))
+        XCTAssertEqual(try StreamParser().append(bad), [.heartbeat])
+    }
+
     func testLetterboxedPictureMapsAndBlackBarsAreIgnored() {
         XCTAssertNil(FrameCoordinates.pixel(
             viewX: 40, viewY: 10,

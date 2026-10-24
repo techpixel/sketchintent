@@ -41,6 +41,8 @@ struct ScrollWheelPayload: Equatable {
     /// `CGEventCreateScrollWheelEvent`.
     var deltaY: Int32
     var phase: CGScrollPhase
+    /// Coasting after the fingers lift. `.none` while the fingers are still down.
+    var momentum: CGMomentumScrollPhase = .none
 
     func makeEvent(source: CGEventSource? = nil) -> CGEvent? {
         guard let event = CGEvent(
@@ -52,9 +54,12 @@ struct ScrollWheelPayload: Equatable {
             wheel3: 0
         ) else { return nil }
         event.location = point
-        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
+        // A momentum event carries momentum phase only. The gesture phase stays none
+        // so AppKit treats the tail as coasting rather than a second finger drag.
+        let gesturePhase: Int64 = momentum == .none ? Int64(phase.rawValue) : 0
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: gesturePhase)
         event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(CGMomentumScrollPhase.none.rawValue))
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum.rawValue))
         event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(deltaY))
         event.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(deltaX))
         return event
@@ -260,6 +265,25 @@ final class MacPointer {
     /// Cursor location where the open virtual-trackpad scroll began. Later samples
     /// stay there so the gesture keeps hitting the view that received `began`.
     private var trackpadScrollOrigin: CGPoint?
+    /// Preferences captured when the open scroll began, so a settings change mid-flick
+    /// does not reverse the gesture.
+    private var activeScrollPreferences = TrackpadPreferences.factory
+    /// Last live read. Tracking speed is refreshed with the rest of the pane, but not
+    /// on every pointer sample.
+    private var cachedPreferences = TrackpadPreferences.factory
+    private var preferencesFetchedAt = -TimeInterval.greatestFiniteMagnitude
+    /// Leftover fraction after scaling one-finger travel by tracking speed.
+    private var moveResidualX = 0.0
+    private var moveResidualY = 0.0
+    /// Left button held for a three-finger drag on the virtual trackpad.
+    private var trackpadDragDown = false
+    /// Wheel-space samples for the open scroll, used to coast when momentum is on.
+    private var scrollSamples: [(dx: Int32, dy: Int32, time: TimeInterval)] = []
+    private var momentumState: TrackpadMomentum?
+    private var momentumOrigin: CGPoint?
+    private var momentumTimer: DispatchSourceTimer?
+    private var momentumToken: UInt = 0
+    private var momentumDidBegin = false
     private var longPressTimer: DispatchSourceTimer?
     private var longPressToken: UInt = 0
     private let longPressQueue = DispatchQueue(label: "sketchintent.pointer.longpress")
@@ -272,6 +296,7 @@ final class MacPointer {
 
     deinit {
         longPressTimer?.cancel()
+        momentumTimer?.cancel()
     }
 
     func noteDisplay(_ id: CGDirectDisplayID) {
@@ -290,19 +315,132 @@ final class MacPointer {
 
     func post(phase: PointerPhase, x: UInt16, y: UInt16, contact: PointerContact = .button) {
         lock.lock()
+        let momentumEnd = cancelMomentumLocked()
         let events = lockedEvents(phase: phase, x: x, y: y, contact: contact)
         lock.unlock()
+        postScroll(momentumEnd)
         deliver(events)
     }
 
-    /// Relative trackpad drag. Pixel scroll at the cursor, not a mapped picture point,
-    /// and not a second finger-contact tracker. Positive `dy` is down, as on the pad.
-    func postTrackpadScroll(dx: Int16, dy: Int16, phase: TrackpadScrollPhase) {
+    /// One-finger travel on the virtual trackpad. Positive `dy` is down, in the same
+    /// top-left coordinate space `CGEvent` uses for the cursor. Distance is scaled
+    /// by the Mac tracking-speed setting.
+    func postTrackpadMove(dx: Int16, dy: Int16) {
+        guard dx != 0 || dy != 0 else { return }
+        let scale = TrackpadMapping.pointerScale(trackingSpeed: preferences().trackingSpeed)
         lock.lock()
+        let momentumEnd = cancelMomentumLocked()
+        let releaseDrag = cancelTrackpadDragLocked()
+        let scaled = takeMoveResidualLocked(dx: dx, dy: dy, scale: scale)
         guard accessibilityTrusted() else {
             lock.unlock()
+            postScroll(momentumEnd)
+            if releaseDrag { releaseTrackpadButton() }
             return
         }
+        lock.unlock()
+        postScroll(momentumEnd)
+        if releaseDrag { releaseTrackpadButton() }
+        guard scaled.x != 0 || scaled.y != 0 else { return }
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let cursor = CGEvent(source: source)?.location else { return }
+        let point = CGPoint(x: cursor.x + CGFloat(scaled.x), y: cursor.y + CGFloat(scaled.y))
+        postMouse(.mouseMoved, point: point, button: .left, source: source, touch: false)
+    }
+
+    /// Three-finger travel. The button is held only when three-finger drag is on.
+    /// One-finger moves are unchanged, including while that setting is off.
+    func postTrackpadDrag(dx: Int16, dy: Int16, phase: PointerPhase, fingers: UInt8) {
+        let allowed = fingers >= 3 && preferences(force: phase == .down).threeFingerDrag
+        let scale = TrackpadMapping.pointerScale(trackingSpeed: preferences().trackingSpeed)
+        lock.lock()
+        let momentumEnd = cancelMomentumLocked()
+        guard allowed, accessibilityTrusted() else {
+            let releaseDrag = cancelTrackpadDragLocked()
+            lock.unlock()
+            postScroll(momentumEnd)
+            if releaseDrag { releaseTrackpadButton() }
+            return
+        }
+        let scaled = takeMoveResidualLocked(dx: dx, dy: dy, scale: scale)
+        let pressing = trackpadDragDown
+        if phase == .up {
+            trackpadDragDown = false
+        } else {
+            trackpadDragDown = true
+        }
+        lock.unlock()
+        postScroll(momentumEnd)
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let cursor = CGEvent(source: source)?.location else { return }
+        var point = cursor
+        if scaled.x != 0 || scaled.y != 0 {
+            point = CGPoint(x: cursor.x + CGFloat(scaled.x), y: cursor.y + CGFloat(scaled.y))
+        }
+        switch phase {
+        case .down:
+            postMouse(.leftMouseDown, point: cursor, button: .left, source: source, touch: false)
+            if point != cursor {
+                postMouse(.leftMouseDragged, point: point, button: .left, source: source, touch: false)
+            }
+        case .move:
+            if !pressing {
+                postMouse(.leftMouseDown, point: cursor, button: .left, source: source, touch: false)
+            }
+            postMouse(.leftMouseDragged, point: point, button: .left, source: source, touch: false)
+        case .up:
+            if pressing || scaled.x != 0 || scaled.y != 0 {
+                if !pressing {
+                    postMouse(.leftMouseDown, point: cursor, button: .left, source: source, touch: false)
+                }
+                if point != cursor {
+                    postMouse(.leftMouseDragged, point: point, button: .left, source: source, touch: false)
+                }
+                postMouse(.leftMouseUp, point: point, button: .left, source: source, touch: false)
+            }
+        }
+    }
+
+    /// Two-finger travel. Positive `dy` is down, as on the pad. Scroll direction,
+    /// horizontal scrolling, and momentum follow the Mac trackpad preferences.
+    func postTrackpadScroll(dx: Int16, dy: Int16, phase: TrackpadScrollPhase) {
+        let freshPreferences = phase == .began ? preferences(force: true) : nil
+        lock.lock()
+        var momentumEnd: ScrollWheelPayload?
+        if phase == .began {
+            momentumEnd = cancelMomentumLocked()
+            if let freshPreferences {
+                activeScrollPreferences = freshPreferences
+            }
+            scrollSamples.removeAll()
+        }
+        let releaseDrag = phase == .began && cancelTrackpadDragLocked()
+        let scrollPreferences = activeScrollPreferences
+        guard accessibilityTrusted() else {
+            if phase == .ended || phase == .cancelled {
+                trackpadScrollOrigin = nil
+                scrollSamples.removeAll()
+            }
+            lock.unlock()
+            postScroll(momentumEnd)
+            if releaseDrag { releaseTrackpadButton() }
+            return
+        }
+        guard scrollPreferences.scroll else {
+            if phase == .ended || phase == .cancelled {
+                trackpadScrollOrigin = nil
+                scrollSamples.removeAll()
+            }
+            lock.unlock()
+            postScroll(momentumEnd)
+            if releaseDrag { releaseTrackpadButton() }
+            return
+        }
+        let wheel = TrackpadMapping.wheelDelta(
+            fingerDX: Int32(dx),
+            fingerDY: Int32(dy),
+            preferences: scrollPreferences
+        ) ?? (x: 0, y: 0)
         let source = CGEventSource(stateID: .hidSystemState)
         let cursor = CGEvent(source: source)?.location
         let point: CGPoint
@@ -310,6 +448,8 @@ final class MacPointer {
         case .began:
             guard let cursor else {
                 lock.unlock()
+                postScroll(momentumEnd)
+                if releaseDrag { releaseTrackpadButton() }
                 return
             }
             trackpadScrollOrigin = cursor
@@ -320,6 +460,8 @@ final class MacPointer {
             }
             guard let origin = trackpadScrollOrigin else {
                 lock.unlock()
+                postScroll(momentumEnd)
+                if releaseDrag { releaseTrackpadButton() }
                 return
             }
             point = origin
@@ -327,23 +469,71 @@ final class MacPointer {
                 trackpadScrollOrigin = nil
             }
         }
+        let now = ProcessInfo.processInfo.systemUptime
+        if (phase == .began || phase == .changed) && (wheel.x != 0 || wheel.y != 0) {
+            scrollSamples.append((dx: wheel.x, dy: wheel.y, time: now))
+        }
+        let samples = phase == .ended ? scrollSamples : []
+        let momentum = phase == .ended && scrollPreferences.momentumScroll
+        if phase == .ended || phase == .cancelled {
+            scrollSamples.removeAll()
+        }
         lock.unlock()
+        postScroll(momentumEnd)
+        if releaseDrag { releaseTrackpadButton() }
+        if phase == .changed, wheel.x == 0, wheel.y == 0 { return }
         ScrollWheelPayload(
             point: point,
-            deltaX: Int32(dx),
-            deltaY: Int32(dy),
+            deltaX: wheel.x,
+            deltaY: wheel.y,
             phase: phase.cgScrollPhase
         ).makeEvent(source: source)?.post(tap: .cghidEventTap)
+        if momentum {
+            startMomentum(samples: samples, origin: point)
+        }
+    }
+
+    /// A tap on the pad. The button comes from tap-to-click and secondary click.
+    /// A preference that produces no click still stops an open coast.
+    func postTrackpadTap(fingers: UInt8, zone: TrackpadTapZone) {
+        let button = TrackpadMapping.click(
+            fingers: Int(fingers),
+            zone: zone,
+            preferences: preferences(force: true)
+        )
+        lock.lock()
+        let momentumEnd = cancelMomentumLocked()
+        let releaseDrag = cancelTrackpadDragLocked()
+        guard accessibilityTrusted() else {
+            lock.unlock()
+            postScroll(momentumEnd)
+            if releaseDrag { releaseTrackpadButton() }
+            return
+        }
+        lock.unlock()
+        postScroll(momentumEnd)
+        if releaseDrag { releaseTrackpadButton() }
+        guard let button else { return }
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let cursor = CGEvent(source: source)?.location else { return }
+        let mouse: CGMouseButton = button == .left ? .left : .right
+        let down: CGEventType = button == .left ? .leftMouseDown : .rightMouseDown
+        let up: CGEventType = button == .left ? .leftMouseUp : .rightMouseUp
+        postMouse(down, point: cursor, button: mouse, source: source, touch: false)
+        postMouse(up, point: cursor, button: mouse, source: source, touch: false)
     }
 
     /// Left or right click where the cursor already is. A tap is down then up.
     func postTrackpadClick(button: TrackpadButton, phase: PointerPhase) {
         lock.lock()
+        let momentumEnd = cancelMomentumLocked()
         guard accessibilityTrusted() else {
             lock.unlock()
+            postScroll(momentumEnd)
             return
         }
         lock.unlock()
+        postScroll(momentumEnd)
         let source = CGEventSource(stateID: .hidSystemState)
         guard let cursor = CGEvent(source: source)?.location else { return }
         let type: CGEventType
@@ -365,6 +555,127 @@ final class MacPointer {
             return
         }
         postMouse(type, point: cursor, button: mouse, source: source, touch: false)
+    }
+
+    /// Live pane, reused for a fraction of a second so a drag does not resynchronize
+    /// preferences on every sample. `force` is for the start of a gesture.
+    private func preferences(force: Bool = false) -> TrackpadPreferences {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        if !force, now - preferencesFetchedAt < 0.25 {
+            let cached = cachedPreferences
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let loaded = TrackpadPreferences.load()
+        lock.lock()
+        cachedPreferences = loaded
+        preferencesFetchedAt = ProcessInfo.processInfo.systemUptime
+        lock.unlock()
+        return loaded
+    }
+
+    /// Called with `lock` held. Scaled pixels, keeping the fraction for the next sample.
+    private func takeMoveResidualLocked(dx: Int16, dy: Int16, scale: Double) -> (x: Int32, y: Int32) {
+        moveResidualX += Double(dx) * scale
+        moveResidualY += Double(dy) * scale
+        let ix = Int32(moveResidualX.rounded(.towardZero))
+        let iy = Int32(moveResidualY.rounded(.towardZero))
+        moveResidualX -= Double(ix)
+        moveResidualY -= Double(iy)
+        return (ix, iy)
+    }
+
+    /// Called with `lock` held. True when a three-finger drag still had the button down.
+    private func cancelTrackpadDragLocked() -> Bool {
+        let down = trackpadDragDown
+        trackpadDragDown = false
+        return down
+    }
+
+    private func releaseTrackpadButton() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let cursor = CGEvent(source: source)?.location else { return }
+        postMouse(.leftMouseUp, point: cursor, button: .left, source: source, touch: false)
+    }
+
+    /// Called with `lock` held. The returned event closes an open coast and is posted
+    /// after the lock is released.
+    private func cancelMomentumLocked() -> ScrollWheelPayload? {
+        momentumToken &+= 1
+        momentumTimer?.cancel()
+        momentumTimer = nil
+        let origin = momentumOrigin
+        let running = momentumState != nil
+        momentumState = nil
+        momentumOrigin = nil
+        momentumDidBegin = false
+        guard running, let origin else { return nil }
+        return ScrollWheelPayload(point: origin, deltaX: 0, deltaY: 0, phase: .ended, momentum: .end)
+    }
+
+    private func startMomentum(samples: [(dx: Int32, dy: Int32, time: TimeInterval)], origin: CGPoint) {
+        guard let momentum = TrackpadMomentum.starting(samples: samples) else { return }
+        lock.lock()
+        momentumTimer?.cancel()
+        momentumToken &+= 1
+        let token = momentumToken
+        momentumState = momentum
+        momentumOrigin = origin
+        momentumDidBegin = false
+        let timer = DispatchSource.makeTimerSource(queue: longPressQueue)
+        timer.schedule(deadline: .now() + .milliseconds(16), repeating: .milliseconds(16), leeway: .milliseconds(4))
+        timer.setEventHandler { [weak self] in
+            self?.stepMomentum(token: token)
+        }
+        momentumTimer = timer
+        lock.unlock()
+        timer.resume()
+    }
+
+    private func stepMomentum(token: UInt) {
+        lock.lock()
+        guard token == momentumToken, let state = momentumState, let origin = momentumOrigin else {
+            lock.unlock()
+            return
+        }
+        let opening = !momentumDidBegin
+        momentumDidBegin = true
+        let stepped = state.advance(dt: 1.0 / 60.0)
+        let finished = stepped.next == nil
+        momentumState = stepped.next
+        if finished {
+            momentumTimer?.cancel()
+            momentumTimer = nil
+            momentumOrigin = nil
+            momentumState = nil
+            momentumDidBegin = false
+        }
+        lock.unlock()
+        let source = CGEventSource(stateID: .hidSystemState)
+        let phase: CGMomentumScrollPhase = opening ? .begin : .continuous
+        ScrollWheelPayload(
+            point: origin,
+            deltaX: stepped.dx,
+            deltaY: stepped.dy,
+            phase: .ended,
+            momentum: phase
+        ).makeEvent(source: source)?.post(tap: .cghidEventTap)
+        if finished {
+            ScrollWheelPayload(
+                point: origin,
+                deltaX: 0,
+                deltaY: 0,
+                phase: .ended,
+                momentum: .end
+            ).makeEvent(source: source)?.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func postScroll(_ payload: ScrollWheelPayload?) {
+        guard let payload else { return }
+        payload.makeEvent(source: CGEventSource(stateID: .hidSystemState))?.post(tap: .cghidEventTap)
     }
 
     private func lockedEvents(phase: PointerPhase, x: UInt16, y: UInt16, contact: PointerContact) -> [PointerInjection] {

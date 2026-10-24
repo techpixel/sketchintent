@@ -419,6 +419,279 @@ final class ServerTests: XCTestCase {
         XCTAssertEqual(event.location.y, 9, accuracy: 0.01)
     }
 
+    func testMomentumScrollClearsTheGesturePhase() throws {
+        let event = try XCTUnwrap(
+            ScrollWheelPayload(
+                point: CGPoint(x: 1, y: 2),
+                deltaX: 3,
+                deltaY: -4,
+                phase: .ended,
+                momentum: .begin
+            ).makeEvent()
+        )
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventScrollPhase), 0)
+        XCTAssertEqual(
+            event.getIntegerValueField(.scrollWheelEventMomentumPhase),
+            Int64(CGMomentumScrollPhase.begin.rawValue)
+        )
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1), -4)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventIsContinuous), 1)
+    }
+
+    func testTrackpadPreferencesUseFactoryWhenTheDomainsAreMissing() {
+        let preferences = TrackpadPreferences.resolved(builtin: nil, bluetooth: nil, naturalScrolling: nil)
+        XCTAssertEqual(preferences, .factory)
+        XCTAssertFalse(preferences.tapToClick)
+        XCTAssertTrue(preferences.twoFingerSecondaryClick)
+        XCTAssertEqual(preferences.cornerSecondaryClick, .off)
+        XCTAssertTrue(preferences.naturalScrolling)
+        XCTAssertTrue(preferences.scroll)
+        XCTAssertTrue(preferences.horizontalScroll)
+        XCTAssertTrue(preferences.momentumScroll)
+        XCTAssertEqual(preferences.trackingSpeed, TrackpadPreferences.factoryTrackingSpeed)
+        XCTAssertEqual(TrackpadMapping.pointerScale(trackingSpeed: preferences.trackingSpeed), 1, accuracy: 0.0001)
+        XCTAssertFalse(preferences.threeFingerDrag)
+        XCTAssertFalse(preferences.dragging)
+        XCTAssertFalse(preferences.dragLock)
+    }
+
+    func testBuiltinTrackpadDomainWinsAndNaturalScrollingIsSeparate() {
+        let preferences = TrackpadPreferences.resolved(
+            builtin: [
+                "Clicking": 0,
+                "TrackpadRightClick": 0,
+                "TrackpadCornerSecondaryClick": 2,
+                "TrackpadScroll": 1,
+                "TrackpadHorizScroll": 0,
+                "TrackpadMomentumScroll": 0
+            ],
+            bluetooth: [
+                "Clicking": 1,
+                "TrackpadRightClick": 1,
+                "TrackpadCornerSecondaryClick": 1
+            ],
+            naturalScrolling: 1
+        )
+        XCTAssertFalse(preferences.tapToClick)
+        XCTAssertFalse(preferences.twoFingerSecondaryClick)
+        XCTAssertEqual(preferences.cornerSecondaryClick, .bottomLeft)
+        XCTAssertTrue(preferences.scroll)
+        XCTAssertFalse(preferences.horizontalScroll)
+        XCTAssertFalse(preferences.momentumScroll)
+        XCTAssertTrue(preferences.naturalScrolling)
+    }
+
+    func testBluetoothTrackpadDomainFillsAMissingBuiltinDomain() {
+        let preferences = TrackpadPreferences.resolved(
+            builtin: nil,
+            bluetooth: ["Clicking": true, "TrackpadCornerSecondaryClick": 1],
+            naturalScrolling: nil
+        )
+        XCTAssertTrue(preferences.tapToClick)
+        XCTAssertEqual(preferences.cornerSecondaryClick, .bottomRight)
+        XCTAssertTrue(preferences.twoFingerSecondaryClick)
+        XCTAssertTrue(preferences.naturalScrolling)
+    }
+
+    func testLoadMatchesTheDomainsUserDefaultsReturns() {
+        let defaults = UserDefaults.standard
+        XCTAssertEqual(
+            TrackpadPreferences.load(userDefaults: defaults),
+            TrackpadPreferences.resolved(
+                builtin: defaults.persistentDomain(forName: "com.apple.AppleMultitouchTrackpad"),
+                bluetooth: defaults.persistentDomain(forName: "com.apple.driver.AppleBluetoothMultitouch.trackpad"),
+                naturalScrolling: defaults.object(forKey: "com.apple.swipescrolldirection"),
+            globalTrackingSpeed: defaults.object(forKey: "HIDTrackpadAcceleration")
+                ?? defaults.object(forKey: "com.apple.trackpad.scaling")
+        )
+        )
+    }
+
+    func testTrackpadClickFollowsTapToClickAndSecondaryClick() {
+        var preferences = TrackpadPreferences.factory
+        XCTAssertNil(TrackpadMapping.click(fingers: 1, zone: .other, preferences: preferences))
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomRight, preferences: preferences), .right)
+        XCTAssertEqual(TrackpadMapping.click(fingers: 2, zone: .other, preferences: preferences), .right)
+
+        preferences.tapToClick = true
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .other, preferences: preferences), .left)
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomRight, preferences: preferences), .right)
+
+        preferences.cornerSecondaryClick = .bottomRight
+        preferences.twoFingerSecondaryClick = false
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomRight, preferences: preferences), .right)
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomLeft, preferences: preferences), .left)
+        XCTAssertNil(TrackpadMapping.click(fingers: 2, zone: .other, preferences: preferences))
+
+        preferences.tapToClick = false
+        preferences.cornerSecondaryClick = .bottomLeft
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomRight, preferences: preferences), .right)
+        XCTAssertNil(TrackpadMapping.click(fingers: 1, zone: .bottomLeft, preferences: preferences))
+        preferences.twoFingerSecondaryClick = true
+        XCTAssertEqual(TrackpadMapping.click(fingers: 2, zone: .bottomRight, preferences: preferences), .right)
+    }
+
+    func testPlistNumbersFollowCornerSecondaryClickAndIgnoreTwoFingerTap() {
+        let preferences = TrackpadPreferences.resolved(
+            builtin: [
+                "Clicking": NSNumber(value: 1),
+                "TrackpadRightClick": NSNumber(value: 0),
+                "TrackpadCornerSecondaryClick": NSNumber(value: 2),
+                "TrackpadScroll": NSNumber(value: 1),
+                "TrackpadHorizScroll": NSNumber(value: 1),
+                "TrackpadMomentumScroll": NSNumber(value: 1),
+                "TrackpadThreeFingerDrag": NSNumber(value: 0),
+                "Dragging": NSNumber(value: 0),
+                "DragLock": NSNumber(value: 0)
+            ],
+            bluetooth: nil,
+            naturalScrolling: NSNumber(value: 0),
+            liveTrackingSpeed: 0.6875
+        )
+        XCTAssertTrue(preferences.tapToClick)
+        XCTAssertFalse(preferences.twoFingerSecondaryClick)
+        XCTAssertEqual(preferences.cornerSecondaryClick, .bottomLeft)
+        XCTAssertFalse(preferences.naturalScrolling)
+        XCTAssertTrue(preferences.scroll)
+        XCTAssertTrue(preferences.horizontalScroll)
+        XCTAssertTrue(preferences.momentumScroll)
+        XCTAssertFalse(preferences.threeFingerDrag)
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomLeft, preferences: preferences), .right)
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .bottomRight, preferences: preferences), .right)
+        XCTAssertEqual(TrackpadMapping.click(fingers: 1, zone: .other, preferences: preferences), .left)
+        XCTAssertNil(TrackpadMapping.click(fingers: 2, zone: .other, preferences: preferences))
+        XCTAssertNil(TrackpadMapping.click(fingers: 1, zone: .bottomLeft, preferences: TrackpadPreferences.factory))
+    }
+
+    func testSavedBluetoothDomainBeatsAStaleBuiltinDomain() {
+        let preferences = TrackpadPreferences.resolved(
+            builtin: [
+                "Clicking": 0,
+                "TrackpadRightClick": 1,
+                "TrackpadCornerSecondaryClick": 0,
+                "HIDTrackpadAcceleration": 1
+            ],
+            bluetooth: [
+                "Clicking": 1,
+                "TrackpadRightClick": 0,
+                "TrackpadCornerSecondaryClick": 2,
+                "HIDTrackpadAcceleration": NSNumber(value: 45056),
+                "UserPreferences": 1
+            ],
+            naturalScrolling: 0,
+            globalTrackingSpeed: 3,
+            liveTrackingSpeed: 0.5
+        )
+        XCTAssertTrue(preferences.tapToClick)
+        XCTAssertFalse(preferences.twoFingerSecondaryClick)
+        XCTAssertEqual(preferences.cornerSecondaryClick, .bottomLeft)
+        XCTAssertFalse(preferences.naturalScrolling)
+        XCTAssertEqual(preferences.trackingSpeed, 0.6875, accuracy: 0.0001)
+    }
+
+    func testTrackingSpeedUsesTheKeyThatIsPresent() {
+        let fromDomain = TrackpadPreferences.resolved(
+            builtin: ["Clicking": 1],
+            bluetooth: ["com.apple.trackpad.scaling": 3],
+            naturalScrolling: nil,
+            globalTrackingSpeed: 0,
+            liveTrackingSpeed: 0.6875
+        )
+        XCTAssertEqual(fromDomain.trackingSpeed, 3, accuracy: 0.0001)
+        XCTAssertGreaterThan(TrackpadMapping.pointerScale(trackingSpeed: fromDomain.trackingSpeed), 1)
+
+        let fromGlobal = TrackpadPreferences.resolved(
+            builtin: ["Clicking": 1],
+            bluetooth: nil,
+            naturalScrolling: nil,
+            globalTrackingSpeed: 0,
+            liveTrackingSpeed: 2
+        )
+        XCTAssertEqual(fromGlobal.trackingSpeed, 0, accuracy: 0.0001)
+        XCTAssertLessThan(TrackpadMapping.pointerScale(trackingSpeed: fromGlobal.trackingSpeed), 1)
+
+        let fromLive = TrackpadPreferences.resolved(
+            builtin: nil,
+            bluetooth: nil,
+            naturalScrolling: nil,
+            globalTrackingSpeed: nil,
+            liveTrackingSpeed: 1.5
+        )
+        XCTAssertEqual(fromLive.trackingSpeed, 1.5, accuracy: 0.0001)
+        XCTAssertEqual(TrackpadMapping.pointerScale(trackingSpeed: 0), 0.35, accuracy: 0.0001)
+        XCTAssertEqual(TrackpadMapping.pointerScale(trackingSpeed: 0.6875), 1, accuracy: 0.0001)
+        XCTAssertEqual(TrackpadMapping.pointerScale(trackingSpeed: 3), 2.75, accuracy: 0.0001)
+    }
+
+    func testLiveTrackpadPreferencesStayInsideTheSettingsRange() {
+        let preferences = TrackpadPreferences.load()
+        XCTAssertGreaterThanOrEqual(preferences.trackingSpeed, 0)
+        XCTAssertLessThanOrEqual(preferences.trackingSpeed, 3)
+    }
+
+    func testTrackpadScrollFollowsNaturalDirectionAndHorizontalScrolling() {
+        var preferences = TrackpadPreferences.factory
+        XCTAssertEqual(
+            TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: -6, preferences: preferences)?.x,
+            4
+        )
+        XCTAssertEqual(
+            TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: -6, preferences: preferences)?.y,
+            -6
+        )
+
+        preferences.naturalScrolling = false
+        XCTAssertEqual(
+            TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: -6, preferences: preferences)?.x,
+            -4
+        )
+        XCTAssertEqual(
+            TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: -6, preferences: preferences)?.y,
+            6
+        )
+
+        preferences.naturalScrolling = true
+        preferences.horizontalScroll = false
+        XCTAssertEqual(
+            TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: 3, preferences: preferences)?.x,
+            0
+        )
+        XCTAssertEqual(
+            TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: 3, preferences: preferences)?.y,
+            3
+        )
+
+        preferences.scroll = false
+        XCTAssertNil(TrackpadMapping.wheelDelta(fingerDX: 4, fingerDY: 3, preferences: preferences))
+    }
+
+    func testMomentumContinuesAFlickAndIgnoresASlowLift() throws {
+        let flick = TrackpadMomentum.starting(samples: [
+            (dx: 0, dy: 40, time: 1.0),
+            (dx: 0, dy: 50, time: 1.04)
+        ])
+        let momentum = try XCTUnwrap(flick)
+        XCTAssertEqual(momentum.velocityX, 0, accuracy: 0.01)
+        XCTAssertEqual(momentum.velocityY, 2250, accuracy: 0.01)
+
+        var state: TrackpadMomentum? = momentum
+        var frames = 0
+        var totalY: Int32 = 0
+        while let current = state {
+            let step = current.advance(dt: 1.0 / 60.0)
+            totalY += step.dy
+            state = step.next
+            frames += 1
+            XCTAssertLessThan(frames, 400)
+        }
+        XCTAssertGreaterThan(totalY, 0)
+        XCTAssertNil(state)
+        XCTAssertNil(TrackpadMomentum.starting(samples: [
+            (dx: 1, dy: 1, time: 2),
+            (dx: 1, dy: 0, time: 2.08)
+        ]))
+    }
+
     func testTrackpadScrollPhaseMapsOntoContinuousScroll() {
         XCTAssertEqual(TrackpadScrollPhase.began.cgScrollPhase, .began)
         XCTAssertEqual(TrackpadScrollPhase.changed.cgScrollPhase, .changed)

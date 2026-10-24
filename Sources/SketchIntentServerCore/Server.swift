@@ -122,6 +122,12 @@ public final class Server {
                 pointer.postTrackpadScroll(dx: dx, dy: dy, phase: phase)
             case .trackpadClick(let button, let phase):
                 pointer.postTrackpadClick(button: button, phase: phase)
+            case .trackpadMove(let dx, let dy):
+                pointer.postTrackpadMove(dx: dx, dy: dy)
+            case .trackpadTap(let fingers, let zone):
+                pointer.postTrackpadTap(fingers: fingers, zone: zone)
+            case .trackpadDrag(let dx, let dy, let phase, let fingers):
+                pointer.postTrackpadDrag(dx: dx, dy: dy, phase: phase, fingers: fingers)
             }
         }
         session.onInk = { snapshot in
