@@ -90,8 +90,10 @@ final class SketchCanvas: ObservableObject {
 }
 
 /// Black pen strokes over the Mac picture, with a white halo so a line stays
-/// visible on light and dark desktops. Strokes stay on the iPad. When Control the
-/// Mac with Pencil is on, the Pencil clicks and drags on the Mac instead of drawing.
+/// visible on light and dark desktops. When a pen stroke ends it is smoothed
+/// lightly, and the halo is redrawn from that smoothed ink. Strokes stay on the
+/// iPad. When Control the Mac with Pencil is on, the Pencil clicks and drags
+/// on the Mac instead of drawing.
 struct PencilOverlay: UIViewRepresentable {
     var spaceID: String?
     var canvas: SketchCanvas
@@ -289,6 +291,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var lastPixel: (x: UInt16, y: UInt16)?
     /// Last drawing-space point of an in-progress stroke erase, so a fast drag still covers the gap between touches.
     private var lastEraserPoint: CGPoint?
+    /// True from pencil-down to lift while the pen tool is inking. Eraser, pointer, and Mac-control touches never set this.
+    private var penStrokeOpen = false
+    /// How many strokes were already stored when the current pen stroke began. Earlier strokes are left as they are.
+    private var strokeCountAtPenDown = 0
+    /// Set while a smoothed stroke is written back, so that write is not smoothed again.
+    private var isApplyingSmoothedStroke = false
 
     /// Half of the old 32-point bitmap tip. Touching ink deletes that whole stroke.
     private static let eraserRadius: CGFloat = 16
@@ -426,6 +434,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     func showSpace(_ id: String) {
         guard id != currentSpaceID else { return }
         lastEraserPoint = nil
+        penStrokeOpen = false
         if let currentSpaceID {
             drawings[currentSpaceID] = canvas.drawing
         }
@@ -493,9 +502,38 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         )
     }
 
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        guard !isApplyingSmoothedStroke else { return }
+        penStrokeOpen = true
+        strokeCountAtPenDown = canvasView.drawing.strokes.count
+    }
+
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        guard !isApplyingSmoothedStroke else { return }
+        smoothFinishedPenStroke(on: canvasView)
         halo.isHidden = false
         canvasViewDrawingDidChange(canvasView)
+    }
+
+    /// Replaces only the pen stroke that just finished. The live stroke is left alone until lift,
+    /// and the halo refresh below reads the drawing after this replacement.
+    private func smoothFinishedPenStroke(on canvasView: PKCanvasView) {
+        guard penStrokeOpen else { return }
+        penStrokeOpen = false
+        let strokes = canvasView.drawing.strokes
+        let firstNew = min(strokeCountAtPenDown, strokes.count)
+        guard firstNew < strokes.count else { return }
+        var updated = strokes
+        var didSmooth = false
+        for index in firstNew..<strokes.count {
+            guard let smoothed = StrokeSmoothing.smoothedPenStroke(from: strokes[index]) else { continue }
+            updated[index] = smoothed
+            didSmooth = true
+        }
+        guard didSmooth else { return }
+        isApplyingSmoothedStroke = true
+        canvasView.drawing = PKDrawing(strokes: updated)
+        isApplyingSmoothedStroke = false
     }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
@@ -755,5 +793,135 @@ final class InkCanvasView: PKCanvasView {
     override var backgroundColor: UIColor? {
         get { .clear }
         set { super.backgroundColor = .clear }
+    }
+}
+/// One light pass over a finished pen stroke. PencilKit has no smoothing API, so the
+/// stroke's own control points are averaged and the stroke is replaced.
+///
+/// The window is 10 points of arc length, with triangular weights. The first and last
+/// samples stay where the Pencil put them. Size, opacity, and force use the same
+/// weights, so pressure and width follow the smoothed centerline. Nothing here fits
+/// a circle, rectangle, or straight line.
+private enum StrokeSmoothing {
+    /// How far along the stroke, in points, a sample may influence its neighbors.
+    private static let radius: CGFloat = 10
+
+    /// Nil when the stroke should be kept as PencilKit produced it.
+    static func smoothedPenStroke(from stroke: PKStroke) -> PKStroke? {
+        let path = stroke.path
+        guard path.count >= 3, stroke.ink.inkType == .pen else { return nil }
+        let controls = (0..<path.count).map { path[$0] }
+        let smoothedPath = PKStrokePath(
+            controlPoints: smoothedControls(controls),
+            creationDate: path.creationDate
+        )
+        return PKStroke(
+            ink: stroke.ink,
+            path: smoothedPath,
+            transform: stroke.transform,
+            mask: stroke.mask,
+            randomSeed: stroke.randomSeed
+        )
+    }
+
+    private static func smoothedControls(_ points: [PKStrokePoint]) -> [PKStrokePoint] {
+        let count = points.count
+        var distanceFromStart = [CGFloat](repeating: 0, count: count)
+        for index in 1..<count {
+            let previous = points[index - 1].location
+            let current = points[index].location
+            distanceFromStart[index] = distanceFromStart[index - 1] + hypot(current.x - previous.x, current.y - previous.y)
+        }
+        return points.indices.map { index in
+            let point = points[index]
+            if index == 0 || index == count - 1 { return point }
+            let center = distanceFromStart[index]
+            var left = index
+            while left > 0, center - distanceFromStart[left] <= radius {
+                left -= 1
+            }
+            if center - distanceFromStart[left] > radius {
+                left += 1
+            }
+            var right = index
+            while right + 1 < count, distanceFromStart[right + 1] - center <= radius {
+                right += 1
+            }
+            var weightSum: CGFloat = 0
+            var x: CGFloat = 0
+            var y: CGFloat = 0
+            var width: CGFloat = 0
+            var height: CGFloat = 0
+            var opacity: CGFloat = 0
+            var force: CGFloat = 0
+            for other in left...right {
+                let weight = 1 - abs(distanceFromStart[other] - center) / radius
+                guard weight > 0 else { continue }
+                let sample = points[other]
+                weightSum += weight
+                x += sample.location.x * weight
+                y += sample.location.y * weight
+                width += sample.size.width * weight
+                height += sample.size.height * weight
+                opacity += sample.opacity * weight
+                force += sample.force * weight
+            }
+            guard weightSum > 0 else { return point }
+            return copy(
+                point,
+                location: CGPoint(x: x / weightSum, y: y / weightSum),
+                size: CGSize(width: width / weightSum, height: height / weightSum),
+                opacity: opacity / weightSum,
+                force: force / weightSum
+            )
+        }
+    }
+
+    /// Keeps time, tilt, and ink extras from the original sample. Only the smoothed
+    /// position and the pressure-driven width move.
+    private static func copy(
+        _ point: PKStrokePoint,
+        location: CGPoint,
+        size: CGSize,
+        opacity: CGFloat,
+        force: CGFloat
+    ) -> PKStrokePoint {
+        if #available(iOS 27, *) {
+            return PKStrokePoint(
+                location: location,
+                timeOffset: point.timeOffset,
+                size: size,
+                opacity: opacity,
+                force: force,
+                azimuth: point.azimuth,
+                altitude: point.altitude,
+                secondaryScale: point.secondaryScale,
+                threshold: point.threshold,
+                lateralJitter: point.lateralJitter
+            )
+        }
+        if #available(iOS 26, *) {
+            return PKStrokePoint(
+                location: location,
+                timeOffset: point.timeOffset,
+                size: size,
+                opacity: opacity,
+                force: force,
+                azimuth: point.azimuth,
+                altitude: point.altitude,
+                secondaryScale: point.secondaryScale,
+                threshold: point.threshold
+            )
+        }
+        return PKStrokePoint(
+            location: location,
+            timeOffset: point.timeOffset,
+            size: size,
+            opacity: opacity,
+            force: force,
+            azimuth: point.azimuth,
+            altitude: point.altitude,
+            secondaryScale: point.secondaryScale
+        )
     }
 }
