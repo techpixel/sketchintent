@@ -1,0 +1,293 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		F00000000000000000000008 /* StreamProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000007 /* StreamProtocol.swift */; };
+		F00000000000000000000012 /* SketchIntentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000013 /* SketchIntentApp.swift */; };
+		F00000000000000000000014 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000015 /* ContentView.swift */; };
+		F00000000000000000000016 /* StreamClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000017 /* StreamClient.swift */; };
+		F00000000000000000000018 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000019 /* Assets.xcassets */; };
+		F0000000000000000000001D /* VideoDisplay.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000001C /* VideoDisplay.swift */; };
+		F00000000000000000000021 /* PencilOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000020 /* PencilOverlay.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		F00000000000000000000005 /* SketchIntent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SketchIntent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F00000000000000000000007 /* StreamProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StreamProtocol.swift; path = ../Sources/StreamProtocol/StreamProtocol.swift; sourceTree = "<group>"; };
+		F00000000000000000000013 /* SketchIntentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SketchIntentApp.swift; sourceTree = "<group>"; };
+		F00000000000000000000015 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		F00000000000000000000017 /* StreamClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamClient.swift; sourceTree = "<group>"; };
+		F00000000000000000000019 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F0000000000000000000001A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F0000000000000000000001C /* VideoDisplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoDisplay.swift; sourceTree = "<group>"; };
+		F00000000000000000000020 /* PencilOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilOverlay.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F0000000000000000000000A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		F00000000000000000000003 = {
+			isa = PBXGroup;
+			children = (
+				F00000000000000000000006 /* SketchIntent */,
+				F0000000000000000000001B /* Support */,
+				F00000000000000000000007 /* StreamProtocol.swift */,
+				F00000000000000000000004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F00000000000000000000004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F00000000000000000000005 /* SketchIntent.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F00000000000000000000006 /* SketchIntent */ = {
+			isa = PBXGroup;
+			children = (
+				F00000000000000000000013 /* SketchIntentApp.swift */,
+				F00000000000000000000015 /* ContentView.swift */,
+				F00000000000000000000017 /* StreamClient.swift */,
+				F0000000000000000000001C /* VideoDisplay.swift */,
+				F00000000000000000000020 /* PencilOverlay.swift */,
+				F00000000000000000000019 /* Assets.xcassets */,
+			);
+			path = SketchIntent;
+			sourceTree = "<group>";
+		};
+		F0000000000000000000001B /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				F0000000000000000000001A /* Info.plist */,
+			);
+			path = Support;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F00000000000000000000002 /* SketchIntent */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F0000000000000000000000D /* Build configuration list for PBXNativeTarget "SketchIntent" */;
+			buildPhases = (
+				F00000000000000000000009 /* Sources */,
+				F0000000000000000000000A /* Frameworks */,
+				F0000000000000000000000B /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = SketchIntent;
+			productName = SketchIntent;
+			productReference = F00000000000000000000005 /* SketchIntent.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					F00000000000000000000002 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+				};
+			};
+			buildConfigurationList = F0000000000000000000000C /* Build configuration list for PBXProject "SketchIntent" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = F00000000000000000000003;
+			productRefGroup = F00000000000000000000004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				F00000000000000000000002 /* SketchIntent */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F0000000000000000000000B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F00000000000000000000018 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F00000000000000000000009 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F00000000000000000000012 /* SketchIntentApp.swift in Sources */,
+				F00000000000000000000014 /* ContentView.swift in Sources */,
+				F00000000000000000000016 /* StreamClient.swift in Sources */,
+				F0000000000000000000001D /* VideoDisplay.swift in Sources */,
+				F00000000000000000000021 /* PencilOverlay.swift in Sources */,
+				F00000000000000000000008 /* StreamProtocol.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		F0000000000000000000000E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		F0000000000000000000000F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F00000000000000000000010 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = FB6CXUS5JW;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Support/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = SketchIntent;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "SketchIntent finds your Mac on the local network when the USB connection is not available.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UIRequiresFullScreen = YES;
+				INFOPLIST_KEY_UIStatusBarStyle = UIStatusBarStyleLightContent;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sketchintent.ipad;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		F00000000000000000000011 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = FB6CXUS5JW;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Support/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = SketchIntent;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "SketchIntent finds your Mac on the local network when the USB connection is not available.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UIRequiresFullScreen = YES;
+				INFOPLIST_KEY_UIStatusBarStyle = UIStatusBarStyleLightContent;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sketchintent.ipad;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F0000000000000000000000C /* Build configuration list for PBXProject "SketchIntent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F0000000000000000000000E /* Debug */,
+				F0000000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F0000000000000000000000D /* Build configuration list for PBXNativeTarget "SketchIntent" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F00000000000000000000010 /* Debug */,
+				F00000000000000000000011 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = F00000000000000000000001 /* Project object */;
+}
