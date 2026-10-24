@@ -1,0 +1,10 @@
+---
+description: Sketch Intent Figma frames are a landscape iPad screen
+alwaysApply: true
+---
+
+The Figma file `0wkKI9eOVZERjEvLKvZ3PH` (Sketch Intent) is an iPad in landscape. Its artboard is the device screen, not a desktop mock and not a frame floating in extra canvas.
+
+When placing a frame on the iPad, scale that landscape artboard onto the screen and keep the frame's position on it. Do not treat the frame's origin as a window offset, and do not re-center a frame the file already places on the iPad.
+
+The virtual trackpad is an exception: it uses the Figma size and is anchored to the bottom center, because that placement was requested separately.
