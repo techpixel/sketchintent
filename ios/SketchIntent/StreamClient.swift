@@ -7,6 +7,8 @@ import UIKit
 /// The simulator and a Mac on the same network connect the other way.
 final class StreamClient: ObservableObject {
     @Published var hasFrame = false
+    /// Mission Control id of the desktop on screen. Sketches are stored under this.
+    @Published var spaceID: String?
     #if targetEnvironment(simulator)
     @Published var badge = "Looking for SketchIntent Server"
     #else
@@ -203,6 +205,7 @@ final class StreamClient: ObservableObject {
 
         var samples: [CMSampleBuffer] = []
         var flushDisplay = false
+        var announcedSpace: String?
         for message in messages {
             switch message {
             case .hello(let hello):
@@ -218,11 +221,20 @@ final class StreamClient: ObservableObject {
                 guard let format, let sample = H264Display.sampleBuffer(from: frame, format: format) else { continue }
                 samples.append(sample)
                 noteFrame()
+            case .space(let id):
+                announcedSpace = id
             case .heartbeat, .input:
                 break
             }
         }
 
+        if let announcedSpace {
+            DispatchQueue.main.async {
+                if self.spaceID != announcedSpace {
+                    self.spaceID = announcedSpace
+                }
+            }
+        }
         scheduleUI(samples: samples, parameterFlush: flushDisplay)
     }
 

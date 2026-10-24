@@ -137,16 +137,17 @@ final class ServerTests: XCTestCase {
     }
 
     func testDesktopSwitchMovesToTheNeighboringSpace() {
-        let layout = DesktopLayout(display: "Main", spaceIDs: [4, 252, 648], currentIndex: 1)
+        let layout = DesktopLayout(display: "Main", spaceIDs: [4, 252, 648], currentIndex: 1, spaceID: "middle")
         XCTAssertEqual(DesktopSwitcher.neighbor(of: .right, in: layout), 648)
         XCTAssertEqual(DesktopSwitcher.neighbor(of: .left, in: layout), 4)
-        XCTAssertNil(DesktopSwitcher.neighbor(of: .left, in: DesktopLayout(display: "Main", spaceIDs: [4], currentIndex: 0)))
-        XCTAssertNil(DesktopSwitcher.neighbor(of: .right, in: DesktopLayout(display: "Main", spaceIDs: [4, 252], currentIndex: 1)))
+        XCTAssertNil(DesktopSwitcher.neighbor(of: .left, in: DesktopLayout(display: "Main", spaceIDs: [4], currentIndex: 0, spaceID: "only")))
+        XCTAssertNil(DesktopSwitcher.neighbor(of: .right, in: DesktopLayout(display: "Main", spaceIDs: [4, 252], currentIndex: 1, spaceID: "last")))
     }
 
     func testDesktopLayoutReadsTheLiveSpaces() throws {
         let layout = try XCTUnwrap(DesktopSwitcher.currentLayout())
         XCTAssertFalse(layout.display.isEmpty)
+        XCTAssertFalse(layout.spaceID.isEmpty)
         XCTAssertFalse(layout.spaceIDs.isEmpty)
         XCTAssertGreaterThanOrEqual(layout.currentIndex, 0)
         XCTAssertLessThan(layout.currentIndex, layout.spaceIDs.count)

@@ -8,6 +8,8 @@ struct DesktopLayout: Equatable {
     var display: String
     var spaceIDs: [UInt64]
     var currentIndex: Int
+    /// Mission Control UUID for the desktop on screen. Stable across a login session.
+    var spaceID: String
 }
 
 /// Moves between macOS desktops directly. Control–arrow is not used: that shortcut
@@ -60,10 +62,18 @@ enum DesktopSwitcher {
         guard let display, let name = display["Display Identifier"] as? String else { return nil }
         let spaces = display["Spaces"] as? [[String: Any]] ?? []
         let ids = spaces.compactMap { ($0["id64"] as? NSNumber)?.uint64Value }
-        guard let current = (display["Current Space"] as? [String: Any])?["id64"] as? NSNumber,
-              let index = ids.firstIndex(of: current.uint64Value),
-              !ids.isEmpty else { return nil }
-        return DesktopLayout(display: name, spaceIDs: ids, currentIndex: index)
+        guard let current = display["Current Space"] as? [String: Any],
+              let currentNumber = (current["id64"] as? NSNumber)?.uint64Value,
+              let index = ids.firstIndex(of: currentNumber),
+              !ids.isEmpty,
+              let spaceID = Self.spaceID(in: current) else { return nil }
+        return DesktopLayout(display: name, spaceIDs: ids, currentIndex: index, spaceID: spaceID)
+    }
+
+    private static func spaceID(in space: [String: Any]) -> String? {
+        if let uuid = space["uuid"] as? String, !uuid.isEmpty { return uuid }
+        if let number = space["id64"] as? NSNumber { return String(number.uint64Value) }
+        return nil
     }
 
     private static func activate(_ spaceID: UInt64, on display: String) -> Bool {

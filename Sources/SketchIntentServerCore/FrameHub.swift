@@ -9,6 +9,7 @@ final class FrameHub {
     private var sessions: [UUID: StreamSession] = [:]
     private var hello: StreamHello
     private var lastConfig: VideoConfig?
+    private var lastSpaceID: String?
     private var frames = 0
     private var bytes = 0
 
@@ -30,12 +31,16 @@ final class FrameHub {
         sessions[id] = session
         let hello = self.hello
         let config = lastConfig
+        let spaceID = lastSpaceID
         lock.unlock()
         if hello.width > 0 && hello.height > 0 {
             session.offerHello(hello)
         }
         if let config {
             session.offer(StreamFraming.encode(.videoConfig(config)), kind: .control)
+        }
+        if let spaceID {
+            session.offer(StreamFraming.encode(.space(spaceID)), kind: .control)
         }
         onNeedsKeyframe?()
     }
@@ -77,6 +82,20 @@ final class FrameHub {
                 session.offer(configPacket, kind: .control)
             }
             session.offer(framePacket, kind: .frame(keyframe: frame.isKeyframe))
+        }
+    }
+
+    /// Tells every iPad which desktop is on screen. Repeated ids are not sent again.
+    func updateSpace(_ id: String) {
+        lock.lock()
+        let changed = lastSpaceID != id
+        if changed { lastSpaceID = id }
+        let current = changed ? Array(sessions.values) : []
+        lock.unlock()
+        guard changed else { return }
+        let packet = StreamFraming.encode(.space(id))
+        for session in current {
+            session.offer(packet, kind: .control)
         }
     }
 

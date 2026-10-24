@@ -76,6 +76,8 @@ public enum StreamMessage: Equatable {
     case videoFrame(VideoFrame)
     case heartbeat
     case input(RemoteInput)
+    /// The macOS desktop currently on the streamed display. Sketches stay with this id.
+    case space(String)
 }
 
 public enum StreamProtocolError: Error, Equatable, CustomStringConvertible {
@@ -101,6 +103,7 @@ enum StreamMessageType: UInt8 {
     case heartbeat = 3
     case videoFrame = 4
     case input = 5
+    case space = 6
 }
 
 public enum StreamFraming {
@@ -126,6 +129,9 @@ public enum StreamFraming {
         case .input(let input):
             type = .input
             payload = input.encodedPayload()
+        case .space(let id):
+            type = .space
+            payload = Data(id.utf8)
         }
 
         var packet = Data(capacity: 5 + payload.count)
@@ -196,6 +202,10 @@ public final class StreamParser {
                 if let input = RemoteInput(payload: payload) {
                     messages.append(.input(input))
                 }
+            case .space:
+                if let id = DesktopSpace.id(from: payload) {
+                    messages.append(.space(id))
+                }
             }
         }
 
@@ -212,6 +222,16 @@ public final class StreamParser {
         let b2 = UInt32(buffer[index + 2])
         let b3 = UInt32(buffer[index + 3])
         return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    }
+}
+
+enum DesktopSpace {
+    /// A space id is the Mission Control UUID, a short ASCII token.
+    static func id(from payload: Data) -> String? {
+        guard (1...80).contains(payload.count),
+              let id = String(data: payload, encoding: .utf8),
+              id.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else { return nil }
+        return id
     }
 }
 

@@ -52,6 +52,11 @@ public final class Server {
         watcher.start()
         advertiser.start(name: hostName, port: Int(config.tcpPort))
 
+        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [hub] _ in
+            guard let id = DesktopSwitcher.currentLayout()?.spaceID else { return }
+            hub.updateSpace(id)
+        }
+
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [hub] _ in
             let stats = hub.takeStats()
             guard stats.frames > 0 || stats.clients > 0 else { return }

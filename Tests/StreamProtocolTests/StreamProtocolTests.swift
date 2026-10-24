@@ -68,6 +68,13 @@ final class StreamProtocolTests: XCTestCase {
         XCTAssertEqual(try parser.append(packet), [.input(.switchDesktop(.right))])
     }
 
+    func testSpaceIdentityRoundTrip() throws {
+        let packet = StreamFraming.encode(.space("3991F2FD-B350-68E9-D174-1414C0D927A7"))
+        let parser = StreamParser()
+        XCTAssertEqual(try parser.append(packet), [.space("3991F2FD-B350-68E9-D174-1414C0D927A7")])
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.space(""))), [])
+    }
+
     func testUSBMuxPortByteSwap() {
         XCTAssertEqual(USBMuxPorts.plistValue(for: 2345), 10505)
         XCTAssertEqual(USBMuxPorts.plistValue(for: 22), 5632)

@@ -1,19 +1,22 @@
 import SwiftUI
 import UIKit
 
-private enum FingerSwipe {
-    case left
-    case right
-}
-
 private enum SwipeSettings {
     static let naturalKey = "naturalSwiping"
 }
 
+private struct SharedSketch: Identifiable {
+    let id = UUID()
+    let image: UIImage
+}
+
 struct ContentView: View {
     @StateObject private var client = StreamClient()
+    @StateObject private var sketch = SketchCanvas()
+    @State private var tool = SketchTool.pen
     @State private var showsChrome = true
     @State private var showsSettings = false
+    @State private var sharedSketch: SharedSketch?
     @State private var desktopHint: DesktopDirection?
     @State private var hintToken = 0
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
@@ -27,9 +30,13 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
             ScreenDisplay(client: client)
                 .ignoresSafeArea()
-            PencilOverlay()
-                .ignoresSafeArea()
-                .accessibilityHidden(true)
+            PencilOverlay(spaceID: client.spaceID, canvas: sketch, tool: tool, acceptsTap: client.hasFrame) {
+                showsChrome.toggle()
+            } onFingerSwipe: { swipe in
+                switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
+            }
+            .ignoresSafeArea()
+            .accessibilityHidden(true)
             if !client.hasFrame {
                 waiting
             }
@@ -55,18 +62,16 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
-            ScreenTouchLayer(acceptsTap: client.hasFrame) {
-                showsChrome.toggle()
-            } onFingerSwipe: { swipe in
-                switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            MarkupChrome(
+                showsTools: client.hasFrame,
+                showsGear: showsStatusChrome,
+                tool: tool,
+                canSend: sketch.hasInk,
+                onTool: { tool = $0 },
+                onSend: sendSketch,
+                onSettings: { showsSettings = true }
+            )
             .ignoresSafeArea()
-
-            SettingsGear(isVisible: showsStatusChrome) {
-                showsSettings = true
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(client.hasFrame && !showsChrome)
@@ -75,6 +80,9 @@ struct ContentView: View {
         .sheet(isPresented: $showsSettings) {
             SettingsSheet()
         }
+        .sheet(item: $sharedSketch) { sketch in
+            ActivityView(image: sketch.image)
+        }
         .onAppear {
             client.start()
             UIApplication.shared.isIdleTimerDisabled = false
@@ -82,6 +90,11 @@ struct ContentView: View {
         .onChange(of: client.hasFrame) { _, hasFrame in
             UIApplication.shared.isIdleTimerDisabled = hasFrame
         }
+    }
+
+    private func sendSketch() {
+        guard let image = sketch.snapshot() else { return }
+        sharedSketch = SharedSketch(image: image)
     }
 
     /// Opens the desktop `direction` points at, and flashes a chevron that way.
@@ -164,19 +177,13 @@ private struct SettingsSheet: View {
 
     var body: some View {
         NavigationStack {
-            VStack(alignment: .leading, spacing: 16) {
-                Toggle("Natural swiping", isOn: $naturalSwiping)
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.white)
-                Text(detail)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.78))
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
+            Form {
+                Section {
+                    Toggle("Natural swiping", isOn: $naturalSwiping)
+                } footer: {
+                    Text(detail)
+                }
             }
-            .padding(24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(Color.black)
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -184,13 +191,10 @@ private struct SettingsSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .toolbarBackground(Color.black, for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
         .presentationDetents([.medium])
         .presentationDragIndicator(.visible)
-        .presentationBackground(Color.black)
     }
 
     private var detail: String {
@@ -201,142 +205,12 @@ private struct SettingsSheet: View {
     }
 }
 
-/// Gear in the top-right corner. Touches anywhere else fall through to the gesture layer.
-private struct SettingsGear: UIViewControllerRepresentable {
-    var isVisible: Bool
-    var action: () -> Void
+private struct ActivityView: UIViewControllerRepresentable {
+    let image: UIImage
 
-    func makeUIViewController(context: Context) -> GearController {
-        let controller = GearController()
-        controller.action = action
-        return controller
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [image], applicationActivities: nil)
     }
 
-    func updateUIViewController(_ controller: GearController, context: Context) {
-        controller.action = action
-        controller.setVisible(isVisible)
-    }
-}
-
-private final class GearController: UIViewController {
-    var action: () -> Void = {}
-    private let button = UIButton(type: .system)
-    private let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
-
-    override func loadView() {
-        view = PassthroughView()
-        view.backgroundColor = .clear
-    }
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        blur.isUserInteractionEnabled = false
-        blur.clipsToBounds = true
-        blur.layer.cornerRadius = 18
-        view.addSubview(blur)
-
-        var configuration = UIButton.Configuration.plain()
-        configuration.image = UIImage(systemName: "gearshape")
-        configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)
-        configuration.baseForegroundColor = .white
-        button.configuration = configuration
-        button.accessibilityLabel = "Settings"
-        button.addTarget(self, action: #selector(tapped), for: .touchUpInside)
-        view.addSubview(button)
-
-        button.translatesAutoresizingMaskIntoConstraints = false
-        blur.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            button.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
-            button.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            button.widthAnchor.constraint(equalToConstant: 36),
-            button.heightAnchor.constraint(equalToConstant: 36),
-            blur.leadingAnchor.constraint(equalTo: button.leadingAnchor),
-            blur.trailingAnchor.constraint(equalTo: button.trailingAnchor),
-            blur.topAnchor.constraint(equalTo: button.topAnchor),
-            blur.bottomAnchor.constraint(equalTo: button.bottomAnchor)
-        ])
-    }
-
-    func setVisible(_ visible: Bool) {
-        button.isHidden = !visible
-        blur.isHidden = !visible
-    }
-
-    @objc private func tapped() {
-        action()
-    }
-}
-
-/// Full-screen host that only accepts touches on its subviews.
-private final class PassthroughView: UIView {
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        let hit = super.hitTest(point, with: event)
-        return hit === self ? nil : hit
-    }
-}
-
-/// One-finger tap toggles the status badge. Three-finger swipes change desktops.
-private struct ScreenTouchLayer: UIViewRepresentable {
-    var acceptsTap: Bool
-    var onTap: () -> Void
-    var onFingerSwipe: (FingerSwipe) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(acceptsTap: acceptsTap, onTap: onTap, onFingerSwipe: onFingerSwipe)
-    }
-
-    func makeUIView(context: Context) -> FingerTouchView {
-        let view = FingerTouchView()
-        view.backgroundColor = .clear
-        view.isMultipleTouchEnabled = true
-
-        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped))
-        tap.numberOfTouchesRequired = 1
-        tap.allowedTouchTypes = FingerTouchView.fingerTouchTypes
-        view.addGestureRecognizer(tap)
-
-        for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
-            let swipe = UISwipeGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.swiped(_:)))
-            swipe.direction = direction
-            swipe.numberOfTouchesRequired = 3
-            swipe.allowedTouchTypes = FingerTouchView.fingerTouchTypes
-            view.addGestureRecognizer(swipe)
-        }
-        return view
-    }
-
-    func updateUIView(_ uiView: FingerTouchView, context: Context) {
-        context.coordinator.acceptsTap = acceptsTap
-        context.coordinator.onTap = onTap
-        context.coordinator.onFingerSwipe = onFingerSwipe
-    }
-
-    final class Coordinator: NSObject {
-        var acceptsTap: Bool
-        var onTap: () -> Void
-        var onFingerSwipe: (FingerSwipe) -> Void
-
-        init(acceptsTap: Bool, onTap: @escaping () -> Void, onFingerSwipe: @escaping (FingerSwipe) -> Void) {
-            self.acceptsTap = acceptsTap
-            self.onTap = onTap
-            self.onFingerSwipe = onFingerSwipe
-        }
-
-        @objc func tapped() {
-            guard acceptsTap else { return }
-            onTap()
-        }
-
-        @objc func swiped(_ recognizer: UISwipeGestureRecognizer) {
-            switch recognizer.direction {
-            case .left:
-                onFingerSwipe(.left)
-            case .right:
-                onFingerSwipe(.right)
-            default:
-                break
-            }
-        }
-    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
