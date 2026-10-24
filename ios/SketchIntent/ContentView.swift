@@ -136,7 +136,7 @@ struct ContentView: View {
     }
 
     /// Apple Pencil barrel double-tap. The first one shows the tool dial.
-    /// Another, while the dial is up, moves clockwise to the next tool and leaves the dial up.
+    /// Another, while the dial is up, moves clockwise to the next tool and dismisses the dial.
     /// When Settings is using the Pencil as a pointer on the Mac, the double-tap is ignored.
     private func toggleToolFromPencil() {
         guard !pencilControlsMac else { return }
@@ -144,6 +144,7 @@ struct ContentView: View {
         toolSelection.prepare()
         if showsToolDial {
             tool = tool.nextOnDial
+            showsToolDial = false
         } else {
             showsToolDial = true
         }
