@@ -9,26 +9,22 @@ private enum CanvasSettings {
     static let blankKey = "blankCanvas"
 }
 
-/// UserDefaults keys the pointer-mode setting may use. The toggle writes `key`.
-private enum PencilMacControl {
-    static let key = "pencilControlsMac"
-    static let storageKeys = [
-        key,
-        "controlMacWithPencil",
-        "controlsMacWithPencil"
-    ]
-}
-
 private struct SharedSketch: Identifiable {
     let id = UUID()
     let image: UIImage
+}
+
+/// The Mac picture, and its pixel size, from the moment a desktop's sketch started.
+private struct FrozenPicture {
+    var image: UIImage
+    var width: Int
+    var height: Int
 }
 
 struct ContentView: View {
     @StateObject private var client = StreamClient()
     @StateObject private var sketch = SketchCanvas()
     @State private var tool = SketchTool.pen
-    @State private var showsToolDial = false
     @State private var showsChrome = true
     @State private var showsSettings = false
     @State private var showsTrackpad = false
@@ -36,8 +32,8 @@ struct ContentView: View {
     @State private var desktopHint: DesktopDirection?
     @State private var hintToken = 0
     @State private var toolSelection = UISelectionFeedbackGenerator()
+    @State private var frozenBySpace: [String: FrozenPicture] = [:]
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
-    @AppStorage(PencilMacControl.key) private var pencilControlsMacStored = false
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
 
     private var showsStatusChrome: Bool {
@@ -54,8 +50,32 @@ struct ContentView: View {
         client.frameWidth > 0 && client.frameHeight > 0
     }
 
-    private var sendsPencilPointer: Bool {
-        (pencilControlsMac || tool == .pointer) && hasCapturedFrameSize && canvasReady
+    /// A finger drives the Mac with the pen or the eraser, until this desktop has a sketch.
+    /// Lasso keeps the finger off the Mac. A Pencil touch never uses it.
+    private var sendsFingerPointer: Bool {
+        !sketch.hasInk
+            && tool != .lasso
+            && hasCapturedFrameSize
+            && canvasReady
+    }
+
+    /// The still picture for the desktop on screen, taken when its sketch began.
+    private var shownFrozen: FrozenPicture? {
+        if let id = client.spaceID {
+            if let frame = frozenBySpace[id] { return frame }
+            if frozenBySpace.count == 1 { return frozenBySpace[""] }
+            return nil
+        }
+        return frozenBySpace[""]
+    }
+
+    /// Ink and pointer mapping stay on the frame the sketch started with.
+    private var sketchFrameWidth: Int {
+        shownFrozen?.width ?? client.frameWidth
+    }
+
+    private var sketchFrameHeight: Int {
+        shownFrozen?.height ?? client.frameHeight
     }
 
     /// Searching chrome stays while the Mac is disconnected. Blank canvas is black before the first frame.
@@ -69,24 +89,34 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            ScreenDisplay(client: client, showsPicture: !blankCanvas)
-                .ignoresSafeArea()
-                .opacity(blankCanvas ? 0 : 1)
-                .accessibilityHidden(blankCanvas)
+            ScreenDisplay(
+                client: client,
+                showsPicture: !blankCanvas,
+                frozenImage: shownFrozen?.image,
+                frozenWidth: shownFrozen?.width ?? 0,
+                frozenHeight: shownFrozen?.height ?? 0
+            )
+            .ignoresSafeArea()
+            .opacity(blankCanvas ? 0 : 1)
+            .accessibilityHidden(blankCanvas)
             PencilOverlay(
                 spaceID: client.spaceID,
                 canvas: sketch,
                 tool: tool,
                 acceptsTap: canvasReady,
-                drawsWithPencil: !pencilControlsMac && tool != .pointer,
-                sendsPointer: sendsPencilPointer,
-                frameWidth: client.frameWidth,
-                frameHeight: client.frameHeight,
-                onPencilPointer: { phase, x, y in
-                    // The pointer tool is one finger: a tap clicks, a drag scrolls, a hold right-clicks.
-                    // Control the Mac with Pencil uses that same finger path for every other tool.
-                    let contact: PointerContact = (pencilControlsMac || tool == .pointer) ? .finger : .button
-                    client.send(.pointer(phase, x: x, y: y, contact: contact))
+                acceptsCanvasSwipe: shownFrozen != nil && sketch.hasInk,
+                sendsFingerPointer: sendsFingerPointer,
+                frameWidth: sketchFrameWidth,
+                frameHeight: sketchFrameHeight,
+                onFingerPointer: { phase, x, y in
+                    // A finger on the picture: a tap clicks, a drag scrolls, a hold right-clicks.
+                    client.send(.pointer(phase, x: x, y: y, contact: .finger))
+                },
+                onFingerCancel: { x, y in
+                    // A second finger ends that contact. Button-up cancels it so a
+                    // three-finger swipe can switch desktops: a still finger stays
+                    // cancelled, and an open scroll or right-click finishes.
+                    client.send(.pointer(.up, x: x, y: y, contact: .button))
                 },
                 onInk: { png, width, height, spaceID in
                     client.sendInk(png: png, width: width, height: height, spaceID: spaceID)
@@ -94,9 +124,12 @@ struct ContentView: View {
                 onTap: { canvasTapped() },
                 onDoubleTap: { fingerDoubleTapped() },
                 onFingerSwipe: { swipe in
+                    guard !sketch.hasInk else { return }
                     switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
                 },
-                onToggleTool: { toggleToolFromPencil() }
+                onToggleTool: { toggleToolFromPencil() },
+                onSketchBegan: { freezeFrameForCurrentSpace() },
+                onSketchAbandoned: { frozenBySpace[$0] = nil }
             )
             .ignoresSafeArea()
             .accessibilityHidden(true)
@@ -116,13 +149,62 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
+            if client.hasFrame && showsStatusChrome {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Text("\(client.framesPerSecond) fps")
+                            .font(.subheadline.weight(.medium).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                        Spacer()
+                    }
+                }
+                .padding(.leading, 20)
+                .padding(.bottom, 16)
+                .allowsHitTesting(false)
+            }
+
+            if sketch.hasInk || shownFrozen != nil {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button(action: clearSketch) {
+                            Image(systemName: "trash")
+                                .symbolRenderingMode(.monochrome)
+                                .font(.system(size: 20, weight: .medium))
+                                .imageScale(.medium)
+                                .foregroundStyle(.white)
+                                .frame(width: 44, height: 44)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .accessibilityLabel("Clear sketch")
+                    }
+                    Spacer()
+                }
+                .padding(.top, 10)
+                .padding(.trailing, showsStatusChrome ? 74 : 20)
+            }
+
             if showsTrackpad && canvasReady {
                 VirtualTrackpad(
+                    onMove: { dx, dy in
+                        client.send(.trackpadMove(dx: dx, dy: dy))
+                    },
                     onScroll: { dx, dy, phase in
                         client.send(.trackpadScroll(dx: dx, dy: dy, phase: phase))
                     },
-                    onClick: { button, phase in
-                        client.send(.trackpadClick(button, phase))
+                    onTap: { fingers, zone in
+                        client.send(.trackpadTap(fingers: fingers, zone: zone))
+                    },
+                    onDrag: { dx, dy, phase, fingers in
+                        client.send(.trackpadDrag(dx: dx, dy: dy, phase: phase, fingers: fingers))
+                    },
+                    onSwipe: { swipe in
+                        guard !sketch.hasInk else { return }
+                        switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
                     }
                 )
                 .ignoresSafeArea()
@@ -131,8 +213,11 @@ struct ContentView: View {
 
             if let desktopHint {
                 Image(systemName: desktopHint == .left ? "chevron.left" : "chevron.right")
-                    .font(.system(size: 64, weight: .light))
+                    .symbolRenderingMode(.monochrome)
+                    .font(.system(size: 64, weight: .medium))
+                    .imageScale(.medium)
                     .foregroundStyle(.white.opacity(0.85))
+                    .accessibilityHidden(true)
                     .padding(28)
                     .background(.ultraThinMaterial, in: Circle())
                     .allowsHitTesting(false)
@@ -141,14 +226,12 @@ struct ContentView: View {
 
             MarkupChrome(
                 showsTools: canvasReady,
-                showsDial: showsToolDial,
                 showsGear: showsStatusChrome,
                 tool: tool,
                 canSend: sketch.hasInk,
                 onTool: { tool = $0 },
                 onSend: sendSketch,
-                onSettings: { showsSettings = true },
-                onDismissDial: { showsToolDial = false }
+                onSettings: { showsSettings = true }
             )
             .ignoresSafeArea()
         }
@@ -174,6 +257,17 @@ struct ContentView: View {
         .onChange(of: blankCanvas) { _, _ in
             updateIdleTimer()
         }
+        .onChange(of: sketch.hasInk) { _, hasInk in
+            if hasInk {
+                showsTrackpad = false
+            } else {
+                frozenBySpace[client.spaceID ?? ""] = nil
+            }
+        }
+        .onChange(of: client.spaceID) { _, id in
+            guard let id, frozenBySpace[id] == nil, let pending = frozenBySpace.removeValue(forKey: "") else { return }
+            frozenBySpace[id] = pending
+        }
         .onChange(of: canvasReady) { _, ready in
             if !ready {
                 showsTrackpad = false
@@ -190,53 +284,44 @@ struct ContentView: View {
         sharedSketch = SharedSketch(image: image)
     }
 
-    /// One-finger tap. Shows or hides the status badge. While the tool dial is up,
-    /// the same tap also dismisses the dial. While the trackpad is up, that tap
-    /// only dismisses the trackpad. A finger double-tap is a different gesture.
+    /// One-finger tap. Shows or hides the status badge. While the trackpad is up,
+    /// that tap only dismisses the trackpad. The finger's pointer packets follow
+    /// the touch. This toggle waits until a double-tap has failed. A double-tap
+    /// shows the trackpad.
     private func canvasTapped() {
         if showsTrackpad {
             showsTrackpad = false
             return
         }
-        if showsToolDial {
-            showsToolDial = false
-        }
         showsChrome.toggle()
     }
 
-    /// Finger double-tap on the stream. The Pencil barrel double-tap does not come here,
-    /// and this still shows the pad while the Pencil is drawing, erasing, or recording.
+    /// Removes this desktop's sketch and returns the picture to the live Mac frame.
+    private func clearSketch() {
+        sketch.clearSketch()
+        frozenBySpace[client.spaceID ?? ""] = nil
+        frozenBySpace[""] = nil
+    }
+    private func freezeFrameForCurrentSpace() {
+        guard !blankCanvas, client.hasFrame else { return }
+        let key = client.spaceID ?? ""
+        guard frozenBySpace[key] == nil, let captured = client.captureDisplayedFrame() else { return }
+        frozenBySpace[key] = FrozenPicture(image: captured.image, width: captured.width, height: captured.height)
+    }
+    /// A desktop that already has a sketch keeps the finger off the Mac, including the trackpad.
     private func fingerDoubleTapped() {
-        guard canvasReady else { return }
+        guard canvasReady, !sketch.hasInk else { return }
         showsTrackpad = true
     }
 
-    /// Apple Pencil barrel double-tap. The first one shows the tool dial.
-    /// Another, while the dial is up, moves clockwise through pen, pointer, eraser, and voice, then dismisses the dial.
-    /// When Settings is using the Pencil as a pointer on the Mac, the double-tap is ignored.
+    /// Apple Pencil barrel double-tap. Cycles the right-edge slider's tools
+    /// (pen, eraser, lasso) without presenting a dial. The Pencil keeps drawing.
+    /// A finger drives the Mac on an empty desktop with the pen or the eraser.
+    /// Lasso keeps the finger off the Mac.
     private func toggleToolFromPencil() {
-        guard !pencilControlsMac else { return }
         toolSelection.selectionChanged()
         toolSelection.prepare()
-        if showsToolDial {
-            tool = tool.nextOnDial
-            showsToolDial = false
-        } else {
-            showsToolDial = true
-        }
-    }
-
-    /// True when "Control the Mac with Pencil" is on. Default is off until a key is stored.
-    /// Once `pencilControlsMac` is written, that value wins over any alias key.
-    private var pencilControlsMac: Bool {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: PencilMacControl.key) != nil {
-            return pencilControlsMacStored
-        }
-        for key in PencilMacControl.storageKeys where key != PencilMacControl.key && defaults.object(forKey: key) != nil {
-            if defaults.bool(forKey: key) { return true }
-        }
-        return pencilControlsMacStored
+        tool = tool.nextOnDial
     }
 
     /// Opens the desktop `direction` points at, and flashes a chevron that way.
@@ -266,8 +351,11 @@ struct ContentView: View {
     private var waiting: some View {
         VStack(spacing: 22) {
             Image(systemName: "ipad.and.arrow.forward")
-                .font(.system(size: 56, weight: .light))
+                .symbolRenderingMode(.monochrome)
+                .font(.system(size: 56, weight: .medium))
+                .imageScale(.medium)
                 .foregroundStyle(.white)
+                .accessibilityHidden(true)
             Text("Waiting for your Mac")
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.white)
@@ -318,8 +406,8 @@ struct ContentView: View {
 private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
-    @AppStorage(PencilMacControl.key) private var pencilControlsMac = false
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
+    @AppStorage(CartesiaSettings.key) private var cartesiaAPIKey = ""
 
     var body: some View {
         NavigationStack {
@@ -330,14 +418,16 @@ private struct SettingsSheet: View {
                     Text(detail)
                 }
                 Section {
-                    Toggle("Control the Mac with Pencil", isOn: $pencilControlsMac)
-                } footer: {
-                    Text(pencilDetail)
-                }
-                Section {
                     Toggle("Blank canvas", isOn: $blankCanvas)
                 } footer: {
                     Text(blankCanvasDetail)
+                }
+                Section {
+                    SecureField("Cartesia API key", text: $cartesiaAPIKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } footer: {
+                    Text("Voice notes are transcribed by Cartesia Ink-2. The key stays on this iPad.")
                 }
             }
             .navigationTitle("Settings")
@@ -360,16 +450,9 @@ private struct SettingsSheet: View {
         return "Off, swiping is inverted. A three-finger swipe left opens the desktop on the left, and a swipe right opens the desktop on the right."
     }
 
-    private var pencilDetail: String {
-        if pencilControlsMac {
-            return "On, the Pencil is a finger on the Mac for every tool, including the pointer: a tap clicks, a drag scrolls, and a hold right-clicks. Drawing and voice notes stay off while this is on."
-        }
-        return "Off, the Pencil draws, and the voice tool records while the Pencil is held. The pointer tool is still a finger: a tap clicks, a drag scrolls, and a hold right-clicks."
-    }
-
     private var blankCanvasDetail: String {
         if blankCanvas {
-            return "On, the page is black and the Mac picture stays hidden. Drawing, voice notes, desktop swipes, and Pencil clicks keep working while the connection stays up."
+            return "On, the page is black and the Mac picture stays hidden. Drawing, voice notes, and desktop swipes keep working while the connection stays up."
         }
         return "Off, the live Mac screen shows here."
     }

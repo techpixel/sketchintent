@@ -2,6 +2,16 @@ import AVFoundation
 import Speech
 import UIKit
 
+/// The Cartesia key for Ink-2. It stays in Settings on this iPad and is not part of the stream.
+enum CartesiaSettings {
+    static let key = "cartesiaAPIKey"
+
+    static var apiKey: String {
+        (UserDefaults.standard.string(forKey: key) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// A voice note anchored to one canvas point. Notes stay on the iPad, keyed by desktop space.
 struct VoiceNote: Identifiable, Equatable {
     let id: UUID
@@ -11,15 +21,15 @@ struct VoiceNote: Identifiable, Equatable {
 
 enum VoiceCaptureBlock: Error {
     case microphone
-    case speech
+    case missingKey
     case unavailable
 
     var message: String {
         switch self {
         case .microphone:
             return "Microphone access is off"
-        case .speech:
-            return "Speech recognition is off"
+        case .missingKey:
+            return "Add a Cartesia API key in Settings"
         case .unavailable:
             return "Voice notes aren't available"
         }
@@ -32,7 +42,7 @@ enum VoiceNoteHit {
     case none
 }
 
-/// Asks for the microphone and speech recognition the first time the voice tool is used.
+/// Asks for the microphone the first time the voice tool is used.
 final class VoicePermissionGate {
     private var inFlight = false
     private var waiters: [(Result<Void, VoiceCaptureBlock>) -> Void] = []
@@ -51,65 +61,72 @@ final class VoicePermissionGate {
         guard !inFlight else { return }
         inFlight = true
         AVAudioApplication.requestRecordPermission { [weak self] _ in
-            SFSpeechRecognizer.requestAuthorization { _ in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.inFlight = false
-                    let result = Self.decision() ?? .failure(.unavailable)
-                    let pending = self.waiters
-                    self.waiters.removeAll()
-                    pending.forEach { $0(result) }
-                }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.inFlight = false
+                let result = Self.decision() ?? .failure(.unavailable)
+                let pending = self.waiters
+                self.waiters.removeAll()
+                pending.forEach { $0(result) }
             }
         }
     }
 
     private static func decision() -> Result<Void, VoiceCaptureBlock>? {
-        let mic = AVAudioApplication.shared.recordPermission
-        let speech = SFSpeechRecognizer.authorizationStatus()
-        if mic == .denied {
+        switch AVAudioApplication.shared.recordPermission {
+        case .denied:
             return .failure(.microphone)
-        }
-        if speech == .denied || speech == .restricted {
-            return .failure(.speech)
-        }
-        if mic == .undetermined || speech == .notDetermined {
+        case .undetermined:
             return nil
-        }
-        if mic == .granted, speech == .authorized {
+        case .granted:
             return .success(())
+        @unknown default:
+            return .failure(.unavailable)
         }
-        return .failure(.unavailable)
     }
 }
 
-/// On-device speech when the recognizer supports it, otherwise the system recognizer.
+/// Streams the microphone to Cartesia Ink-2 and reports the live transcript.
 /// Partial transcripts are delivered on the main queue. Start and stop from the main queue.
 final class VoiceTranscriber {
     var onPartial: ((String) -> Void)?
-    var onFailure: (() -> Void)?
+    var onFailure: ((String) -> Void)?
 
     private let engine = AVAudioEngine()
-    private let recognizer = SFSpeechRecognizer()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
+    private let sampleRate = 16_000
+    private let chunkBytes = 3_200
+    private var socket: URLSessionWebSocketTask?
+    private var converter: AVAudioConverter?
+    private var targetFormat: AVAudioFormat?
     private var tapInstalled = false
     private var listening = false
-    private var didFallBack = false
     private var generation = 0
     private let lock = NSLock()
+    private var pending = Data()
+    private var finishedTurns: [String] = []
+    private var activeTurn = ""
     private var latest = ""
 
     func start() throws {
-        listening = false
+        guard !CartesiaSettings.apiKey.isEmpty else {
+            throw VoiceCaptureBlock.missingKey
+        }
         generation += 1
-        didFallBack = false
+        finishedTurns = []
+        activeTurn = ""
+        pending.removeAll()
         store("")
         tearDownEngine()
+        listening = true
         do {
-            try beginEngine(onDevice: recognizer?.supportsOnDeviceRecognition == true)
-            listening = true
+            try beginEngine()
+            try openSocket()
+        } catch let block as VoiceCaptureBlock {
+            listening = false
+            tearDownEngine()
+            throw block
         } catch {
+            listening = false
             tearDownEngine()
             throw VoiceCaptureBlock.unavailable
         }
@@ -120,89 +137,202 @@ final class VoiceTranscriber {
         guard listening else { return text }
         listening = false
         generation += 1
+        flushPending()
+        socket?.send(.string("{\"type\":\"close\"}")) { _ in }
         tearDownEngine()
         return text
     }
 
-    private func beginEngine(onDevice: Bool) throws {
-        guard let recognizer, recognizer.isAvailable else {
-            throw VoiceCaptureBlock.unavailable
-        }
+    private func beginEngine() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.record, mode: .measurement, options: .duckOthers)
+        try session.setCategory(
+            .playAndRecord,
+            mode: .spokenAudio,
+            options: [.duckOthers, .defaultToSpeaker, .allowBluetoothHFP]
+        )
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        if onDevice {
-            request.requiresOnDeviceRecognition = true
-        }
-        lock.lock()
-        self.request = request
-        lock.unlock()
-
         let input = engine.inputNode
+        engine.prepare()
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw VoiceCaptureBlock.unavailable
         }
+        guard let target = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: Double(sampleRate),
+            channels: 1,
+            interleaved: true
+        ) else {
+            throw VoiceCaptureBlock.unavailable
+        }
+        targetFormat = target
+        converter = AVAudioConverter(from: format, to: target)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.append(buffer)
+            self?.consume(buffer)
         }
         tapInstalled = true
-        engine.prepare()
         try engine.start()
-        listen(onDevice: onDevice)
     }
 
-    private func listen(onDevice: Bool) {
-        guard let recognizer, let request else { return }
-        let generation = self.generation
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-            if let text = result?.bestTranscription.formattedString, !text.isEmpty, self.generation == generation {
-                self.store(text)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.generation == generation, self.listening else { return }
-                    self.onPartial?(text)
-                }
-            }
-            guard error != nil else { return }
-            let empty = self.currentText().isEmpty
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation == generation, self.listening else { return }
-                if onDevice, empty, !self.didFallBack {
-                    self.didFallBack = true
-                    self.restart(onDevice: false)
-                    return
-                }
-                if empty {
-                    self.onFailure?()
+    private func openSocket() throws {
+        var components = URLComponents()
+        components.scheme = "wss"
+        components.host = "api.cartesia.ai"
+        components.path = "/stt/turns/websocket"
+        components.queryItems = [
+            URLQueryItem(name: "model", value: "ink-2"),
+            URLQueryItem(name: "encoding", value: "pcm_s16le"),
+            URLQueryItem(name: "sample_rate", value: String(sampleRate)),
+            URLQueryItem(name: "cartesia_version", value: "2026-08-14")
+        ]
+        guard let url = components.url else {
+            throw VoiceCaptureBlock.unavailable
+        }
+        var request = URLRequest(url: url)
+        request.setValue(CartesiaSettings.apiKey, forHTTPHeaderField: "X-API-Key")
+        let socket = URLSession.shared.webSocketTask(with: request)
+        self.socket = socket
+        socket.resume()
+        receive(generation: generation)
+    }
+
+    private func receive(generation: Int) {
+        socket?.receive { [weak self] result in
+            guard let self, self.generation == generation, self.listening else { return }
+            switch result {
+            case .success(let message):
+                self.handle(message)
+                self.receive(generation: generation)
+            case .failure:
+                DispatchQueue.main.async {
+                    guard self.generation == generation, self.listening else { return }
+                    if self.currentText().isEmpty {
+                        self.fail(VoiceCaptureBlock.unavailable.message)
+                    }
                 }
             }
         }
     }
 
-    /// On-device recognition can fail when the locale asset is missing. One system retry, then surface the error.
-    private func restart(onDevice: Bool) {
+    private func handle(_ message: URLSessionWebSocketTask.Message) {
+        let text: String?
+        switch message {
+        case .string(let value):
+            text = value
+        case .data(let value):
+            text = String(data: value, encoding: .utf8)
+        @unknown default:
+            text = nil
+        }
+        guard let text, let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else { return }
+        switch type {
+        case "turn.update", "turn.eager_end", "turn.resume":
+            if let transcript = json["transcript"] as? String {
+                activeTurn = transcript
+                publish()
+            }
+        case "turn.end":
+            if let transcript = json["transcript"] as? String {
+                commitTurn(transcript)
+            }
+            publish()
+        case "error":
+            let message = (json["message"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? VoiceCaptureBlock.unavailable.message
+            DispatchQueue.main.async { [weak self] in
+                self?.fail(message)
+            }
+        default:
+            break
+        }
+    }
+
+    private func consume(_ buffer: AVAudioPCMBuffer) {
+        guard listening, let pcm = convert(buffer) else { return }
+        lock.lock()
+        pending.append(pcm)
+        var chunks: [Data] = []
+        while pending.count >= chunkBytes {
+            chunks.append(pending.prefix(chunkBytes))
+            pending.removeFirst(chunkBytes)
+        }
+        lock.unlock()
+        for chunk in chunks {
+            send(chunk)
+        }
+    }
+
+    private func convert(_ buffer: AVAudioPCMBuffer) -> Data? {
+        guard let converter, let targetFormat else { return nil }
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 32
+        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
+        var error: NSError?
+        var provided = false
+        converter.convert(to: output, error: &error) { _, status in
+            if provided {
+                status.pointee = .noDataNow
+                return nil
+            }
+            provided = true
+            status.pointee = .haveData
+            return buffer
+        }
+        guard error == nil, let samples = output.int16ChannelData else { return nil }
+        let count = Int(output.frameLength) * MemoryLayout<Int16>.size
+        guard count > 0 else { return nil }
+        return Data(bytes: samples[0], count: count)
+    }
+
+    private func send(_ data: Data) {
+        socket?.send(.data(data)) { _ in }
+    }
+
+    private func flushPending() {
+        lock.lock()
+        let rest = pending
+        pending.removeAll()
+        lock.unlock()
+        if !rest.isEmpty {
+            send(rest)
+        }
+    }
+
+    private func commitTurn(_ transcript: String) {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        activeTurn = ""
+        guard !trimmed.isEmpty else { return }
+        if finishedTurns.last == trimmed { return }
+        finishedTurns.append(trimmed)
+    }
+
+    private func publish() {
+        let text = displayedText()
+        store(text)
+        guard !text.isEmpty else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.listening else { return }
+            self.onPartial?(text)
+        }
+    }
+
+    private func displayedText() -> String {
+        var parts = finishedTurns
+        let trimmed = activeTurn.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, parts.last != trimmed {
+            parts.append(trimmed)
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private func fail(_ message: String) {
         listening = false
         generation += 1
         tearDownEngine()
-        do {
-            try beginEngine(onDevice: onDevice)
-            listening = true
-        } catch {
-            listening = false
-            tearDownEngine()
-            onFailure?()
-        }
-    }
-
-    private func append(_ buffer: AVAudioPCMBuffer) {
-        lock.lock()
-        let request = self.request
-        lock.unlock()
-        request?.append(buffer)
+        onFailure?(message)
     }
 
     private func store(_ text: String) {
@@ -225,13 +355,10 @@ final class VoiceTranscriber {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
-        lock.lock()
-        let activeRequest = request
-        request = nil
-        lock.unlock()
-        activeRequest?.endAudio()
-        task?.cancel()
-        task = nil
+        converter = nil
+        targetFormat = nil
+        socket?.cancel(with: .goingAway, reason: nil)
+        socket = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
@@ -321,13 +448,19 @@ final class VoiceNoteLayer: UIView {
         if !bubbleHost.isHidden, bubbleHost.frame.contains(point) {
             return .bubble
         }
-        let hits = notes.filter { Self.targetRect(around: $0.anchor).contains(point) }
-        guard let nearest = hits.min(by: { lhs, rhs in
-            Self.distance(lhs.anchor, point) < Self.distance(rhs.anchor, point)
-        }) else {
-            return .none
+        if let id = noteID(at: point) {
+            return .dot(id)
         }
-        return .dot(nearest.id)
+        return .none
+    }
+
+    /// Saved note for this space whose 44pt target contains the point.
+    /// The open bubble is not a dot. A pen tap or hold resolves the dot here.
+    func noteID(at point: CGPoint) -> UUID? {
+        let hits = notes.filter { Self.targetRect(around: $0.anchor).contains(point) }
+        return hits.min(by: { lhs, rhs in
+            Self.distance(lhs.anchor, point) < Self.distance(rhs.anchor, point)
+        })?.id
     }
 
     private func render() {
@@ -336,7 +469,7 @@ final class VoiceNoteLayer: UIView {
         if let liveAnchor {
             showBubble(
                 text: liveText,
-                symbol: "mic.fill",
+                symbol: "mic",
                 near: liveAnchor,
                 placeholder: "Listening…"
             )
@@ -350,7 +483,7 @@ final class VoiceNoteLayer: UIView {
         } else if let openID, let note = notes.first(where: { $0.id == openID }) {
             showBubble(
                 text: note.text,
-                symbol: "mic.fill",
+                symbol: "mic",
                 near: note.anchor,
                 placeholder: nil
             )
@@ -421,7 +554,7 @@ final class VoiceNoteLayer: UIView {
         label.textColor = isPlaceholder ? UIColor.white.withAlphaComponent(0.72) : .white
         icon.image = UIImage(
             systemName: symbol,
-            withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .medium, scale: .medium)
         )
 
         let maxTextWidth = min(240, max(120, bounds.width - 88))

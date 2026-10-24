@@ -32,7 +32,8 @@ final class StreamClient: ObservableObject {
     private var frameTimes: [Date] = []
     private var macName = "Mac"
     private var resolution = ""
-    private var framesPerSecond = 0
+    /// Frames decoded in the last second. Shown at the bottom left of the picture.
+    @Published var framesPerSecond = 0
     private var isLive = false
     private var lastPacket = Date()
     private var timer: Timer?
@@ -65,6 +66,11 @@ final class StreamClient: ObservableObject {
 
     func attachDisplay(_ view: SampleDisplayView) {
         display = view
+    }
+
+    /// The Mac picture on screen right now, for a sketch that should stay on that frame.
+    func captureDisplayedFrame() -> (image: UIImage, width: Int, height: Int)? {
+        display?.capturedFrame()
     }
 
     func send(_ input: RemoteInput) {
@@ -398,8 +404,8 @@ final class StreamClient: ObservableObject {
         if hasFrame && !isLive {
             next = "Reconnecting"
         } else if isLive {
-            let size = resolution.isEmpty ? "" : "\(resolution) · "
-            next = "\(macName) · \(size)\(framesPerSecond) fps"
+            let size = resolution.isEmpty ? macName : "\(macName) · \(resolution)"
+            next = size
         } else {
             return
         }

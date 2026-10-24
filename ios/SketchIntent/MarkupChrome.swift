@@ -1,25 +1,22 @@
 import SwiftUI
 import UIKit
 
-/// Floating markup controls. The tool dial stays hidden until `showsDial`.
-/// Empty space falls through to the canvas while the dial is hidden.
+/// Floating markup controls. The send tab hangs from the top edge. The tool
+/// slider is attached to the right edge. Empty space falls through to the canvas.
 struct MarkupChrome: UIViewControllerRepresentable {
     var showsTools: Bool
-    var showsDial: Bool
     var showsGear: Bool
     var tool: SketchTool
     var canSend: Bool
     var onTool: (SketchTool) -> Void
     var onSend: () -> Void
     var onSettings: () -> Void
-    var onDismissDial: () -> Void
 
     func makeUIViewController(context: Context) -> MarkupChromeController {
         let controller = MarkupChromeController()
         controller.onTool = onTool
         controller.onSend = onSend
         controller.onSettings = onSettings
-        controller.onDismissDial = onDismissDial
         return controller
     }
 
@@ -27,9 +24,7 @@ struct MarkupChrome: UIViewControllerRepresentable {
         controller.onTool = onTool
         controller.onSend = onSend
         controller.onSettings = onSettings
-        controller.onDismissDial = onDismissDial
         controller.showsTools = showsTools
-        controller.showsDial = showsDial
         controller.showsGear = showsGear
         controller.tool = tool
         controller.canSend = canSend
@@ -37,21 +32,40 @@ struct MarkupChrome: UIViewControllerRepresentable {
     }
 }
 
+/// Spacing shared by the send tab (Figma 28:356) and the tool slider (Figma 28:326).
+private enum ChromeMetrics {
+    /// `rounded-bl` / `rounded-br` of 16 on the send tab. The slider uses the same radius on its free corners.
+    static let cornerRadius: CGFloat = 16
+    static let sendWidth: CGFloat = 200
+    static let sendHeight: CGFloat = 49
+    static let sliderWidth: CGFloat = 60
+    /// Node 28:326 is 385pt tall with 8pt padding and 10pt gaps around three equal segments.
+    static let sliderLength: CGFloat = 385
+    static let sliderPadding: CGFloat = 8
+    static let sliderGap: CGFloat = 10
+    static let segmentCornerRadius: CGFloat = 8
+    static let segmentLength: CGFloat = (sliderLength - sliderPadding * 2 - sliderGap * 2) / 3
+    /// Selected tool chip from node 28:340. Not a system token.
+    static let selectedFill = UIColor(red: 0, green: 113 / 255, blue: 227 / 255, alpha: 0.4)
+}
+
+/// Medium weight and medium scale for every chrome symbol.
+private func chromeSymbolConfiguration(pointSize: CGFloat) -> UIImage.SymbolConfiguration {
+    UIImage.SymbolConfiguration(pointSize: pointSize, weight: .medium, scale: .medium)
+}
+
 final class MarkupChromeController: UIViewController {
     var showsTools = false
-    var showsDial = false
     var showsGear = false
     var tool = SketchTool.pen
     var canSend = false
     var onTool: (SketchTool) -> Void = { _ in }
     var onSend: () -> Void = {}
     var onSettings: () -> Void = {}
-    var onDismissDial: () -> Void = {}
-    private var dialIsShown = false
 
-    private let toolDial = ToolDialView()
+    private let toolSlider = ToolSliderView()
     private let sendButton = UIButton(type: .system)
-    private let sendPlate = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    private let sendPlate = GlassTab(roundedCorners: [.bottomLeft, .bottomRight])
     private let gearButton = UIButton(type: .system)
     private let gearPlate = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
     private let selection = UISelectionFeedbackGenerator()
@@ -63,33 +77,32 @@ final class MarkupChromeController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        toolDial.onSelect = { [weak self] tool in
+        toolSlider.onSelect = { [weak self] tool in
             self?.choose(tool)
         }
-        toolDial.onCommit = { [weak self] in
-            self?.onDismissDial()
-        }
-        toolDial.isHidden = true
-        toolDial.alpha = 0
-        toolDial.isUserInteractionEnabled = false
-        view.addSubview(toolDial)
+        view.addSubview(toolSlider)
 
-        configure(sendPlate, radius: 28)
-        style(sendButton, symbol: "arrow.up", pointSize: 20, weight: .semibold)
+        sendPlate.isUserInteractionEnabled = true
+        style(
+            sendButton,
+            symbol: "arrow.up",
+            pointSize: 22,
+            contentInsets: NSDirectionalEdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8)
+        )
         sendButton.accessibilityLabel = "Send sketch"
         sendButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
-        sendPlate.contentView.addSubview(sendButton)
+        sendPlate.addSubview(sendButton)
         view.addSubview(sendPlate)
 
         configure(gearPlate, radius: 22)
-        style(gearButton, symbol: "gearshape", pointSize: 17, weight: .medium)
+        style(gearButton, symbol: "gearshape", pointSize: 20)
         gearButton.accessibilityLabel = "Settings"
         gearButton.addTarget(self, action: #selector(settingsTapped), for: .touchUpInside)
         gearPlate.contentView.addSubview(gearButton)
         view.addSubview(gearPlate)
 
         selection.prepare()
-        toolDial.setSelected(tool, animated: false)
+        toolSlider.setSelected(tool)
     }
 
     override func viewDidLayoutSubviews() {
@@ -97,22 +110,26 @@ final class MarkupChromeController: UIViewController {
         let safe = view.safeAreaInsets
         let bounds = view.bounds
 
-        let side = ToolDialView.diameter
-        toolDial.frame = CGRect(
-            x: (bounds.width - side) / 2,
-            y: safe.top + 56,
-            width: side,
-            height: side
-        )
-
-        let sendSide: CGFloat = 56
         sendPlate.frame = CGRect(
-            x: bounds.width - safe.right - 20 - sendSide,
-            y: (bounds.height - sendSide) / 2,
-            width: sendSide,
-            height: sendSide
+            x: (bounds.width - ChromeMetrics.sendWidth) / 2,
+            y: 0,
+            width: ChromeMetrics.sendWidth,
+            height: ChromeMetrics.sendHeight
         )
         sendButton.frame = sendPlate.bounds
+
+        let sliderHeight = ToolSliderView.preferredHeight
+        var sliderY = (bounds.height - sliderHeight) / 2
+        let gearBottom = safe.top + 10 + 44
+        if sliderY < gearBottom + 12 {
+            sliderY = min(gearBottom + 12, max(0, bounds.height - sliderHeight))
+        }
+        toolSlider.frame = CGRect(
+            x: bounds.width - ChromeMetrics.sliderWidth,
+            y: max(0, sliderY),
+            width: ChromeMetrics.sliderWidth,
+            height: sliderHeight
+        )
 
         let gearSide: CGFloat = 44
         gearPlate.frame = CGRect(
@@ -126,60 +143,13 @@ final class MarkupChromeController: UIViewController {
 
     func reload() {
         guard isViewLoaded else { return }
-        sendPlate.isHidden = !showsTools
+        let toolsVisible = showsTools
+        sendPlate.isHidden = !toolsVisible
+        toolSlider.isHidden = !toolsVisible
         gearPlate.isHidden = !showsGear
         sendButton.isEnabled = canSend
         sendPlate.alpha = canSend ? 1 : 0.4
-        toolDial.setSelected(tool, animated: toolDial.selectedTool != tool)
-        guard dialIsShown != showsDial else { return }
-        toolDial.cancelPendingCommit()
-        dialIsShown = showsDial
-        updateDialVisibility(animated: view.window != nil)
-    }
-
-    /// The send button and settings gear stay up with the stream. Only the dial toggles.
-    private func updateDialVisibility(animated: Bool) {
-        if showsDial {
-            toolDial.isHidden = false
-            toolDial.isUserInteractionEnabled = true
-            guard animated else {
-                toolDial.alpha = 1
-                toolDial.transform = .identity
-                return
-            }
-            toolDial.alpha = 0
-            toolDial.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
-            UIView.animate(
-                withDuration: 0.32,
-                delay: 0,
-                usingSpringWithDamping: 0.86,
-                initialSpringVelocity: 0.2,
-                options: [.beginFromCurrentState, .allowUserInteraction]
-            ) {
-                self.toolDial.alpha = 1
-                self.toolDial.transform = .identity
-            }
-        } else {
-            toolDial.isUserInteractionEnabled = false
-            guard animated, !toolDial.isHidden else {
-                toolDial.isHidden = true
-                toolDial.alpha = 0
-                toolDial.transform = .identity
-                return
-            }
-            UIView.animate(
-                withDuration: 0.18,
-                delay: 0,
-                options: [.beginFromCurrentState, .curveEaseIn]
-            ) {
-                self.toolDial.alpha = 0
-            } completion: { _ in
-                guard !self.showsDial else { return }
-                self.toolDial.isHidden = true
-                self.toolDial.alpha = 0
-                self.toolDial.transform = .identity
-            }
-        }
+        toolSlider.setSelected(tool)
     }
 
     private func configure(_ plate: UIVisualEffectView, radius: CGFloat) {
@@ -189,11 +159,18 @@ final class MarkupChromeController: UIViewController {
         plate.isUserInteractionEnabled = true
     }
 
-    private func style(_ button: UIButton, symbol: String, pointSize: CGFloat, weight: UIImage.SymbolWeight) {
+    private func style(
+        _ button: UIButton,
+        symbol: String,
+        pointSize: CGFloat,
+        contentInsets: NSDirectionalEdgeInsets = .zero
+    ) {
+        let symbolConfiguration = chromeSymbolConfiguration(pointSize: pointSize)
         var configuration = UIButton.Configuration.plain()
-        configuration.image = UIImage(systemName: symbol)
-        configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+        configuration.image = UIImage(systemName: symbol, withConfiguration: symbolConfiguration)
+        configuration.preferredSymbolConfigurationForImage = symbolConfiguration
         configuration.baseForegroundColor = .white
+        configuration.contentInsets = contentInsets
         configuration.background.cornerRadius = 18
         button.configuration = configuration
     }
@@ -203,7 +180,7 @@ final class MarkupChromeController: UIViewController {
         selection.selectionChanged()
         selection.prepare()
         tool = next
-        toolDial.setSelected(next, animated: true)
+        toolSlider.setSelected(next)
         onTool(next)
     }
 
@@ -217,91 +194,22 @@ final class MarkupChromeController: UIViewController {
     }
 }
 
-/// Glass ring for pen, pointer, eraser, and voice. Symbols stay upright. The center
-/// hole and the square corners pass touches through to the canvas.
-private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
-    static let diameter: CGFloat = 176
+/// Glass tab. Only `roundedCorners` are curved; the edge that sits on the screen stays square.
+private class GlassTab: UIView {
+    var roundedCorners: UIRectCorner {
+        didSet { setNeedsLayout() }
+    }
 
-    private(set) var selectedTool = SketchTool.pen
-    var onSelect: ((SketchTool) -> Void)?
-    var onCommit: (() -> Void)?
-    /// Bumped when the selection changes or a commit is cancelled, so a drag
-    /// that is still settling does not dismiss the dial afterward.
-    private var commitToken = 0
-    private var selectionSettlesAt = Date.distantPast
-    private var dragChangedTool = false
-    /// Unwrapped wedge angle so a step to the next tool animates the short way.
-    private var wedgeAngle: CGFloat = 0
-    private static let wedgeSpringDuration: TimeInterval = 0.32
+    private let plate = LiquidGlassPlate()
 
-    private let ring = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
-    private let hairline = RingHairline()
-    private let wedge = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
-    private let wedgeTint = UIView()
-    private let ringMask = CAShapeLayer()
-    private let wedgeMask = CAShapeLayer()
-    private var buttons: [SketchTool: UIButton] = [:]
-
-    private static let innerRadius: CGFloat = 42
-    private static let symbolRadius: CGFloat = 65
-    private static let bandWidth: CGFloat = 46
-    /// Half the stroked arc, before the round caps widen it.
-    /// Kept narrower than the gap so four tools do not share one pill.
-    private static let wedgeHalfAngle: CGFloat = 0.32
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
+    init(roundedCorners: UIRectCorner) {
+        self.roundedCorners = roundedCorners
+        super.init(frame: .zero)
         isOpaque = false
         backgroundColor = .clear
-        isAccessibilityElement = false
-
-        ring.isUserInteractionEnabled = false
-        ring.layer.cornerCurve = .continuous
-        ring.layer.mask = ringMask
-        ringMask.fillRule = .evenOdd
-        addSubview(ring)
-        addSubview(hairline)
-
-        wedge.isUserInteractionEnabled = false
-        wedge.layer.cornerCurve = .continuous
-        wedge.layer.mask = wedgeMask
-        wedgeMask.fillColor = nil
-        wedgeMask.strokeColor = UIColor.white.cgColor
-        wedgeMask.lineWidth = Self.bandWidth
-        wedgeMask.lineCap = .round
-        wedgeTint.isUserInteractionEnabled = false
-        wedgeTint.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.42)
-        wedge.contentView.addSubview(wedgeTint)
-        addSubview(wedge)
-
-        for tool in SketchTool.dialOrder {
-            let button = UIButton(type: .system)
-            button.automaticallyUpdatesConfiguration = false
-            button.accessibilityLabel = tool.accessibilityName
-            if tool == .pointer {
-                button.accessibilityHint = "Clicks and drags on the Mac"
-            } else if tool == .voice {
-                button.accessibilityHint = "Records a voice note while the Pencil is held"
-            }
-            var configuration = UIButton.Configuration.plain()
-            configuration.image = UIImage(systemName: tool.symbolName)
-            configuration.background.backgroundColor = .clear
-            button.configuration = configuration
-            button.tag = tool.rawTag
-            button.addTarget(self, action: #selector(toolTapped(_:)), for: .touchUpInside)
-            buttons[tool] = button
-            addSubview(button)
-        }
-        accessibilityElements = SketchTool.dialOrder.compactMap { buttons[$0] }
-
-        let tap = UITapGestureRecognizer(target: self, action: #selector(ringTapped(_:)))
-        tap.delegate = self
-        addGestureRecognizer(tap)
-
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
-        pan.maximumNumberOfTouches = 1
-        addGestureRecognizer(pan)
-        refreshButtons()
+        plate.roundedCorners = roundedCorners
+        plate.cornerRadius = ChromeMetrics.cornerRadius
+        addSubview(plate)
     }
 
     required init?(coder: NSCoder) {
@@ -310,217 +218,168 @@ private final class ToolDialView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        ring.frame = bounds
-        hairline.frame = bounds
-        wedge.bounds = bounds
-        wedge.center = CGPoint(x: bounds.midX, y: bounds.midY)
-        wedgeTint.frame = wedge.contentView.bounds
-        updatePaths()
-        layoutButtons()
+        plate.frame = bounds
+        plate.roundedCorners = roundedCorners
+        plate.cornerRadius = ChromeMetrics.cornerRadius
+    }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.contains(point)
+    }
+}
+
+/// Vertical tool control flush with the right edge. A vertical swipe steps the
+/// tool. A tap selects the segment under the finger.
+private final class ToolSliderView: GlassTab, UIGestureRecognizerDelegate {
+    static var preferredHeight: CGFloat {
+        let count = CGFloat(SketchTool.edgeOrder.count)
+        guard count > 0 else { return 0 }
+        return ChromeMetrics.sliderPadding * 2
+            + ChromeMetrics.segmentLength * count
+            + ChromeMetrics.sliderGap * max(0, count - 1)
+    }
+
+    private(set) var selectedTool = SketchTool.pen
+    var onSelect: ((SketchTool) -> Void)?
+    private var panMovedTool = false
+    private var highlights: [SketchTool: UIView] = [:]
+    private var buttons: [SketchTool: ToolSegmentControl] = [:]
+
+    init() {
+        super.init(roundedCorners: [.topLeft, .bottomLeft])
+        isAccessibilityElement = false
+        for tool in SketchTool.edgeOrder {
+            let highlight = UIView()
+            highlight.isUserInteractionEnabled = false
+            highlight.layer.cornerRadius = ChromeMetrics.segmentCornerRadius
+            highlight.backgroundColor = .clear
+            addSubview(highlight)
+            highlights[tool] = highlight
+
+            let button = ToolSegmentControl(type: .system)
+            button.isUserInteractionEnabled = false
+            button.accessibilityLabel = tool.accessibilityName
+            button.onActivate = { [weak self] in
+                self?.onSelect?(tool)
+            }
+            let symbolConfiguration = chromeSymbolConfiguration(pointSize: 22)
+            var configuration = UIButton.Configuration.plain()
+            configuration.image = UIImage(systemName: tool.symbolName, withConfiguration: symbolConfiguration)
+            configuration.preferredSymbolConfigurationForImage = symbolConfiguration
+            configuration.baseForegroundColor = .white
+            button.configuration = configuration
+            buttons[tool] = button
+            addSubview(button)
+        }
+        accessibilityElements = SketchTool.edgeOrder.compactMap { buttons[$0] }
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
+        pan.maximumNumberOfTouches = 1
+        pan.delegate = self
+        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
+        tap.require(toFail: pan)
+        addGestureRecognizer(pan)
+        addGestureRecognizer(tap)
+        setSelected(selectedTool)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let segmentWidth = bounds.width - ChromeMetrics.sliderPadding * 2
+        var y = ChromeMetrics.sliderPadding
+        for tool in SketchTool.edgeOrder {
+            let frame = CGRect(x: ChromeMetrics.sliderPadding, y: y, width: segmentWidth, height: ChromeMetrics.segmentLength)
+            highlights[tool]?.frame = frame
+            buttons[tool]?.frame = frame
+            y += ChromeMetrics.segmentLength + ChromeMetrics.sliderGap
+        }
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard isUserInteractionEnabled, !isHidden, alpha > 0.01, bounds.contains(point) else { return nil }
-        let distance = hypot(point.x - bounds.midX, point.y - bounds.midY)
-        guard distance <= bounds.width / 2 else { return nil }
-        for button in buttons.values where !button.isHidden {
-            let local = convert(point, to: button)
-            if button.point(inside: local, with: event) {
-                return button
-            }
-        }
-        guard distance >= Self.innerRadius else { return nil }
         return self
     }
 
-    func cancelPendingCommit() {
-        commitToken += 1
-    }
-
-    func setSelected(_ tool: SketchTool, animated: Bool) {
-        let changed = selectedTool != tool
-        if changed {
-            commitToken += 1
-        }
+    func setSelected(_ tool: SketchTool) {
         selectedTool = tool
-        refreshButtons()
-        guard changed else { return }
-        let target = tool.dialAngle
-        if animated, window != nil {
-            wedgeAngle += Self.wrapped(target - wedgeAngle)
-        } else {
-            wedgeAngle = target
+        for (candidate, highlight) in highlights {
+            highlight.backgroundColor = candidate == tool ? ChromeMetrics.selectedFill : .clear
         }
-        let angle = wedgeAngle
-        let apply = { self.wedge.transform = CGAffineTransform(rotationAngle: angle) }
-        if animated, window != nil {
-            selectionSettlesAt = Date().addingTimeInterval(Self.wedgeSpringDuration)
-            UIView.animate(
-                withDuration: Self.wedgeSpringDuration,
-                delay: 0,
-                usingSpringWithDamping: 0.86,
-                initialSpringVelocity: 0.2,
-                options: [.beginFromCurrentState, .allowUserInteraction],
-                animations: apply
-            )
-        } else {
-            selectionSettlesAt = .distantPast
-            apply()
+        for (candidate, button) in buttons {
+            button.accessibilityTraits = candidate == tool ? [.button, .selected] : .button
         }
     }
 
-    private func updatePaths() {
-        guard bounds.width > 0 else { return }
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let outer = bounds.width / 2 - 0.5
-        let donut = UIBezierPath(arcCenter: center, radius: outer, startAngle: 0, endAngle: 2 * .pi, clockwise: true)
-        donut.append(UIBezierPath(arcCenter: center, radius: Self.innerRadius, startAngle: 0, endAngle: 2 * .pi, clockwise: true))
-        ringMask.frame = ring.bounds
-        ringMask.path = donut.cgPath
-
-        let outline = UIBezierPath(arcCenter: center, radius: outer, startAngle: 0, endAngle: 2 * .pi, clockwise: true)
-        outline.append(UIBezierPath(arcCenter: center, radius: Self.innerRadius, startAngle: 0, endAngle: 2 * .pi, clockwise: true))
-        hairline.shapeLayer.path = outline.cgPath
-
-        let arc = UIBezierPath(
-            arcCenter: center,
-            radius: Self.symbolRadius,
-            startAngle: -Self.wedgeHalfAngle,
-            endAngle: Self.wedgeHalfAngle,
-            clockwise: true
-        )
-        wedgeMask.frame = wedge.bounds
-        wedgeMask.path = arc.cgPath
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        false
     }
 
-    private func layoutButtons() {
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        for (tool, button) in buttons {
-            let angle = tool.dialAngle
-            let origin = CGPoint(
-                x: center.x + cos(angle) * Self.symbolRadius - 22,
-                y: center.y + sin(angle) * Self.symbolRadius - 22
-            )
-            button.frame = CGRect(origin: origin, size: CGSize(width: 44, height: 44))
-        }
-    }
-
-    private func refreshButtons() {
-        for (tool, button) in buttons {
-            let selected = tool == selectedTool
-            var configuration = button.configuration ?? .plain()
-            let pointSize: CGFloat = (tool == .eraser || tool == .voice) ? 20 : 22
-            configuration.image = UIImage(systemName: tool.symbolName)
-            configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(
-                pointSize: pointSize,
-                weight: selected ? .semibold : .medium
-            )
-            configuration.baseForegroundColor = selected ? .white : UIColor.white.withAlphaComponent(0.78)
-            configuration.background.backgroundColor = .clear
-            button.configuration = configuration
-            button.isSelected = selected
-            button.accessibilityTraits = selected ? [.button, .selected] : .button
-        }
-    }
-
-    private func nearestTool(to point: CGPoint) -> SketchTool {
-        let angle = atan2(point.y - bounds.midY, point.x - bounds.midX)
-        return SketchTool.allCases.min { lhs, rhs in
-            abs(Self.wrapped(angle - lhs.dialAngle)) < abs(Self.wrapped(angle - rhs.dialAngle))
-        } ?? .pen
-    }
-
-    private static func wrapped(_ delta: CGFloat) -> CGFloat {
-        var value = delta
-        while value > .pi { value -= 2 * .pi }
-        while value < -.pi { value += 2 * .pi }
-        return value
-    }
-
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        let point = touch.location(in: self)
-        for button in buttons.values {
-            let local = convert(point, to: button)
-            if button.point(inside: local, with: nil) {
-                return false
+    private func tool(at point: CGPoint) -> SketchTool? {
+        let tools = SketchTool.edgeOrder
+        guard bounds.contains(point), !tools.isEmpty else { return nil }
+        let stride = ChromeMetrics.segmentLength + ChromeMetrics.sliderGap
+        let local = point.y - ChromeMetrics.sliderPadding
+        var best = tools[0]
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for (index, tool) in tools.enumerated() {
+            let mid = CGFloat(index) * stride + ChromeMetrics.segmentLength / 2
+            let distance = abs(local - mid)
+            if distance < bestDistance {
+                bestDistance = distance
+                best = tool
             }
         }
-        return true
+        return best
     }
 
-    @objc private func toolTapped(_ sender: UIButton) {
-        guard let tool = SketchTool(rawTag: sender.tag) else { return }
+    private func step(down: Bool) {
+        let tools = SketchTool.edgeOrder
+        guard !tools.isEmpty else { return }
+        guard let index = tools.firstIndex(of: selectedTool) else {
+            onSelect?(down ? tools[0] : tools[tools.count - 1])
+            return
+        }
+        let nextIndex = down
+            ? (index + 1) % tools.count
+            : (index - 1 + tools.count) % tools.count
+        onSelect?(tools[nextIndex])
+    }
+
+    @objc private func tapped(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended, let tool = tool(at: gesture.location(in: self)) else { return }
         onSelect?(tool)
-        commitNow()
-    }
-
-    @objc private func ringTapped(_ gesture: UITapGestureRecognizer) {
-        guard gesture.state == .ended else { return }
-        onSelect?(nearestTool(to: gesture.location(in: self)))
-        commitNow()
     }
 
     @objc private func panned(_ gesture: UIPanGestureRecognizer) {
+        let point = gesture.location(in: self)
         switch gesture.state {
         case .began:
-            cancelPendingCommit()
-            dragChangedTool = false
-            selectFromDrag(gesture)
+            panMovedTool = false
         case .changed:
-            selectFromDrag(gesture)
-        case .ended:
-            selectFromDrag(gesture)
-            let remaining = selectionSettlesAt.timeIntervalSinceNow
-            if dragChangedTool, remaining > 0.02 {
-                commitAfter(remaining)
-            } else {
-                commitNow()
+            guard let tool = tool(at: point), tool != selectedTool else { return }
+            panMovedTool = true
+            onSelect?(tool)
+        case .ended, .cancelled:
+            let translation = gesture.translation(in: self)
+            if !panMovedTool, abs(translation.y) >= 36, abs(translation.y) > abs(translation.x) {
+                step(down: translation.y > 0)
             }
         default:
             break
         }
     }
-
-    private func selectFromDrag(_ gesture: UIPanGestureRecognizer) {
-        let tool = nearestTool(to: gesture.location(in: self))
-        if tool != selectedTool {
-            dragChangedTool = true
-        }
-        onSelect?(tool)
-    }
-
-    private func commitNow() {
-        commitToken += 1
-        onCommit?()
-    }
-
-    /// Waits out the wedge spring, then dismisses. A newer selection cancels it.
-    private func commitAfter(_ delay: TimeInterval) {
-        commitToken += 1
-        let token = commitToken
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.commitToken == token else { return }
-            self.onCommit?()
-        }
-    }
 }
 
-private final class RingHairline: UIView {
-    override class var layerClass: AnyClass { CAShapeLayer.self }
-    var shapeLayer: CAShapeLayer { layer as! CAShapeLayer }
+private final class ToolSegmentControl: UIButton {
+    var onActivate: (() -> Void)?
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        isOpaque = false
-        backgroundColor = .clear
-        shapeLayer.fillColor = nil
-        shapeLayer.strokeColor = UIColor.white.withAlphaComponent(0.28).cgColor
-        shapeLayer.lineWidth = 1
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    override func accessibilityActivate() -> Bool {
+        onActivate?()
+        return true
     }
 }
 

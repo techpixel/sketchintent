@@ -1,7 +1,9 @@
 import AVFoundation
+import CoreImage
 import CoreMedia
 import SwiftUI
 import UIKit
+import VideoToolbox
 
 /// Presents H.264 as soon as each access unit arrives. No jitter buffer.
 final class SampleDisplayView: UIView {
@@ -17,6 +19,8 @@ final class SampleDisplayView: UIView {
     private var didEnqueue = false
     /// Display timestamps stay a millisecond apart so a burst cannot sit on a long PTS timeline.
     private var nextPresentation = CMTime.zero
+    /// Compressed frames since the last keyframe, so a sketch can keep the picture it started on.
+    private var groupOfPictures: [CMSampleBuffer] = []
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -36,6 +40,7 @@ final class SampleDisplayView: UIView {
     func flush() {
         videoLayer.flushAndRemoveImage()
         needsKeyframe = true
+        groupOfPictures = []
     }
 
     /// Keeps the decoder attached while the picture is covered. Blank canvas hides the
@@ -89,7 +94,58 @@ final class SampleDisplayView: UIView {
         needsKeyframe = false
         didEnqueue = true
         videoLayer.enqueue(immediate)
+        remember(sampleBuffer)
         return true
+    }
+
+    /// The picture currently on screen, decoded from the frames since the last keyframe.
+    func capturedFrame() -> (image: UIImage, width: Int, height: Int)? {
+        let frames = groupOfPictures
+        guard let format = frames.first.flatMap({ CMSampleBufferGetFormatDescription($0) }) else { return nil }
+        let decoded = DecodedFrame()
+        var callback = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: { refCon, _, status, _, imageBuffer, _, _ in
+                guard status == noErr, let imageBuffer, let refCon else { return }
+                Unmanaged<DecodedFrame>.fromOpaque(refCon).takeUnretainedValue().store(imageBuffer)
+            },
+            decompressionOutputRefCon: Unmanaged.passUnretained(decoded).toOpaque()
+        )
+        var session: VTDecompressionSession?
+        let created = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: format,
+            decoderSpecification: nil,
+            imageBufferAttributes: nil,
+            outputCallback: &callback,
+            decompressionSessionOut: &session
+        )
+        guard created == noErr, let session else { return nil }
+        for frame in frames {
+            var flags = VTDecodeInfoFlags()
+            VTDecompressionSessionDecodeFrame(
+                session,
+                sampleBuffer: frame,
+                flags: [._EnableAsynchronousDecompression],
+                frameRefcon: nil,
+                infoFlagsOut: &flags
+            )
+        }
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
+        VTDecompressionSessionInvalidate(session)
+        guard let image = decoded.image else { return nil }
+        return (UIImage(cgImage: image), image.width, image.height)
+    }
+
+    private func remember(_ sample: CMSampleBuffer) {
+        if Self.isSync(sample) || groupOfPictures.isEmpty {
+            guard Self.isSync(sample) else { return }
+            groupOfPictures = [sample]
+        } else {
+            groupOfPictures.append(sample)
+            if groupOfPictures.count > 120 {
+                groupOfPictures.removeFirst(groupOfPictures.count - 120)
+            }
+        }
     }
 
     /// Stamps a short, local timeline. Mac capture timestamps are a different clock and
@@ -220,19 +276,120 @@ enum H264Display {
     }
 }
 
+/// The newest picture from one decode of the frames currently on screen.
+private final class DecodedFrame {
+    var image: CGImage?
+    private let context = CIContext(options: [.cacheIntermediates: false])
+
+    func store(_ buffer: CVPixelBuffer) {
+        let source = CIImage(cvPixelBuffer: buffer)
+        image = context.createCGImage(source, from: source.extent)
+    }
+}
+
+/// One bounds rect for the live sample layer and the frozen still.
+/// The still is a sibling of the sample view: hiding `AVSampleBufferDisplayLayer`
+/// hides that view's subviews, so the still cannot live inside it.
+/// Both children fill this view. The still uses `FrameCoordinates`, the same
+/// aspect fit as the layer's `.resizeAspect` gravity and the ink mapping.
+final class ScreenPictureView: UIView {
+    let display = SampleDisplayView()
+    private let stillView = UIImageView()
+    private var showsPicture = true
+    private var frozenWidth = 0
+    private var frozenHeight = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        stillView.isHidden = true
+        stillView.contentMode = .scaleToFill
+        stillView.isUserInteractionEnabled = false
+        stillView.isAccessibilityElement = false
+        stillView.accessibilityElementsHidden = true
+        addSubview(display)
+        addSubview(stillView)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setShowsPicture(_ shows: Bool) {
+        showsPicture = shows
+        applyPicture()
+    }
+
+    /// `width` and `height` are the captured pixel size, the same numbers ink maps against.
+    func setFrozenImage(_ image: UIImage?, width: Int, height: Int) {
+        frozenWidth = width
+        frozenHeight = height
+        if stillView.image !== image {
+            stillView.image = image
+        }
+        applyPicture()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        display.frame = bounds
+        placeStill()
+    }
+
+    /// The live sample view is the only hit target, matching the picture before the still existed.
+    /// A frozen still and a blank canvas let touches through to the overlay.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard showsPicture, !wantsStill else { return nil }
+        return super.hitTest(point, with: event)
+    }
+
+    private var wantsStill: Bool {
+        showsPicture && stillView.image != nil && frozenWidth > 0 && frozenHeight > 0
+    }
+
+    private func applyPicture() {
+        display.setPictureHidden(!showsPicture || wantsStill)
+        placeStill()
+    }
+
+    private func placeStill() {
+        guard wantsStill,
+              let picture = FrameCoordinates.pictureRect(
+                viewWidth: Double(bounds.width),
+                viewHeight: Double(bounds.height),
+                frameWidth: frozenWidth,
+                frameHeight: frozenHeight
+              ),
+              picture.width > 0, picture.height > 0
+        else {
+            stillView.isHidden = true
+            return
+        }
+        stillView.isHidden = false
+        stillView.frame = CGRect(x: picture.x, y: picture.y, width: picture.width, height: picture.height)
+    }
+}
+
 struct ScreenDisplay: UIViewRepresentable {
     let client: StreamClient
+    /// Blank canvas keeps the live layer and the still hidden.
     var showsPicture: Bool
+    /// Nil while the livestream is the picture on screen.
+    var frozenImage: UIImage?
+    var frozenWidth: Int
+    var frozenHeight: Int
 
-    func makeUIView(context: Context) -> SampleDisplayView {
-        let view = SampleDisplayView()
-        view.setPictureHidden(!showsPicture)
-        client.attachDisplay(view)
+    func makeUIView(context: Context) -> ScreenPictureView {
+        let view = ScreenPictureView()
+        view.setShowsPicture(showsPicture)
+        view.setFrozenImage(frozenImage, width: frozenWidth, height: frozenHeight)
+        client.attachDisplay(view.display)
         return view
     }
 
-    func updateUIView(_ view: SampleDisplayView, context: Context) {
-        view.setPictureHidden(!showsPicture)
-        client.attachDisplay(view)
+    func updateUIView(_ view: ScreenPictureView, context: Context) {
+        view.setShowsPicture(showsPicture)
+        view.setFrozenImage(frozenImage, width: frozenWidth, height: frozenHeight)
+        client.attachDisplay(view.display)
     }
 }
