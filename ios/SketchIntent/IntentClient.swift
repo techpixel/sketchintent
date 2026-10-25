@@ -134,7 +134,9 @@ final class IntentClient: ObservableObject {
         return id
     }
 
-    /// Returns true when this reply is the agent finishing the sketch it was sent.
+    /// Returns true when this reply shows the agent has read the sketch it was sent:
+    /// its first status or text, or the finish. A live moment waits for the finish, so its
+    /// ink keeps pulsing while the agent works.
     @discardableResult
     func apply(_ reply: IntentReply) -> Bool {
         guard reply.id == activeID, isSending, let index = activeIndex else { return false }
@@ -149,12 +151,14 @@ final class IntentClient: ObservableObject {
             if turns[index].steps.last?.step != step {
                 add(step, at: index)
             }
+            return !turns[index].live
         case .text:
             if case .text = turns[index].steps.last?.step {
                 turns[index].steps[turns[index].steps.count - 1].step = .text(reply.text)
             } else {
                 add(.text(reply.text), at: index)
             }
+            return !turns[index].live
         case .error:
             add(.error(reply.text.isEmpty ? "The agent stopped" : reply.text), at: index)
             finish(as: .finished)

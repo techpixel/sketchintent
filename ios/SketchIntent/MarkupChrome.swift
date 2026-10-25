@@ -30,6 +30,8 @@ enum ChromeMetrics {
 
 private extension Color {
     static let agentYellow = Color("AgentYellow")
+    /// AgentYellow at 50% saturation, for tool call lines.
+    static let agentYellowMuted = Color("AgentYellowMuted")
     static let agentBlue = Color("AgentBlue")
     static let chromePill = Color("ChromePill")
     static let chromeButton = Color("ChromeButton")
@@ -188,7 +190,7 @@ struct TopBar: View {
                 .frame(width: ChromeMetrics.sendWidth)
                 .background(
                     isSending ? Color.chromeButton : Color.agentYellow,
-                    in: RoundedRectangle(cornerRadius: ChromeMetrics.buttonCornerRadius, style: .continuous)
+                    in: RoundedRectangle(cornerRadius: ChromeMetrics.toolCornerRadius, style: .continuous)
                 )
         }
         .disabled(!isSending && !canSend)
@@ -252,6 +254,8 @@ struct BottomBar: View {
     var tool: SketchTool
     var inkColor: InkColor
     var canClear: Bool
+    /// Live mode shows only the pen and the eraser.
+    var isLive = false
     var onTool: (SketchTool) -> Void
     var onColor: (InkColor) -> Void
     var onClear: () -> Void
@@ -293,7 +297,7 @@ struct BottomBar: View {
     /// and the highlight slides with it.
     private var tools: some View {
         HStack(spacing: ChromeMetrics.toolGap) {
-            ForEach(SketchTool.edgeOrder, id: \.self) { candidate in
+            ForEach(SketchTool.shown(live: isLive), id: \.self) { candidate in
                 toolButton(candidate)
             }
         }
@@ -303,7 +307,7 @@ struct BottomBar: View {
                 .onChanged { drag in
                     // Talking to the agent keeps the tool where it is.
                     guard !(pressingDictation && heldDictation) else { return }
-                    let order = SketchTool.edgeOrder
+                    let order = SketchTool.shown(live: isLive)
                     let slot = ChromeMetrics.toolWidth + ChromeMetrics.toolGap
                     let index = Int((drag.location.x / slot).rounded(.down))
                     let candidate = order[min(max(index, 0), order.count - 1)]
@@ -570,7 +574,7 @@ private struct AgentTurnView: View {
         switch step {
         case .status(let lead, let name, let onCanvas):
             statusText(lead: lead, name: name)
-                .foregroundStyle(onCanvas ? Color.agentBlue : Color.agentYellow)
+                .foregroundStyle(onCanvas ? Color.agentBlue : Color.agentYellowMuted)
         case .text(let text):
             MarkdownText(source: text)
                 .foregroundStyle(Color.agentYellow)
@@ -776,24 +780,25 @@ private struct ThinkingRow: View {
     }
 }
 
-/// The logo: a black hand-drawn asterisk ordered-dithered onto a yellow square. Figma 65:1258.
-/// While the agent works it turns and its arms breathe, the dither crawls, and now and then the
-/// rows tear sideways like the VGA displace export (Figma 65:1260). While reading the canvas the
-/// square is blue and a scan line sweeps down it, inking the mark solid as it passes.
+/// The logo: a black hand-drawn blob ring ordered-dithered onto a yellow square. Figma 78:1367.
+/// While the agent works the blob wobbles like a lava lamp, its lumps drifting from a random
+/// start, the dither crawls, and now and then the rows tear sideways like the VGA displace
+/// export (Figma 65:1260). While reading the canvas the square is blue and a scan line sweeps
+/// down it, inking the mark solid as it passes.
 struct DitherMark: View {
     var reading: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Each mark gets its own blob.
+    @State private var seed = Int.random(in: 0..<997)
 
     /// Cells per side, and the frame rate of the dither, kept low so it reads as pixels.
     private static let cells = 16
+    /// Mean radius and half width of the ring, in half sides. Traced from the Figma blob.
+    private static let radius = 0.62
+    private static let halfWidth = 0.14
+    /// Size of the blob's lumps for 2, 3 and 4 lobes, also from the Figma blob.
+    private static let lumps: [(lobes: Double, size: Double)] = [(2, 0.09), (3, 0.09), (4, 0.06)]
     private static let fps = 12.0
-    /// Angle (turns), length (of the half side) and half width (cells) of each arm. Uneven on
-    /// purpose, like the pen-drawn mark.
-    private static let arms: [(angle: Double, length: Double, width: Double)] = [
-        (0.00, 0.92, 0.95), (0.10, 0.80, 0.80), (0.22, 0.95, 1.00),
-        (0.33, 0.78, 0.85), (0.44, 0.90, 0.90), (0.56, 0.84, 0.80),
-        (0.66, 0.96, 1.00), (0.78, 0.82, 0.85), (0.89, 0.90, 0.90),
-    ]
     private static let bayer: [Double] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
         .map { ($0 + 0.5) / 16 }
 
@@ -813,7 +818,6 @@ struct DitherMark: View {
         let t = Double(frame) / Self.fps
         context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(reading ? .agentBlue : .agentYellow))
 
-        let spin = t * 0.08
         // Dither threshold shift: the pattern steps diagonally, a few cells a second.
         let shift = frame / 3
         // A torn band of rows for two frames out of every ~20, seeded by the frame.
@@ -831,7 +835,7 @@ struct DitherMark: View {
             for col in 0..<n {
                 let x = (Double(col - shifted) + 0.5) / Double(n) * 2 - 1
                 let y = (Double(row) + 0.5) / Double(n) * 2 - 1
-                var level = Self.coverage(x: x, y: y, spin: spin, t: t, cell: 2 / Double(n))
+                var level = Self.coverage(x: x, y: y, seed: seed, t: t, cell: 2 / Double(n))
                 if reading {
                     level = row < scanRow ? min(1, level * 1.6) : level * 0.55
                     if row == scanRow { level = max(level, 0.5) }
@@ -845,24 +849,26 @@ struct DitherMark: View {
         context.fill(ink, with: .color(.black))
     }
 
-    /// How much ink covers a point in the -1...1 square: 1 on an arm's spine, fading over a
+    /// How much ink covers a point in the -1...1 square: 1 on the ring's spine, fading over a
     /// couple of cells so the dither has a soft edge to chew on.
-    private static func coverage(x: Double, y: Double, spin: Double, t: Double, cell: Double) -> Double {
-        var best = 0.0
-        for (index, arm) in arms.enumerated() {
-            let breath = 1 + 0.12 * sin(t * 2.4 + Double(index) * 1.7)
-            let angle = (arm.angle + spin) * 2 * .pi
-            let tipX = cos(angle) * arm.length * breath
-            let tipY = sin(angle) * arm.length * breath
-            // Distance from the point to the segment from the centre to the tip.
-            let along = max(0, min(1, (x * tipX + y * tipY) / (tipX * tipX + tipY * tipY)))
-            let distance = hypot(x - tipX * along, y - tipY * along)
-            // Arms taper toward the tip.
-            let halfWidth = arm.width * cell * (1.15 - 0.45 * along)
-            best = max(best, smoothstep(halfWidth + cell * 1.4, halfWidth - cell * 0.6, distance))
+    private static func coverage(x: Double, y: Double, seed: Int, t: Double, cell: Double) -> Double {
+        // Random rates and phases from the seed, so no two marks wobble alike.
+        func random(_ salt: Int) -> Double { Double(hash(seed &* 31 &+ salt)) / 997 }
+        // The blob floats a little around the middle.
+        let dx = x - 0.04 * sin(t * 0.7 + random(1) * 6.3)
+        let dy = y - 0.04 * sin(t * 0.9 + random(2) * 6.3)
+        let theta = atan2(dy, dx)
+        var edge = radius * (1 + 0.04 * sin(t * 1.3 + random(3) * 6.3))
+        for (index, lump) in lumps.enumerated() {
+            let salt = 10 * (index + 1)
+            // Each lump swells and shrinks, and slides around the ring one way or the other.
+            let swell = 0.55 + 0.45 * sin(t * (0.6 + random(salt) * 0.8) + random(salt + 1) * 6.3)
+            let drift = (random(salt + 2) < 0.5 ? -1.0 : 1.0) * (0.15 + random(salt + 3) * 0.3)
+            let phase = random(salt + 4) * 6.3 + t * drift + 0.8 * sin(t * 0.5 + random(salt + 5) * 6.3)
+            edge += lump.size * swell * 1.2 * cos(lump.lobes * theta + phase)
         }
-        let core = smoothstep(cell * 3.4, cell * 1.6, hypot(x, y))
-        return max(best, core)
+        let distance = abs(hypot(dx, dy) - edge)
+        return smoothstep(halfWidth + cell, halfWidth - cell * 0.6, distance)
     }
 
     private static func smoothstep(_ edge0: Double, _ edge1: Double, _ x: Double) -> Double {

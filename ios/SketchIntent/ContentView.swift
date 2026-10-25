@@ -156,6 +156,7 @@ struct ContentView: View {
                             tool: tool,
                             inkColor: inkColor,
                             canClear: sketch.hasInk || shownFrozen != nil,
+                            isLive: live.isOn,
                             onTool: chooseTool,
                             onColor: { inkColorName = $0.rawValue },
                             onClear: clearSketch,
@@ -405,6 +406,10 @@ struct ContentView: View {
         } else {
             showsSidebar = true
             live.start()
+            // Dictation and lasso are hidden while live, so neither stays chosen.
+            if !SketchTool.liveOrder.contains(tool) {
+                chooseTool(.pen)
+            }
         }
     }
 
@@ -521,13 +526,13 @@ struct ContentView: View {
     }
 
     /// Apple Pencil barrel double-tap. Cycles the right-edge slider's tools
-    /// (pen, eraser, lasso) without presenting a dial. The Pencil keeps drawing.
+    /// (only pen and eraser while live) without presenting a dial. The Pencil keeps drawing.
     /// A finger drives the Mac on an empty desktop with the pen or the eraser.
     /// Lasso keeps the finger off the Mac.
     private func toggleToolFromPencil() {
         toolSelection.selectionChanged()
         toolSelection.prepare()
-        tool = tool.nextOnDial
+        tool = tool.next(live: live.isOn)
     }
 
     /// Separation ratio since the last sample, as the wire's ten-thousandths. 1 is no change.

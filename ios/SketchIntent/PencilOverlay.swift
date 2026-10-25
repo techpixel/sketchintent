@@ -61,9 +61,15 @@ enum SketchTool: Equatable, CaseIterable {
 
     /// Top to bottom on the right-edge slider. Dictation is its own tool.
     static let edgeOrder: [SketchTool] = [.pen, .eraser, .voice, .lasso]
+    /// Live mode already hears everything said, so dictation goes, and lasso with it.
+    static let liveOrder: [SketchTool] = [.pen, .eraser]
 
-    var nextOnDial: SketchTool {
-        let order = Self.edgeOrder
+    static func shown(live: Bool) -> [SketchTool] {
+        live ? liveOrder : edgeOrder
+    }
+
+    func next(live: Bool) -> SketchTool {
+        let order = Self.shown(live: live)
         guard let index = order.firstIndex(of: self) else { return order.first ?? .pen }
         return order[(index + 1) % order.count]
     }

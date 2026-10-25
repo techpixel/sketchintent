@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Tells speech from silence on the iPad, so silence never goes to Cartesia.
 /// Each 20 ms frame's level is compared with a noise floor that follows the room.
@@ -9,27 +10,41 @@ struct SpeechDetector {
     }
 
     /// Speech is this far above the floor, and never quieter than `quietest`.
-    static let margin: Float = 12
-    static let quietest: Float = -50
+    static let margin: Float = 10
+    static let quietest: Float = -58
     /// Loud frames in a row before speech begins. A Pencil tap on the glass is shorter.
     static let onsetFrames = 3
     /// Quiet frames in a row before speech ends. Short pauses between words stay in.
     static let hangoverFrames = 40
     /// Frames that only measure the room before anything counts as speech.
     static let warmupFrames = 15
+    /// Below this a frame is digital silence, as the engine sends while it starts. It says
+    /// nothing about the room.
+    static let silence: Float = -100
+    /// Speech dips between words and syllables within this many frames. A sound that never
+    /// does is the room getting louder, such as a fan turning on.
+    static let dipFrames = 75
 
     private(set) var speaking = false
-    private var floor: Float = -60
+    private(set) var floor: Float = -60
     private var heardFrames = 0
     private var loudRun = 0
     private var quietRun = 0
     /// A running level while speaking, to step over noise that was mistaken for speech.
     private var speechLevel: Float = -60
+    /// The quietest frame of the last `dipFrames` while speaking.
+    private var recent: [Float] = []
+
+    var warmedUp: Bool { heardFrames >= Self.warmupFrames }
 
     mutating func feed(_ level: Float) -> Change? {
-        if heardFrames < Self.warmupFrames {
+        guard level > Self.silence else { return nil }
+        if !warmedUp {
             floor = heardFrames == 0 ? level : floor + (level - floor) / Float(heardFrames + 1)
             heardFrames += 1
+            if warmedUp {
+                floor = min(max(floor, -90), -25)
+            }
             return nil
         }
         let loud = level > max(floor + Self.margin, Self.quietest)
@@ -42,22 +57,42 @@ struct SpeechDetector {
             speaking = true
             quietRun = 0
             speechLevel = level
+            recent.removeAll()
             return .began
         }
         speechLevel += (level - speechLevel) * 0.05
-        quietRun = loud ? 0 : quietRun + 1
+        // The floor still follows the room while speaking. If even the quietest moment of the
+        // last second and a half was loud, the room rose, so speech can end above the old floor.
+        if level < floor {
+            floor = max(level, -90)
+        }
+        recent.append(level)
+        if recent.count > Self.dipFrames {
+            recent.removeFirst(recent.count - Self.dipFrames)
+            if let quietestRecent = recent.min(), quietestRecent > floor + Self.margin {
+                floor = min(-25, quietestRecent - 3)
+            }
+        }
+        let stillLoud = level > max(floor + Self.margin, Self.quietest)
+        quietRun = stillLoud ? 0 : quietRun + 1
         guard quietRun >= Self.hangoverFrames else { return nil }
-        speaking = false
-        loudRun = 0
+        endSpeech()
         return .ended
     }
 
     /// What sounded like speech was steady noise, such as a fan or music. Lift the floor above it.
     mutating func ignoreCurrentLevel() {
         floor = min(-25, max(floor, speechLevel - Self.margin + 4))
+        endSpeech()
+    }
+
+    /// Stops counting the current sound as speech without moving the floor. Speech that goes on
+    /// begins again after `onsetFrames`.
+    mutating func endSpeech() {
         speaking = false
         loudRun = 0
         quietRun = 0
+        recent.removeAll()
     }
 
     /// Loudness of 16-bit PCM in dB below full scale.
@@ -80,7 +115,8 @@ struct SpeechDetector {
 /// The microphone runs on the iPad without a socket. When `SpeechDetector` hears speech, a
 /// Cartesia socket opens with the half second before it, so the first word is kept. After
 /// 0.8 s of quiet the socket is asked to close and its words come back as one utterance.
-/// Silence, Pencil taps and steady room noise are never sent.
+/// Silence, Pencil taps and steady room noise are never sent. A socket that hears no words
+/// within a few seconds is closed, since Cartesia bills for every second it receives.
 /// Start and stop from the main queue. Callbacks run on the main queue.
 final class LiveListener {
     var onSpeaking: ((Bool) -> Void)?
@@ -94,7 +130,13 @@ final class LiveListener {
     private static let frameBytes = 640
     private static let prerollBytes = 16_000
     /// An utterance this long with no words back is noise, so its socket closes early.
-    private static let noiseFrames = 400
+    private static let noiseFrames = 200
+    /// An utterance is cut here even with words, so a stuck one cannot run up the bill.
+    /// Speech that goes on opens the next one.
+    private static let longestFrames = 750
+    /// Sockets in a row that fail before words come back. Then live mode stops.
+    private static let failuresAllowed = 3
+    private static let log = Logger(subsystem: "sketchintent", category: "live")
 
     private let microphone = MicrophoneTap()
     private let queue = DispatchQueue(label: "sketchintent.live")
@@ -109,6 +151,8 @@ final class LiveListener {
     private var segment: CartesiaTurns?
     private var segmentFrames = 0
     private var closing: [ObjectIdentifier: CartesiaTurns] = [:]
+    private var failures = 0
+    private var failed: Set<ObjectIdentifier> = []
 
     func start() throws {
         guard !running else { return }
@@ -120,6 +164,8 @@ final class LiveListener {
             detector = SpeechDetector()
             carry.removeAll()
             preroll.removeAll()
+            failures = 0
+            failed.removeAll()
         }
         do {
             try microphone.start { [weak self] pcm in
@@ -155,13 +201,19 @@ final class LiveListener {
     }
 
     private func process(_ frame: Data) {
-        let change = detector.feed(SpeechDetector.level(of: frame))
+        let level = SpeechDetector.level(of: frame)
+        let wasWarm = detector.warmedUp
+        let change = detector.feed(level)
+        if !wasWarm, detector.warmedUp {
+            Self.log.debug("Room floor \(self.detector.floor, format: .fixed(precision: 1)) dB")
+        }
         guard let segment else {
             preroll.append(frame)
             if preroll.count > Self.prerollBytes {
                 preroll.removeFirst(preroll.count - Self.prerollBytes)
             }
             if change == .began {
+                Self.log.debug("Speech at \(level, format: .fixed(precision: 1)) dB, floor \(self.detector.floor, format: .fixed(precision: 1)) dB")
                 openSegment()
             }
             return
@@ -172,9 +224,12 @@ final class LiveListener {
             endSegment()
         } else if segmentFrames >= Self.noiseFrames, segment.text.isEmpty {
             detector.ignoreCurrentLevel()
-            segment.cancel()
-            self.segment = nil
-            DispatchQueue.main.async { self.onSpeaking?(false) }
+            Self.log.debug("No words, so noise. Floor now \(self.detector.floor, format: .fixed(precision: 1)) dB")
+            dropSegment()
+        } else if segmentFrames >= Self.longestFrames {
+            detector.endSpeech()
+            Self.log.debug("Utterance cut at its longest")
+            endSegment()
         }
     }
 
@@ -182,10 +237,11 @@ final class LiveListener {
         guard let turns = try? CartesiaTurns(apiKey: apiKey) else { return }
         let id = ObjectIdentifier(turns)
         turns.onTranscript = { [weak self] text in
+            self?.queue.async { self?.failures = 0 }
             DispatchQueue.main.async { self?.onHeard?(text) }
         }
         turns.onFailure = { [weak self] message in
-            DispatchQueue.main.async { self?.fail(message) }
+            self?.queue.async { self?.segmentFailed(id, message: message) }
         }
         turns.onClosed = { [weak self] in
             guard let self else { return }
@@ -209,6 +265,38 @@ final class LiveListener {
         closing[ObjectIdentifier(turns)] = turns
         turns.finish()
         DispatchQueue.main.async { self.onSpeaking?(false) }
+    }
+
+    /// Closes the socket without waiting for its last words. What it heard so far still comes
+    /// back, empty for noise, so the listening line clears.
+    private func dropSegment() {
+        guard let turns = segment else { return }
+        segment = nil
+        turns.cancel()
+        let text = turns.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        DispatchQueue.main.async {
+            self.onSpeaking?(false)
+            self.onUtterance?(text)
+        }
+    }
+
+    /// One socket failing, as a dropped connection does, loses only that utterance. Several in
+    /// a row, as with a bad key or no network, end live mode.
+    private func segmentFailed(_ id: ObjectIdentifier, message: String) {
+        guard failed.insert(id).inserted else { return }
+        Self.log.error("Cartesia failed: \(message, privacy: .public)")
+        // Words that came back before the failure still count.
+        if let current = segment, ObjectIdentifier(current) == id {
+            detector.endSpeech()
+            dropSegment()
+        } else if let closed = closing.removeValue(forKey: id) {
+            closed.cancel()
+            let text = closed.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async { self.onUtterance?(text) }
+        }
+        failures += 1
+        guard failures >= Self.failuresAllowed else { return }
+        DispatchQueue.main.async { self.fail(message) }
     }
 
     private func fail(_ message: String) {
