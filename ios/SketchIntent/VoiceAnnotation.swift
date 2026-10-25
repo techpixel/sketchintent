@@ -153,8 +153,9 @@ final class VoiceTranscriber {
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
         let input = engine.inputNode
-        engine.prepare()
-        let format = input.outputFormat(forBus: 0)
+        // installTap requires the hardware sample rate. outputFormat often
+        // disagrees with the mic and that mismatch terminates the app.
+        let format = input.inputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw VoiceCaptureBlock.unavailable
         }
