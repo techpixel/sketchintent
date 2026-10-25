@@ -14,6 +14,9 @@ enum VirtualTrackpadMetrics {
     /// Bottom corners occupy this fraction of the pad. A one-finger tap in the
     /// bottom-right is always a right click. The bottom-left follows the Mac setting.
     static let cornerFraction: CGFloat = 0.2
+    /// Extra hit area around the pad. A fingertip aimed at the rim often reports
+    /// its center just outside the plate, and that touch would otherwise miss.
+    static let edgeHitOutset: CGFloat = 32
 
     /// Uniform artboard scale. The pad is centered horizontally and sits 24pt
     /// above the home indicator.
@@ -43,7 +46,8 @@ enum VirtualTrackpadMetrics {
 }
 
 /// Full-screen host. A finger tap outside the pad falls through, so it can
-/// dismiss the pad and click the picture. A palm outside is kept here and
+/// dismiss the pad and click the picture. A fingertip that starts in the margin
+/// around the plate still belongs to the pad. A palm outside is kept here and
 /// does neither. The pad itself keeps a fingertip.
 final class TrackpadHostView: UIView {
     let pad = TrackpadSurfaceView()
@@ -78,10 +82,35 @@ final class TrackpadHostView: UIView {
         if pad.point(inside: local, with: event) {
             return pad
         }
+        let reach = pad.bounds.insetBy(
+            dx: -VirtualTrackpadMetrics.edgeHitOutset,
+            dy: -VirtualTrackpadMetrics.edgeHitOutset
+        )
+        if pointIsOnClosedEdge(local, of: reach) {
+            if isPencil(at: point, event: event) {
+                return nil
+            }
+            return pad
+        }
         if let touch = touch(at: point, event: event), VirtualTrackpadMetrics.beginsAsPalm(touch) {
             return self
         }
         return nil
+    }
+
+    /// `CGRect.contains` leaves out the max edges, so a contact on the right or
+    /// bottom rim of the plate was falling through.
+    private func pointIsOnClosedEdge(_ point: CGPoint, of rect: CGRect) -> Bool {
+        point.x >= rect.minX && point.x <= rect.maxX && point.y >= rect.minY && point.y <= rect.maxY
+    }
+
+    private func isPencil(at point: CGPoint, event: UIEvent?) -> Bool {
+        guard let touches = event?.allTouches else { return false }
+        return touches.contains { touch in
+            guard touch.type == .pencil else { return false }
+            let location = touch.location(in: self)
+            return hypot(location.x - point.x, location.y - point.y) < 44
+        }
     }
 
     /// The host claims a palm so the picture never sees it. These touches are not gestures.
@@ -217,7 +246,7 @@ final class TrackpadSurfaceView: UIView {
         }
         guard !added.isEmpty else { return }
         for touch in added {
-            contacts.append(Contact(touch, at: touch.location(in: self)))
+            contacts.append(Contact(touch, at: clampToPad(touch.location(in: self))))
         }
         peakFingers = max(peakFingers, contacts.count)
         if contacts.count > 3 {
@@ -252,7 +281,7 @@ final class TrackpadSurfaceView: UIView {
         var changed = false
         for touch in touches where isFinger(touch) {
             guard let contact = contacts.first(where: { $0.touch === touch }) else { continue }
-            contact.last = touch.location(in: self)
+            contact.last = clampToPad(touch.location(in: self))
             changed = true
         }
         guard changed, mode != .suppressed else { return }
@@ -298,7 +327,7 @@ final class TrackpadSurfaceView: UIView {
         defer { release(touches) }
         for touch in touches where isFinger(touch) {
             if let contact = contacts.first(where: { $0.touch === touch }) {
-                contact.last = touch.location(in: self)
+                contact.last = clampToPad(touch.location(in: self))
             }
         }
         let lifting = contacts.filter { contact in touches.contains { $0 === contact.touch } }
@@ -422,6 +451,15 @@ final class TrackpadSurfaceView: UIView {
         residualX = 0
         residualY = 0
         anchor = .zero
+    }
+
+    /// Samples outside the plate sit on its rim, so travel before the finger
+    /// enters, or after it leaves, does not move, scroll, or swipe.
+    private func clampToPad(_ point: CGPoint) -> CGPoint {
+        CGPoint(
+            x: min(max(point.x, bounds.minX), bounds.maxX),
+            y: min(max(point.y, bounds.minY), bounds.maxY)
+        )
     }
 
     private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
