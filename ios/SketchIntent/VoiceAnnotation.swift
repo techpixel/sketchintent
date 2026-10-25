@@ -92,7 +92,9 @@ final class VoiceTranscriber {
     var onPartial: ((String) -> Void)?
     var onFailure: ((String) -> Void)?
 
-    private let engine = AVAudioEngine()
+    /// Replaced after the audio session is active. An engine created earlier keeps
+    /// a stale hardware rate, and `installTap` terminates the app when they differ.
+    private var engine = AVAudioEngine()
     private let sampleRate = 16_000
     private let chunkBytes = 3_200
     private var socket: URLSessionWebSocketTask?
@@ -152,13 +154,18 @@ final class VoiceTranscriber {
         )
         try session.setActive(true, options: .notifyOthersOnDeactivation)
 
-        let input = engine.inputNode
-        // installTap requires the hardware sample rate. outputFormat often
-        // disagrees with the mic and that mismatch terminates the app.
-        let format = input.inputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw VoiceCaptureBlock.unavailable
+        // A new engine picks up the active session. One created earlier keeps a
+        // hardware rate that no longer matches, and installTap then terminates the app.
+        engine = AVAudioEngine()
+        var input = engine.inputNode
+        let hardwareRate = input.inputFormat(forBus: 0).sampleRate
+        if hardwareRate > 0, abs(hardwareRate - session.sampleRate) > 1 {
+            try session.setPreferredSampleRate(hardwareRate)
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+            engine = AVAudioEngine()
+            input = engine.inputNode
         }
+        let format = try tapFormat(for: input)
         guard let target = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: Double(sampleRate),
@@ -174,6 +181,29 @@ final class VoiceTranscriber {
         }
         tapInstalled = true
         try engine.start()
+    }
+
+    /// The tap format's sample rate has to be the hardware rate. Prefer the
+    /// output format once it already matches; otherwise build one at the hardware rate.
+    private func tapFormat(for input: AVAudioInputNode) throws -> AVAudioFormat {
+        let hardware = input.inputFormat(forBus: 0)
+        let output = input.outputFormat(forBus: 0)
+        if output.sampleRate > 0, output.channelCount > 0,
+           hardware.sampleRate == 0 || abs(hardware.sampleRate - output.sampleRate) < 1 {
+            return output
+        }
+        let rate = hardware.sampleRate > 0 ? hardware.sampleRate : output.sampleRate
+        let channels = hardware.channelCount > 0 ? hardware.channelCount : output.channelCount
+        guard rate > 0, channels > 0,
+              let format = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: rate,
+                channels: channels,
+                interleaved: false
+              ) else {
+            throw VoiceCaptureBlock.unavailable
+        }
+        return format
     }
 
     private func openSocket() throws {
@@ -267,7 +297,11 @@ final class VoiceTranscriber {
     }
 
     private func convert(_ buffer: AVAudioPCMBuffer) -> Data? {
-        guard let converter, let targetFormat else { return nil }
+        guard let targetFormat else { return nil }
+        if converter == nil || converter?.inputFormat.sampleRate != buffer.format.sampleRate {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+        }
+        guard let converter else { return nil }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 32
         guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
