@@ -5,6 +5,13 @@ private enum SwipeSettings {
     static let naturalKey = "naturalSwiping"
 }
 
+private enum TrackpadSettings {
+    static let speedKey = "trackpadTrackingSpeed"
+    static let defaultSpeed = 1.0
+    static let minimumSpeed = 0.25
+    static let maximumSpeed = 2.5
+}
+
 private enum CanvasSettings {
     static let blankKey = "blankCanvas"
 }
@@ -35,6 +42,9 @@ struct ContentView: View {
     @State private var frozenBySpace: [String: FrozenPicture] = [:]
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
+    @AppStorage(TrackpadSettings.speedKey) private var trackingSpeed = TrackpadSettings.defaultSpeed
+    @State private var trackingResidualX = 0.0
+    @State private var trackingResidualY = 0.0
 
     private var showsStatusChrome: Bool {
         !canvasReady || showsChrome
@@ -191,16 +201,20 @@ struct ContentView: View {
             if showsTrackpad && canvasReady {
                 VirtualTrackpad(
                     onMove: { dx, dy in
-                        client.send(.trackpadMove(dx: dx, dy: dy))
+                        let scaled = scaleTracking(dx, dy)
+                        guard scaled.dx != 0 || scaled.dy != 0 else { return }
+                        client.send(.trackpadMove(dx: scaled.dx, dy: scaled.dy))
                     },
                     onScroll: { dx, dy, phase in
-                        client.send(.trackpadScroll(dx: dx, dy: dy, phase: phase))
+                        let scaled = scaleTracking(dx, dy)
+                        client.send(.trackpadScroll(dx: scaled.dx, dy: scaled.dy, phase: phase))
                     },
                     onTap: { fingers, zone in
                         client.send(.trackpadTap(fingers: fingers, zone: zone))
                     },
                     onDrag: { dx, dy, phase, fingers in
-                        client.send(.trackpadDrag(dx: dx, dy: dy, phase: phase, fingers: fingers))
+                        let scaled = scaleTracking(dx, dy)
+                        client.send(.trackpadDrag(dx: scaled.dx, dy: scaled.dy, phase: phase, fingers: fingers))
                     },
                     onSwipe: { swipe in
                         guard !sketch.hasInk else { return }
@@ -257,6 +271,10 @@ struct ContentView: View {
         .onChange(of: blankCanvas) { _, _ in
             updateIdleTimer()
         }
+        .onChange(of: trackingSpeed) { _, _ in
+            trackingResidualX = 0
+            trackingResidualY = 0
+        }
         .onChange(of: sketch.hasInk) { _, hasInk in
             if hasInk {
                 showsTrackpad = false
@@ -308,7 +326,7 @@ struct ContentView: View {
         guard frozenBySpace[key] == nil, let captured = client.captureDisplayedFrame() else { return }
         frozenBySpace[key] = FrozenPicture(image: captured.image, width: captured.width, height: captured.height)
     }
-    /// A desktop that already has a sketch keeps the finger off the Mac, including the trackpad.
+    /// A finger double-tap opens the trackpad. A desktop that already has a sketch keeps the finger off the Mac.
     private func fingerDoubleTapped() {
         guard canvasReady, !sketch.hasInk else { return }
         showsTrackpad = true
@@ -322,6 +340,18 @@ struct ContentView: View {
         toolSelection.selectionChanged()
         toolSelection.prepare()
         tool = tool.nextOnDial
+    }
+
+    /// Leftover fraction so a slow tracking speed still moves the pointer.
+    private func scaleTracking(_ dx: Int16, _ dy: Int16) -> (dx: Int16, dy: Int16) {
+        let speed = min(TrackpadSettings.maximumSpeed, max(TrackpadSettings.minimumSpeed, trackingSpeed))
+        trackingResidualX += Double(dx) * speed
+        trackingResidualY += Double(dy) * speed
+        let ix = Int(trackingResidualX.rounded(.towardZero))
+        let iy = Int(trackingResidualY.rounded(.towardZero))
+        trackingResidualX -= Double(ix)
+        trackingResidualY -= Double(iy)
+        return (Int16(clamping: ix), Int16(clamping: iy))
     }
 
     /// Opens the desktop `direction` points at, and flashes a chevron that way.
@@ -406,6 +436,7 @@ struct ContentView: View {
 private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
+    @AppStorage(TrackpadSettings.speedKey) private var trackingSpeed = TrackpadSettings.defaultSpeed
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
     @AppStorage(CartesiaSettings.key) private var cartesiaAPIKey = ""
 
@@ -416,6 +447,24 @@ private struct SettingsSheet: View {
                     Toggle("Natural swiping", isOn: $naturalSwiping)
                 } footer: {
                     Text(detail)
+                }
+                Section {
+                    Slider(
+                        value: $trackingSpeed,
+                        in: TrackpadSettings.minimumSpeed...TrackpadSettings.maximumSpeed,
+                        step: 0.05
+                    ) {
+                        Text("Tracking speed")
+                    } minimumValueLabel: {
+                        Image(systemName: "tortoise.fill")
+                            .accessibilityHidden(true)
+                    } maximumValueLabel: {
+                        Image(systemName: "hare.fill")
+                            .accessibilityHidden(true)
+                    }
+                    .accessibilityValue(Text(trackingSpeedLabel))
+                } footer: {
+                    Text("Scales pointer movement, scrolling, and three-finger drag on the virtual trackpad. The Mac's tracking speed still applies.")
                 }
                 Section {
                     Toggle("Blank canvas", isOn: $blankCanvas)
@@ -439,8 +488,13 @@ private struct SettingsSheet: View {
             }
         }
         .preferredColorScheme(.dark)
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+    }
+
+    private var trackingSpeedLabel: String {
+        let percent = Int((trackingSpeed * 100).rounded())
+        return "\(percent) percent"
     }
 
     private var detail: String {
