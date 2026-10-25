@@ -422,7 +422,7 @@ struct AgentSidebar: View {
 }
 
 /// The prompt is half white. Tool calls are half yellow with the tool name in bold, and
-/// canvas renders are blue. Replies are yellow at 80%. While the agent works, "Reading the
+/// canvas renders are blue. Replies are yellow at 80%, read as Markdown. While the agent works, "Reading the
 /// canvas..." (blue, Figma 55:1033) shows until it first acts, then "Thinking...". Figma 53:929.
 private struct AgentTurnView: View {
     var turn: AgentTurn
@@ -457,7 +457,7 @@ private struct AgentTurnView: View {
                 .foregroundStyle(onCanvas ? Color.agentBlue : Color.agentYellow)
                 .opacity(onCanvas ? 0.8 : 0.5)
         case .text(let text):
-            Text(text)
+            MarkdownText(source: text)
                 .foregroundStyle(Color.agentYellow)
                 .opacity(0.8)
         case .error(let message):
@@ -485,6 +485,166 @@ private struct ListeningRow: View {
                 .foregroundStyle(.white.opacity(heard.isEmpty ? 0.5 : 0.8))
         }
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// One block of a Markdown reply. Inline marks stay in the text and SwiftUI draws them.
+enum MarkdownBlock: Equatable {
+    case paragraph(String)
+    case heading(level: Int, text: String)
+    /// `marker` is a bullet, or the number of an ordered item. `depth` counts nesting.
+    case item(marker: String, text: String, depth: Int)
+    case quote(String)
+    case code(String)
+    case rule
+
+    /// Reads the reply line by line. A reply still streaming in may stop mid-block, so an
+    /// open code fence runs to the end.
+    static func parse(_ source: String) -> [MarkdownBlock] {
+        var blocks: [MarkdownBlock] = []
+        var paragraph: [String] = []
+        var quote: [String] = []
+        var code: [String]?
+
+        func flush() {
+            if !paragraph.isEmpty {
+                blocks.append(.paragraph(paragraph.joined(separator: "\n")))
+                paragraph = []
+            }
+            if !quote.isEmpty {
+                blocks.append(.quote(quote.joined(separator: "\n")))
+                quote = []
+            }
+        }
+
+        for line in source.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if var open = code {
+                if trimmed.hasPrefix("```") {
+                    blocks.append(.code(open.joined(separator: "\n")))
+                    code = nil
+                } else {
+                    open.append(line)
+                    code = open
+                }
+                continue
+            }
+            if trimmed.hasPrefix("```") {
+                flush()
+                code = []
+            } else if trimmed.isEmpty {
+                flush()
+            } else if let heading = heading(trimmed) {
+                flush()
+                blocks.append(heading)
+            } else if isRule(trimmed) {
+                flush()
+                blocks.append(.rule)
+            } else if let item = item(line) {
+                flush()
+                blocks.append(item)
+            } else if trimmed.hasPrefix(">") {
+                if !paragraph.isEmpty { flush() }
+                quote.append(String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces))
+            } else {
+                if !quote.isEmpty { flush() }
+                paragraph.append(trimmed)
+            }
+        }
+        flush()
+        if let code {
+            blocks.append(.code(code.joined(separator: "\n").trimmingCharacters(in: .newlines)))
+        }
+        return blocks
+    }
+
+    /// Bold, italics, code, and links, keeping the line breaks.
+    static func inline(_ text: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+    }
+
+    private static func heading(_ line: String) -> MarkdownBlock? {
+        let hashes = line.prefix { $0 == "#" }.count
+        guard (1...6).contains(hashes) else { return nil }
+        let rest = line.dropFirst(hashes)
+        guard rest.first == " " else { return nil }
+        return .heading(level: hashes, text: rest.trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func isRule(_ line: String) -> Bool {
+        let marks = line.filter { $0 != " " }
+        guard marks.count >= 3, let first = marks.first, "-*_".contains(first) else { return false }
+        return marks.allSatisfy { $0 == first }
+    }
+
+    private static func item(_ line: String) -> MarkdownBlock? {
+        let indent = line.prefix { $0 == " " || $0 == "\t" }
+        let depth = indent.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) } / 2
+        let rest = line.dropFirst(indent.count)
+        if let first = rest.first, "-*+".contains(first), rest.dropFirst().first == " " {
+            return .item(marker: "•", text: rest.dropFirst(2).trimmingCharacters(in: .whitespaces), depth: depth)
+        }
+        let digits = rest.prefix { $0.isNumber }
+        let after = rest.dropFirst(digits.count)
+        if !digits.isEmpty, digits.count <= 3, let dot = after.first, dot == "." || dot == ")",
+           after.dropFirst().first == " " {
+            return .item(marker: "\(digits).", text: after.dropFirst(2).trimmingCharacters(in: .whitespaces), depth: depth)
+        }
+        return nil
+    }
+}
+
+/// The agent's reply as Markdown. Headings are bold, lists hang their bullets, quotes get a
+/// rule on the left, and code blocks are monospaced on a faint panel that scrolls sideways.
+private struct MarkdownText: View {
+    var source: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(MarkdownBlock.parse(source).enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .tint(Color.agentYellow)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .paragraph(let text):
+            Text(MarkdownBlock.inline(text))
+        case .heading(let level, let text):
+            Text(MarkdownBlock.inline(text))
+                .font(level <= 2 ? .headline : .callout.weight(.semibold))
+                .padding(.top, 4)
+        case .item(let marker, let text, let depth):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(marker)
+                    .monospacedDigit()
+                Text(MarkdownBlock.inline(text))
+            }
+            .padding(.leading, CGFloat(depth) * 14)
+        case .quote(let text):
+            Text(MarkdownBlock.inline(text))
+                .padding(.leading, 10)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .frame(width: 2)
+                        .opacity(0.5)
+                }
+        case .code(let text):
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(text)
+                    .font(.system(.footnote, design: .monospaced))
+                    .padding(10)
+            }
+            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        case .rule:
+            Rectangle()
+                .frame(height: 1)
+                .opacity(0.3)
+        }
     }
 }
 
