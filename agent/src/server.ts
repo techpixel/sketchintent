@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { createSdkMcpServer, query, tool, type McpServerConfig, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { makeImage, type CanvasImage } from "./canvas.ts";
-import { buildPrompt, systemPrompt, toolStatus, type Memory, type SketchNote } from "./prompt.ts";
+import { openOnMac } from "./mac.ts";
+import { buildPrompt, systemPrompt, toolStatus, type DrawnOn, type Memory, type SketchNote } from "./prompt.ts";
 
 const port = Number(process.env.SKETCHINTENT_AI_PORT ?? 2347);
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -72,12 +73,20 @@ interface IntentBody {
   folder: string;
   /// Said to the agent while holding the dictation button. Empty for a sketch alone.
   spoken: string;
+  /// The Mac desktop on the streamed display, zero-based, and how many there are. Null when the Mac did not say.
+  desktops: { index: number; count: number } | null;
+  /// The iPad page the sketch was drawn on. Null when the iPad did not say.
+  drawnOn: DrawnOn | null;
 }
 
 type ClientEvent =
   | { type: "status"; lead: string; name: string; tone?: "canvas" }
   | { type: "text"; text: string }
   | ({ type: "canvas" } & CanvasImage)
+  /// The Mac opens this desktop, and the iPad shows the Mac screen.
+  | { type: "desktop"; index: number }
+  /// The iPad shows the Mac screen instead of the Canvas page.
+  | { type: "screen" }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -107,6 +116,8 @@ function writeEvent(response: ServerResponse, turn: number, event: ClientEvent) 
   if (event.type === "status") logTurn(turn, `→ ${event.lead}${event.name}`);
   else if (event.type === "error") logTurn(turn, `→ error ${event.message}`);
   else if (event.type === "done") logTurn(turn, "→ done");
+  else if (event.type === "desktop") logTurn(turn, `→ desktop ${event.index + 1}`);
+  else if (event.type === "screen") logTurn(turn, "→ screen");
   else if (event.type === "canvas") {
     logTurn(turn, `→ canvas image ${event.width}×${event.height} at (${event.x}, ${event.y}) in ${event.space}, ${event.html.length} chars`);
   }
@@ -158,6 +169,7 @@ function parseIntent(raw: Buffer): IntentBody {
     notes.push({ text, x: item.x, y: item.y });
   }
   const spoken = typeof body.spoken === "string" ? body.spoken.trim().slice(0, 4000) : "";
+  const desktops = parseDesktops(body);
   return {
     imagePng: body.imagePng,
     width,
@@ -166,7 +178,23 @@ function parseIntent(raw: Buffer): IntentBody {
     screen: parseScreen(body),
     folder: parseFolder(body.folder),
     spoken,
+    desktops,
+    drawnOn: parseDrawnOn(body.drawnOn, desktops),
   };
+}
+
+function parseDrawnOn(value: unknown, desktops: { count: number } | null): DrawnOn | null {
+  if (value === "canvas") return { page: "canvas" };
+  if (typeof value !== "number" || !Number.isInteger(value) || !desktops) return null;
+  if (value < -1 || value >= desktops.count) return null;
+  return { page: "desktop", index: value, count: desktops.count };
+}
+
+function parseDesktops(body: Record<string, unknown>): { index: number; count: number } | null {
+  const { desktopIndex: index, desktopCount: count } = body;
+  if (typeof index !== "number" || typeof count !== "number" || !Number.isInteger(index) || !Number.isInteger(count)) return null;
+  if (count < 1 || index < -1 || index >= count) return null;
+  return { index, count };
 }
 
 function parseFolder(value: unknown): string {
@@ -322,6 +350,41 @@ async function runIntent(turn: number, body: IntentBody, prompt: string, respons
           };
         },
         { alwaysLoad: true },
+      ),
+      tool(
+        "open_on_mac",
+        [
+          "Open an app, a web link, or a file or folder on the Mac, in front. macOS moves to a desktop where that app has windows, and the iPad shows the Mac screen, so the person sees what you opened.",
+          "Scripts, installers, and other files that would run as programs are refused.",
+        ].join(" "),
+        {
+          target: z.string().min(1).describe("An app name such as Safari, an http or https link, or a full path to a file or folder."),
+          app: z.string().optional().describe("The app to open a link or file with. Leave it out to use the Mac's default."),
+        },
+        async (args) => {
+          const failed = await openOnMac(args.target, args.app);
+          if (failed) return { content: [{ type: "text" as const, text: failed }], isError: true };
+          writeEvent(response, turn, { type: "screen" });
+          return { content: [{ type: "text" as const, text: "Opened. The iPad is showing the Mac screen." }] };
+        },
+      ),
+      tool(
+        "go_to_desktop",
+        [
+          "Open a Mac desktop (a Space in Mission Control) on the streamed display, and show the Mac screen on the iPad.",
+          body.desktops
+            ? `The display has ${body.desktops.count} desktops, numbered 1 to ${body.desktops.count} from left to right. ${body.desktops.index >= 0 ? `Desktop ${body.desktops.index + 1} is on screen now.` : "A fullscreen app is on screen now."}`
+            : "The Mac did not say how many desktops it has.",
+        ].join(" "),
+        { desktop: z.number().int().min(1).describe("The desktop's number, counted from 1 on the left.") },
+        async (args) => {
+          const fail = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true });
+          if (body.desktops && args.desktop > body.desktops.count) return fail(`There are only ${body.desktops.count} desktops.`);
+          if (args.desktop > 256) return fail("There is no such desktop.");
+          if (response.writableEnded || response.destroyed) return fail("The iPad is no longer connected.");
+          writeEvent(response, turn, { type: "desktop", index: args.desktop - 1 });
+          return { content: [{ type: "text" as const, text: `Opening desktop ${args.desktop}.` }] };
+        },
       ),
     ],
   });
@@ -609,6 +672,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     body.folder || undefined,
     earlier,
     body.spoken,
+    body.drawnOn ?? undefined,
   );
   await rememberSketch(turn, body, prompt);
   logInput(turn, body, prompt);

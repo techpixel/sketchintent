@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildPrompt, imageToolName, rememberToolName, systemPrompt, toolLabel, toolStatus } from "./prompt.ts";
+import { buildPrompt, desktopToolName, imageToolName, openToolName, rememberToolName, systemPrompt, toolLabel, toolStatus } from "./prompt.ts";
 
 test("tool labels use the MCP server name", () => {
   assert.equal(toolLabel("mcp__figma-mcp__get_design_context"), "figma-mcp");
@@ -11,6 +11,11 @@ test("the canvas tool gets its own status line, and remember stays hidden", () =
   assert.deepEqual(toolStatus(imageToolName), { lead: "Rendering on ", name: "the canvas", tone: "canvas" });
   assert.equal(toolStatus(rememberToolName), null);
   assert.deepEqual(toolStatus("mcp__figma-mcp__get_design_context"), { lead: "Calling ", name: "figma-mcp" });
+});
+
+test("the Mac tools get their own status lines", () => {
+  assert.deepEqual(toolStatus(openToolName), { lead: "Opening on ", name: "the Mac" });
+  assert.deepEqual(toolStatus(desktopToolName), { lead: "Switching ", name: "Mac desktop" });
 });
 
 test("the system prompt sends feedback and uncertain readings to the canvas", () => {
@@ -57,4 +62,14 @@ test("words said through the dictation button are the main request", () => {
 
 test("a first sketch has no history", () => {
   assert.doesNotMatch(buildPrompt(800, 600, []), /earlier/);
+});
+
+test("the page the sketch was drawn on is named", () => {
+  const desktop = buildPrompt(800, 600, [], undefined, undefined, [], "", { page: "desktop", index: 1, count: 4 });
+  assert.match(desktop, /drawn over Mac desktop 2 of 4/);
+  const canvas = buildPrompt(800, 600, [], undefined, undefined, [], "", { page: "canvas" });
+  assert.match(canvas, /drawn on the iPad's Canvas page/);
+  const fullscreen = buildPrompt(800, 600, [], undefined, undefined, [], "", { page: "desktop", index: -1, count: 4 });
+  assert.match(fullscreen, /fullscreen app/);
+  assert.doesNotMatch(buildPrompt(800, 600, []), /sketch was drawn/);
 });

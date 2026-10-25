@@ -10,11 +10,24 @@ export interface Memory {
   reply: string;
 }
 
+/// The iPad page a sketch was drawn on. `index` is zero-based, and -1 is a fullscreen app.
+export type DrawnOn = { page: "canvas" } | { page: "desktop"; index: number; count: number };
+
+function drawnOnLine(drawnOn: DrawnOn): string {
+  if (drawnOn.page === "canvas") return "The sketch was drawn on the iPad's Canvas page, not over a Mac desktop.";
+  if (drawnOn.index < 0) return "The sketch was drawn over a fullscreen app on the Mac, not on one of its numbered desktops.";
+  return `The sketch was drawn over Mac desktop ${drawnOn.index + 1} of ${drawnOn.count}, counted from the left in Mission Control.`;
+}
+
 /// The agent saves each sketch's summary through this tool, and the banner does not show it.
 export const rememberToolName = "mcp__sketchintent__remember";
 
 /// The agent's own canvas tool on the sketchintent MCP server.
 export const imageToolName = "mcp__sketchintent__show_image";
+
+/// The agent's tools that move the Mac screen the iPad is showing.
+export const openToolName = "mcp__sketchintent__open_on_mac";
+export const desktopToolName = "mcp__sketchintent__go_to_desktop";
 
 /// The banner shows "Calling figma-mcp..." from an MCP tool named mcp__figma-mcp__….
 export function toolLabel(name: string): string {
@@ -28,6 +41,8 @@ export function toolLabel(name: string): string {
 export function toolStatus(name: string): { lead: string; name: string; tone?: "canvas" } | null {
   if (name === rememberToolName) return null;
   if (name === imageToolName) return { lead: "Rendering on ", name: "the canvas", tone: "canvas" };
+  if (name === openToolName) return { lead: "Opening on ", name: "the Mac" };
+  if (name === desktopToolName) return { lead: "Switching ", name: "Mac desktop" };
   return { lead: "Calling ", name: toolLabel(name) };
 }
 
@@ -39,6 +54,7 @@ export function buildPrompt(
   folder?: string,
   earlier: Memory[] = [],
   spoken = "",
+  drawnOn?: DrawnOn,
 ): string {
   const listed =
     notes.length === 0
@@ -61,6 +77,7 @@ export function buildPrompt(
       `The person also held the dictation button and said this to you directly. It is not attached to any point. It is their main request, and it may refer to the ink and the voice notes: "${spoken}"`,
     );
   }
+  if (drawnOn) lines.push(drawnOnLine(drawnOn));
   if (folder) lines.push(`The working folder on the Mac is ${folder}.`);
   if (earlier.length === 0) return lines.join("\n");
   const history = earlier.map((memory, index) => `${index + 1}. ${memory.summary}\n   You replied: ${memory.reply}`);
@@ -86,6 +103,7 @@ export const systemPrompt = [
   "Read the sketch honestly. If any part of it is ambiguous (a rough shape, an unclear arrow, a scribble that could be several things, a size or position you are estimating), render your best reading instead of guessing silently, and do not make changes elsewhere that depend on that reading until the person has seen it.",
   "Coordinates pick where on the iPad's screen the image lands on the Canvas. They are pixels in the cropped sketch image, the space the voice notes use, unless you choose the whole screen image. When the sketch was drawn on the Canvas, place the image beside the part it interprets without covering their ink, unless you are redrawing that part in place. Say in your reply what you rendered and what you want them to check.",
   "The person answers by sketching and adding voice notes on top of your image, then sends again. The next sketch shows your image with their marks, so treat those marks as corrections to it.",
+  "To show the person something on the Mac, open it with open_on_mac, or move to the desktop it is on with go_to_desktop. Both put the iPad back on the Mac screen. Do not open things the sketch did not ask for.",
   "Before your final reply, call the remember tool once. Summarize what the screen showed, what the ink marked, what the notes asked, and what you did, with any file paths, URLs, or IDs a follow-up sketch would need. Later sketches see only this summary, not the images.",
   "The app shows tool calls on its own. Reply with one short sentence, in the first person, about what you are doing.",
 ].join(" ");

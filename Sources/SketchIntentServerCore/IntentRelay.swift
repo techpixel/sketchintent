@@ -66,6 +66,18 @@ final class IntentRelay {
             if !request.spoken.isEmpty {
                 object["spoken"] = request.spoken
             }
+            if let layout = DesktopSwitcher.currentLayout(), !layout.spaceIDs.isEmpty {
+                object["desktopIndex"] = layout.currentIndex
+                object["desktopCount"] = layout.spaceIDs.count
+            }
+            switch request.drawnOn {
+            case .canvas:
+                object["drawnOn"] = "canvas"
+            case .desktop(let index):
+                object["drawnOn"] = index
+            case nil:
+                break
+            }
             urlRequest.httpBody = try JSONSerialization.data(withJSONObject: object)
             let (bytes, response) = try await URLSession.shared.bytes(for: urlRequest)
             guard let http = response as? HTTPURLResponse else {
@@ -112,6 +124,13 @@ final class IntentRelay {
                           encoded.count <= IntentReply.textLimit(for: .canvas),
                           let text = String(data: encoded, encoding: .utf8) else { continue }
                     reply(IntentReply(id: id, kind: .canvas, text: text))
+                case "desktop":
+                    // The iPad follows the streamed display, so only the Mac switches.
+                    guard let index = object["index"] as? Int, index >= 0 else { continue }
+                    DesktopSwitcher.switchDesktop(toIndex: index)
+                    reply(IntentReply(id: id, kind: .screen))
+                case "screen":
+                    reply(IntentReply(id: id, kind: .screen))
                 case "done":
                     reply(IntentReply(id: id, kind: .done))
                 default:

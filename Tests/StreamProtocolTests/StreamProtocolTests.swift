@@ -343,6 +343,16 @@ final class StreamProtocolTests: XCTestCase {
         var spoken = inFolder
         spoken.spoken = "open the settings page"
         XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(spoken))), [.intent(spoken)])
+        var onCanvas = request
+        onCanvas.drawnOn = .canvas
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(onCanvas))), [.intent(onCanvas)])
+        var onDesktop = spoken
+        onDesktop.drawnOn = .desktop(2)
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(onDesktop))), [.intent(onDesktop)])
+        var overFullscreen = withScreen
+        overFullscreen.drawnOn = .desktop(-1)
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(overFullscreen))), [.intent(overFullscreen)])
+
         var spokenWithScreen = withScreen
         spokenWithScreen.spoken = "make the header smaller"
         XCTAssertEqual(

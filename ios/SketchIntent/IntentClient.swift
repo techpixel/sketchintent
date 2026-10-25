@@ -72,7 +72,13 @@ final class IntentClient: ObservableObject {
 
     /// Starts a turn and returns the packet to send on the open Mac socket.
     /// `spoken` is what was said while holding the dictation button.
-    func begin(_ sketch: IntentSketch, folder: String, spoken: String = "") -> IntentRequest {
+    /// `drawnOn` is the page the sketch was drawn on, or nil before the Mac has listed its desktops.
+    func begin(
+        _ sketch: IntentSketch,
+        folder: String,
+        spoken: String = "",
+        drawnOn: IntentRequest.DrawnOn? = nil
+    ) -> IntentRequest {
         let id = nextID
         nextID &+= 1
         activeID = id
@@ -92,7 +98,8 @@ final class IntentClient: ObservableObject {
             screenHeight: sketch.screenHeight,
             screenPng: sketch.screenPng,
             folder: folder,
-            spoken: spoken
+            spoken: spoken,
+            drawnOn: drawnOn
         )
     }
 
@@ -140,8 +147,8 @@ final class IntentClient: ObservableObject {
         case .error:
             turns[index].steps.append(.error(reply.text.isEmpty ? "The agent stopped" : reply.text))
             finish(as: .finished)
-        case .canvas:
-            // The image goes to the canvas. "Rendering on the canvas" is already a status line.
+        case .canvas, .screen:
+            // The image goes to the canvas, and a screen reply changes the page. Both already have a status line.
             break
         case .done:
             let answered = turns[index].steps.contains { step in

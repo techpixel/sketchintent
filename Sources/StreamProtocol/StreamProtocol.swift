@@ -241,6 +241,15 @@ public struct IntentRequest: Equatable {
     public var folder: String
     /// What the person said to the agent while holding the dictation button. Empty for a sketch alone.
     public var spoken: String
+    /// The iPad page the sketch was drawn on. Nil when the iPad did not say.
+    public var drawnOn: DrawnOn?
+
+    public enum DrawnOn: Equatable {
+        /// The blank Canvas page, apart from the Mac screen.
+        case canvas
+        /// Zero-based position in Mission Control. `-1` is a fullscreen app outside that list.
+        case desktop(Int)
+    }
 
     public init(
         id: UInt32,
@@ -252,7 +261,8 @@ public struct IntentRequest: Equatable {
         screenHeight: Int = 0,
         screenPng: Data = Data(),
         folder: String = "",
-        spoken: String = ""
+        spoken: String = "",
+        drawnOn: DrawnOn? = nil
     ) {
         self.id = id
         self.width = width
@@ -264,6 +274,7 @@ public struct IntentRequest: Equatable {
         self.screenPng = screenPng
         self.folder = folder
         self.spoken = spoken
+        self.drawnOn = drawnOn
     }
 }
 
@@ -276,6 +287,8 @@ public struct IntentReply: Equatable {
         case error = 4
         /// Ink and notes the agent put on the sketch. `text` is JSON: see `AgentCanvas` on the iPad.
         case canvas = 5
+        /// The agent opened something on the Mac, so the iPad shows the Mac screen. `text` is empty.
+        case screen = 6
     }
 
     /// Longest `text` a reply carries. A canvas drawing is JSON, so it is never cut short:
@@ -592,16 +605,26 @@ private extension IntentRequest {
         payload.appendBE(UInt16(folder.count))
         payload.append(folder)
         let spoken = Data(self.spoken.utf8.prefix(Self.spokenByteLimit))
-        // The screen block is written empty when only the spoken words follow it.
-        if !screenPng.isEmpty || !spoken.isEmpty {
+        // The screen and spoken blocks are written empty when a later block follows them.
+        if !screenPng.isEmpty || !spoken.isEmpty || drawnOn != nil {
             payload.appendBE(UInt32(clamping: screenPng.isEmpty ? 0 : max(0, screenWidth)))
             payload.appendBE(UInt32(clamping: screenPng.isEmpty ? 0 : max(0, screenHeight)))
             payload.appendBE(UInt32(screenPng.count))
             payload.append(screenPng)
         }
-        if !spoken.isEmpty {
+        if !spoken.isEmpty || drawnOn != nil {
             payload.appendBE(UInt32(spoken.count))
             payload.append(spoken)
+        }
+        switch drawnOn {
+        case .canvas:
+            payload.append(1)
+            payload.appendBE(UInt16(0))
+        case .desktop(let index):
+            payload.append(2)
+            payload.appendBE(UInt16(bitPattern: Int16(clamping: index)))
+        case nil:
+            break
         }
         return payload
     }
@@ -639,6 +662,15 @@ private extension IntentRequest {
                   let text = String(data: spokenBytes, encoding: .utf8) else { return nil }
             spoken = text
         }
+        var drawnOn: DrawnOn?
+        if !cursor.isAtEnd {
+            guard let tag = cursor.u8(), let raw = cursor.u16() else { return nil }
+            switch tag {
+            case 1: drawnOn = .canvas
+            case 2: drawnOn = .desktop(Int(Int16(bitPattern: raw)))
+            default: return nil
+            }
+        }
         guard cursor.isAtEnd else { return nil }
         self.init(
             id: id,
@@ -650,7 +682,8 @@ private extension IntentRequest {
             screenHeight: Int(screenHeight),
             screenPng: screenPng,
             folder: folder,
-            spoken: spoken
+            spoken: spoken,
+            drawnOn: drawnOn
         )
     }
 

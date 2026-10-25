@@ -209,6 +209,11 @@ struct ContentView: View {
                     showAgentRender(reply)
                     return
                 }
+                if reply.kind == .screen {
+                    // The agent opened something on the Mac. The Mac already chose the desktop.
+                    if intent.isWorking(on: reply.id) { blankCanvas = false }
+                    return
+                }
                 if reply.kind == .done || reply.kind == .error {
                     agentPlacements[reply.id] = nil
                 }
@@ -359,7 +364,7 @@ struct ContentView: View {
             intent.fail("The Mac isn't connected")
             return
         }
-        let request = intent.begin(sketch, folder: client.workingFolder, spoken: spoken)
+        let request = intent.begin(sketch, folder: client.workingFolder, spoken: spoken, drawnOn: drawnOn)
         agentPlacements = [request.id: sketch.placement]
         if client.sendIntent(request) {
             self.sketch.markSent()
@@ -397,6 +402,16 @@ struct ContentView: View {
         placement.spaceID = Self.canvasSketchID
         sketch.showAgentRender(render, placement: placement) {
             selectSurface(.canvas)
+        }
+    }
+
+    /// The page the sketch is on, for the agent. Nil until the Mac has listed its desktops.
+    private var drawnOn: IntentRequest.DrawnOn? {
+        switch surface {
+        case .canvas:
+            return .canvas
+        case .desktop(let index):
+            return client.desktopCount > 0 ? .desktop(index) : nil
         }
     }
 
