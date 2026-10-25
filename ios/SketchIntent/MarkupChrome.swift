@@ -651,26 +651,115 @@ private struct MarkdownText: View {
 private struct ThinkingRow: View {
     /// The agent is still looking at the sketch, before its first step.
     var reading: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var wobble = false
-
     var body: some View {
-        HStack(spacing: reading ? 6 : 10) {
+        HStack(spacing: 10) {
             Text(reading ? "Reading the canvas..." : "Thinking...")
                 .foregroundStyle(reading ? Color.agentBlue : Color.agentYellow)
-            Image(reading ? "ReadingBlob" : "ThinkingBlob")
-                .resizable()
-                .aspectRatio(34 / 45, contentMode: .fit)
-                .frame(height: 19)
-                .rotationEffect(.degrees(wobble ? 12 : -12))
+            DitherMark(reading: reading)
+                .frame(width: 20, height: 20)
                 .accessibilityHidden(true)
         }
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
-                wobble = true
+    }
+}
+
+/// The logo: a black hand-drawn asterisk ordered-dithered onto a yellow square. Figma 65:1258.
+/// While the agent works it turns and its arms breathe, the dither crawls, and now and then the
+/// rows tear sideways like the VGA displace export (Figma 65:1260). While reading the canvas the
+/// square is blue and a scan line sweeps down it, inking the mark solid as it passes.
+struct DitherMark: View {
+    var reading: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Cells per side, and the frame rate of the dither, kept low so it reads as pixels.
+    private static let cells = 16
+    private static let fps = 12.0
+    /// Angle (turns), length (of the half side) and half width (cells) of each arm. Uneven on
+    /// purpose, like the pen-drawn mark.
+    private static let arms: [(angle: Double, length: Double, width: Double)] = [
+        (0.00, 0.92, 0.95), (0.10, 0.80, 0.80), (0.22, 0.95, 1.00),
+        (0.33, 0.78, 0.85), (0.44, 0.90, 0.90), (0.56, 0.84, 0.80),
+        (0.66, 0.96, 1.00), (0.78, 0.82, 0.85), (0.89, 0.90, 0.90),
+    ]
+    private static let bayer: [Double] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+        .map { ($0 + 0.5) / 16 }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1 / Self.fps)) { timeline in
+            let frame = reduceMotion ? 0 : Int(timeline.date.timeIntervalSinceReferenceDate * Self.fps)
+            Canvas { context, size in
+                draw(frame: frame, in: &context, size: size)
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
+    }
+
+    private func draw(frame: Int, in context: inout GraphicsContext, size: CGSize) {
+        let n = Self.cells
+        let cell = min(size.width, size.height) / CGFloat(n)
+        let t = Double(frame) / Self.fps
+        context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(reading ? .agentBlue : .agentYellow))
+
+        let spin = t * 0.08
+        // Dither threshold shift: the pattern steps diagonally, a few cells a second.
+        let shift = frame / 3
+        // A torn band of rows for two frames out of every ~20, seeded by the frame.
+        let tearSeed = Self.hash(frame / 20)
+        let tearing = !reading && frame % 20 < 2 && tearSeed % 3 != 0
+        let tearTop = tearSeed % (n - 4)
+        let tearRows = tearTop..<(tearTop + 2 + tearSeed % 4)
+        let tearBy = (tearSeed / 7) % 2 == 0 ? 2 : -3
+        // While reading, the scan line's row; rows above it have been read.
+        let scanRow = Int((t * 9).truncatingRemainder(dividingBy: Double(n + 6))) - 3
+
+        var ink = Path()
+        for row in 0..<n {
+            let shifted = tearing && tearRows.contains(row) ? tearBy : 0
+            for col in 0..<n {
+                let x = (Double(col - shifted) + 0.5) / Double(n) * 2 - 1
+                let y = (Double(row) + 0.5) / Double(n) * 2 - 1
+                var level = Self.coverage(x: x, y: y, spin: spin, t: t, cell: 2 / Double(n))
+                if reading {
+                    level = row < scanRow ? min(1, level * 1.6) : level * 0.55
+                    if row == scanRow { level = max(level, 0.5) }
+                }
+                let threshold = Self.bayer[((row + shift) & 3) * 4 + ((col + shift) & 3)]
+                if level > threshold {
+                    ink.addRect(CGRect(x: CGFloat(col) * cell, y: CGFloat(row) * cell, width: cell, height: cell))
+                }
+            }
+        }
+        context.fill(ink, with: .color(.black))
+    }
+
+    /// How much ink covers a point in the -1...1 square: 1 on an arm's spine, fading over a
+    /// couple of cells so the dither has a soft edge to chew on.
+    private static func coverage(x: Double, y: Double, spin: Double, t: Double, cell: Double) -> Double {
+        var best = 0.0
+        for (index, arm) in arms.enumerated() {
+            let breath = 1 + 0.12 * sin(t * 2.4 + Double(index) * 1.7)
+            let angle = (arm.angle + spin) * 2 * .pi
+            let tipX = cos(angle) * arm.length * breath
+            let tipY = sin(angle) * arm.length * breath
+            // Distance from the point to the segment from the centre to the tip.
+            let along = max(0, min(1, (x * tipX + y * tipY) / (tipX * tipX + tipY * tipY)))
+            let distance = hypot(x - tipX * along, y - tipY * along)
+            // Arms taper toward the tip.
+            let halfWidth = arm.width * cell * (1.15 - 0.45 * along)
+            best = max(best, smoothstep(halfWidth + cell * 1.4, halfWidth - cell * 0.6, distance))
+        }
+        let core = smoothstep(cell * 3.4, cell * 1.6, hypot(x, y))
+        return max(best, core)
+    }
+
+    private static func smoothstep(_ edge0: Double, _ edge1: Double, _ x: Double) -> Double {
+        let k = max(0, min(1, (x - edge0) / (edge1 - edge0)))
+        return k * k * (3 - 2 * k)
+    }
+
+    private static func hash(_ value: Int) -> Int {
+        var h = UInt32(truncatingIfNeeded: value) &* 2_654_435_761
+        h ^= h >> 15
+        return Int(h % 997)
     }
 }
 
