@@ -128,7 +128,7 @@ struct ContentView: View {
                     isConnected: client.isConnected,
                     surface: surface,
                     desktopCount: client.desktopCount,
-                    canSend: sketch.hasInk && !intent.isSending,
+                    canSend: (sketch.hasInk || sketch.hasNotes) && !intent.isSending,
                     isSending: intent.isSending,
                     isLive: live.isOn,
                     onChooseFolder: { client.requestWorkingFolder() },

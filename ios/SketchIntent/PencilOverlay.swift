@@ -118,6 +118,8 @@ enum SketchTool: Equatable, CaseIterable {
 final class SketchCanvas: ObservableObject {
     fileprivate weak var overlay: PencilOverlayView?
     @Published private(set) var hasInk = false
+    /// This desktop has a voice note with text, which can be sent without any ink.
+    @Published private(set) var hasNotes = false
 
     func snapshot() -> UIImage? {
         overlay?.snapshot()
@@ -183,6 +185,17 @@ final class SketchCanvas: ObservableObject {
             }
         }
     }
+
+    fileprivate func noteNotes(_ hasNotes: Bool) {
+        guard self.hasNotes != hasNotes else { return }
+        if Thread.isMainThread {
+            self.hasNotes = hasNotes
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.hasNotes = hasNotes
+            }
+        }
+    }
 }
 
 /// Black pen strokes over the Mac picture. While the Pencil is down, the stroke
@@ -244,6 +257,9 @@ struct PencilOverlay: UIViewRepresentable {
         view.onInkChange = { [weak canvas] hasInk in
             canvas?.noteInk(hasInk)
         }
+        view.onNotesChange = { [weak canvas] hasNotes in
+            canvas?.noteNotes(hasNotes)
+        }
         view.onEdit = { [weak canvas] in
             canvas?.onEdit?()
         }
@@ -274,6 +290,9 @@ struct PencilOverlay: UIViewRepresentable {
         context.coordinator.onToggleTool = onToggleTool
         uiView.onInkChange = { [weak canvas] hasInk in
             canvas?.noteInk(hasInk)
+        }
+        uiView.onNotesChange = { [weak canvas] hasNotes in
+            canvas?.noteNotes(hasNotes)
         }
         uiView.onInk = onInk
         uiView.onSketchBegan = onSketchBegan
@@ -511,6 +530,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// Color for new pen strokes and snapped shapes. Ink already on the page keeps its color.
     private var inkColor: UIColor = InkColor.red.color
     var onInkChange: ((Bool) -> Void)?
+    /// True when this desktop has a voice note with text.
+    var onNotesChange: ((Bool) -> Void)?
     /// The person changed the page. See `SketchCanvas.onEdit`.
     var onEdit: (() -> Void)?
     /// The voice-note tool took the microphone, or gave it back.
@@ -665,7 +686,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// Set while a smoothed stroke is written back, so that write is not smoothed again.
     private var isApplyingSmoothedStroke = false
     /// Voice notes for the desktop on screen, and the notes kept for every other space.
-    private var notes: [VoiceNote] = []
+    private var notes: [VoiceNote] = [] {
+        didSet {
+            onNotesChange?(notes.contains { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+        }
+    }
     private var notesBySpace: [String: [VoiceNote]] = [:]
     private var openNoteID: UUID?
     /// What the agent was sent, so only that is wiped once it answers.
@@ -761,6 +786,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// The crop and the whole screen share the stream's frame limit. Base64 on the Mac needs the rest.
     private static let intentByteBudget = 8_000_000
     private static let screenPngBudget = 4_000_000
+    /// Room around each voice note's dot in the crop, in stroke space.
+    private static let noteContext: CGFloat = 120
 
     var hasInk: Bool {
         !canvas.drawing.strokes.isEmpty
@@ -908,8 +935,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         if rect.isNull || rect.isInfinite || rect.width <= 0 || rect.height <= 0 {
             rect = .null
         }
+        // A note shows what is around its dot, so a page with only notes still has context.
         for anchor in anchors {
-            let point = CGRect(origin: anchor, size: .zero)
+            let point = CGRect(origin: anchor, size: .zero).insetBy(dx: -Self.noteContext, dy: -Self.noteContext)
             rect = rect.isNull ? point : rect.union(point)
         }
         for image in agentImages {
