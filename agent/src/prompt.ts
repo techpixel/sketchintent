@@ -58,7 +58,7 @@ export function buildPrompt(
   const lines = [...intro, listed];
   if (spoken) {
     lines.push(
-      `The person also held the dictation button and said this to you directly. It is their main request, about the page as a whole: "${spoken}"`,
+      `The person also held the dictation button and said this to you directly. It is not attached to any point. It is their main request, and it may refer to the ink and the voice notes: "${spoken}"`,
     );
   }
   if (folder) lines.push(`The working folder on the Mac is ${folder}.`);
