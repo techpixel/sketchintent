@@ -149,11 +149,12 @@ enum PointerInjection: Equatable {
 /// One Pencil contact, mapped the way TN3212 § "Automatic mouse emulation" describes a Sidecar finger.
 ///
 /// A tap (lift before the finger moves `movementSlop` points) is a left click: mouse-down then mouse-up,
-/// not a button held for the whole touch. A drag is a continuous pixel `scrollWheel` with
-/// `kCGScrollWheelEventScrollPhase` began, changed, and ended. The event location stays at the
-/// touch-down point, because AppKit delivers a gesture scroll to the view under the cursor when
-/// the phase began (`NSEvent.phase`). A hold without that movement is `rightMouseDown`, then
-/// `rightMouseDragged`, then `rightMouseUp`.
+/// not a button held for the whole touch. A drag before `longPressDuration` is a continuous pixel
+/// `scrollWheel` with `kCGScrollWheelEventScrollPhase` began, changed, and ended. The event location
+/// stays at the touch-down point, because AppKit delivers a gesture scroll to the view under the cursor
+/// when the phase began (`NSEvent.phase`). A hold without movement is a right click on lift
+/// (`rightMouseDown`, then `rightMouseUp`), while moving after the hold is a left-button drag
+/// (`leftMouseDown`, `leftMouseDragged`, then `leftMouseUp`).
 ///
 /// Magnify and rotate are not produced. TN3212 ties those to a two-finger pinch or rotation,
 /// and this tracker has one point. Each phase also posts a direct-touch event at the Pencil
@@ -161,21 +162,22 @@ enum PointerInjection: Equatable {
 struct FingerContactTracker {
     static let movementSlop: CGFloat = 6
     /// `NSPressGestureRecognizer.minimumPressDuration` is "appropriate for touch" and not a fixed
-    /// public number. Half a second is the hold that becomes the right-click above.
+    /// public number. Half a second is the hold that unlocks a drag or right-click above.
     static let longPressDuration: TimeInterval = 0.5
 
     private enum Mode {
         case idle
         case pending
         case scrolling
-        case pressing
+        case held
+        case dragging
     }
 
     private var mode: Mode = .idle
     private var origin: CGPoint = .zero
     private var current: CGPoint = .zero
     private var lastScroll: CGPoint = .zero
-    /// `ProcessInfo.systemUptime` deadline while the contact is still undecided. Nil once it scrolls or presses.
+    /// `ProcessInfo.systemUptime` deadline while the contact is still undecided. Nil once it scrolls or holds.
     private(set) var longPressDeadline: TimeInterval?
 
     mutating func handle(phase: PointerPhase, point: CGPoint, time: TimeInterval) -> [PointerInjection] {
@@ -203,8 +205,12 @@ struct FingerContactTracker {
                 let events = scrollEvents(phase: .changed, from: lastScroll, to: point)
                 guard !events.isEmpty else { return [] }
                 return events + [Self.touch(point, .changed)]
-            case .pressing:
-                return [.rightDrag(point), Self.touch(point, .changed)]
+            case .held:
+                guard Self.distance(origin, point) >= Self.movementSlop else { return [] }
+                mode = .dragging
+                return [.leftDown(origin), .leftDrag(point), Self.touch(point, .changed)]
+            case .dragging:
+                return [.leftDrag(point), Self.touch(point, .changed)]
             case .idle:
                 return []
             }
@@ -215,15 +221,16 @@ struct FingerContactTracker {
         }
     }
 
-    /// Begins the right-click once `time` has reached `longPressDeadline`.
+    /// Marks the contact as held once `time` has reached `longPressDeadline`.
+    /// Lifting from here right-clicks; moving past `movementSlop` starts a left-button drag.
     mutating func fireLongPress(time: TimeInterval) -> [PointerInjection] {
         guard mode == .pending, let deadline = longPressDeadline, time >= deadline else { return [] }
-        mode = .pressing
+        mode = .held
         longPressDeadline = nil
-        return [.rightDown(current), Self.touch(current, .changed)]
+        return [Self.touch(current, .changed)]
     }
 
-    /// Ends an open scroll or right-click without turning an undecided touch into a click.
+    /// Ends an open scroll or drag without turning an undecided touch into a click.
     mutating func cancel() -> [PointerInjection] {
         finish(lifted: false)
     }
@@ -244,8 +251,11 @@ struct FingerContactTracker {
             events.append(.scroll(ScrollWheelPayload(point: origin, deltaX: 0, deltaY: 0, phase: .ended)))
             events.append(Self.touch(point, lifted ? .ended : .cancelled))
             return events
-        case .pressing:
-            return [.rightUp(point), Self.touch(point, lifted ? .ended : .cancelled)]
+        case .held:
+            guard lifted else { return [Self.touch(point, .cancelled)] }
+            return [.rightDown(origin), .rightUp(origin), Self.touch(point, .ended)]
+        case .dragging:
+            return [.leftUp(point), Self.touch(point, lifted ? .ended : .cancelled)]
         }
     }
 
@@ -390,10 +400,9 @@ final class MacPointer {
         postMouse(.mouseMoved, point: point, button: .left, source: source, touch: false)
     }
 
-    /// Three-finger travel. The button is held only when three-finger drag is on.
-    /// One-finger moves are unchanged, including while that setting is off.
+    /// One-finger hold-and-drag, or three-finger travel when three-finger drag is on.
     func postTrackpadDrag(dx: Int16, dy: Int16, phase: PointerPhase, fingers: UInt8) {
-        let allowed = fingers >= 3 && preferences(force: phase == .down).threeFingerDrag
+        let allowed = fingers == 1 || (fingers >= 3 && preferences(force: phase == .down).threeFingerDrag)
         let scale = TrackpadMapping.pointerScale(trackingSpeed: preferences().trackingSpeed)
         lock.lock()
         let momentumEnd = cancelMomentumLocked()

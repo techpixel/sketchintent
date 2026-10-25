@@ -178,14 +178,19 @@ final class TrackpadSurfaceView: UIView {
     private var traveled = false
     private var anchor: CGPoint = .zero
     private var peakFingers = 0
+    private var dragFingers: UInt8 = 3
     private var residualX: CGFloat = 0
     private var residualY: CGFloat = 0
     /// Finger separation when the two-finger gesture started, and at the last zoom sample.
     private var pinchStart: CGFloat = 0
     private var pinchLast: CGFloat = 0
+    private var longPressItem: DispatchWorkItem?
+    private let dragHaptic = UIImpactFeedbackGenerator(style: .light)
 
     /// Travel past this, in points, leaves the tap and becomes a move or a scroll.
     private static let slop: CGFloat = 8
+    /// Holding one finger still for this long begins a primary-button drag.
+    private static let longPressDelay: TimeInterval = 0.35
     /// Same horizontal travel the canvas uses before a three-finger pan switches desktops.
     private static let desktopSwipeTravel: CGFloat = 36
     /// Classification is fixed at touch-down. A palm that shrinks stays a palm,
@@ -281,6 +286,9 @@ final class TrackpadSurfaceView: UIView {
             contacts.append(Contact(touch, at: clampToPad(touch.location(in: self))))
         }
         peakFingers = max(peakFingers, contacts.count)
+        if contacts.count > 1 {
+            cancelLongPress()
+        }
         if contacts.count > 3 {
             suppress()
             return
@@ -306,6 +314,9 @@ final class TrackpadSurfaceView: UIView {
         }
         if mode == .pending {
             anchor = centroid
+            if contacts.count == 1 {
+                scheduleLongPress()
+            }
         }
     }
 
@@ -321,6 +332,7 @@ final class TrackpadSurfaceView: UIView {
         switch (contacts.count, mode) {
         case (1, .pending):
             guard distance(point, anchor) >= Self.slop else { return }
+            cancelLongPress()
             mode = .moving
             traveled = true
             emitMove(from: anchor, to: point)
@@ -357,7 +369,7 @@ final class TrackpadSurfaceView: UIView {
             }
         case (3, .pending):
             resolveThreeFingerTravel(to: point)
-        case (3, .dragging):
+        case (1, .dragging), (3, .dragging):
             emitDrag(from: anchor, to: point, phase: .move)
             anchor = point
         default:
@@ -382,6 +394,7 @@ final class TrackpadSurfaceView: UIView {
         }
         let lifting = contacts.filter { contact in touches.contains { $0 === contact.touch } }
         guard !lifting.isEmpty else { return }
+        cancelLongPress()
         if !cancelled {
             resolveThreeFingerTravel(to: centroid)
         }
@@ -426,13 +439,43 @@ final class TrackpadSurfaceView: UIView {
             return
         }
         guard abs(dy) >= Self.desktopSwipeTravel, abs(dy) >= abs(dx) else { return }
+        dragFingers = 3
         mode = .dragging
         traveled = true
         emitDrag(from: anchor, to: point, phase: .down)
         anchor = point
     }
 
+    private func scheduleLongPress() {
+        cancelLongPress()
+        dragHaptic.prepare()
+        let item = DispatchWorkItem { [weak self] in
+            self?.beginLongPressDrag()
+        }
+        longPressItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.longPressDelay, execute: item)
+    }
+
+    private func cancelLongPress() {
+        longPressItem?.cancel()
+        longPressItem = nil
+    }
+
+    private func beginLongPressDrag() {
+        longPressItem = nil
+        guard mode == .pending, contacts.count == 1 else { return }
+        anchor = centroid
+        residualX = 0
+        residualY = 0
+        dragFingers = 1
+        mode = .dragging
+        traveled = true
+        dragHaptic.impactOccurred()
+        emitDrag(from: anchor, to: anchor, phase: .down)
+    }
+
     private func suppress() {
+        cancelLongPress()
         if mode == .scrolling {
             finishScroll(at: centroid, cancelled: true)
         } else if mode == .zooming {
@@ -475,7 +518,7 @@ final class TrackpadSurfaceView: UIView {
     private func emitDrag(from start: CGPoint, to end: CGPoint, phase: PointerPhase) {
         let (dx, dy) = takeResidual(dx: end.x - start.x, dy: end.y - start.y)
         if phase == .move, dx == 0, dy == 0 { return }
-        onDrag(dx, dy, phase, 3)
+        onDrag(dx, dy, phase, dragFingers)
     }
 
     /// Keeps the fractional point so a slow finger still reaches the next pixel.
@@ -499,10 +542,12 @@ final class TrackpadSurfaceView: UIView {
     }
 
     private func reset() {
+        cancelLongPress()
         contacts.removeAll()
         mode = .pending
         traveled = false
         peakFingers = 0
+        dragFingers = 3
         residualX = 0
         residualY = 0
         pinchStart = 0

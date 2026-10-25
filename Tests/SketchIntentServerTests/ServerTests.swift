@@ -369,23 +369,45 @@ final class ServerTests: XCTestCase {
         )
     }
 
-    func testFingerHoldIsARightClickThenARightDrag() {
+    func testFingerHoldWithoutMovementIsARightClickOnLift() {
         var tracker = FingerContactTracker()
         let origin = CGPoint(x: 4, y: 9)
         _ = tracker.handle(phase: .down, point: origin, time: 5)
         XCTAssertEqual(tracker.longPressDeadline, 5.5)
         XCTAssertEqual(tracker.fireLongPress(time: 5.5), [
+            .directTouch(DirectTouchEvent(point: origin, phase: .changed))
+        ])
+        let wobble = CGPoint(x: 6, y: 10)
+        XCTAssertEqual(tracker.handle(phase: .move, point: wobble, time: 5.6), [])
+        XCTAssertEqual(tracker.handle(phase: .up, point: wobble, time: 5.7), [
             .rightDown(origin),
+            .rightUp(origin),
+            .directTouch(DirectTouchEvent(point: wobble, phase: .ended))
+        ])
+    }
+
+    func testFingerHoldAndMoveIsALeftDrag() {
+        var tracker = FingerContactTracker()
+        let origin = CGPoint(x: 4, y: 9)
+        _ = tracker.handle(phase: .down, point: origin, time: 5)
+        XCTAssertEqual(tracker.longPressDeadline, 5.5)
+        XCTAssertEqual(tracker.fireLongPress(time: 5.5), [
             .directTouch(DirectTouchEvent(point: origin, phase: .changed))
         ])
         let dragged = CGPoint(x: 18, y: 9)
         XCTAssertEqual(tracker.handle(phase: .move, point: dragged, time: 5.7), [
-            .rightDrag(dragged),
+            .leftDown(origin),
+            .leftDrag(dragged),
             .directTouch(DirectTouchEvent(point: dragged, phase: .changed))
         ])
-        XCTAssertEqual(tracker.handle(phase: .up, point: dragged, time: 5.8), [
-            .rightUp(dragged),
-            .directTouch(DirectTouchEvent(point: dragged, phase: .ended))
+        let further = CGPoint(x: 24, y: 12)
+        XCTAssertEqual(tracker.handle(phase: .move, point: further, time: 5.75), [
+            .leftDrag(further),
+            .directTouch(DirectTouchEvent(point: further, phase: .changed))
+        ])
+        XCTAssertEqual(tracker.handle(phase: .up, point: further, time: 5.8), [
+            .leftUp(further),
+            .directTouch(DirectTouchEvent(point: further, phase: .ended))
         ])
     }
 
