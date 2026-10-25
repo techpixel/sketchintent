@@ -208,12 +208,11 @@ struct BottomBar: View {
     var onTool: (SketchTool) -> Void
     var onColor: (InkColor) -> Void
     var onClear: () -> Void
+    @Namespace private var toolHighlight
 
     var body: some View {
         HStack(spacing: ChromeMetrics.toolGap) {
-            ForEach(SketchTool.edgeOrder, id: \.self) { candidate in
-                toolButton(candidate)
-            }
+            tools
             if canClear {
                 Button(action: onClear) {
                     Image(systemName: "trash")
@@ -236,6 +235,30 @@ struct BottomBar: View {
         .frame(height: ChromeMetrics.bottomBarHeight)
     }
 
+    /// A tap picks a tool. A swipe along the row picks whichever tool is under the finger,
+    /// and the highlight slides with it.
+    private var tools: some View {
+        HStack(spacing: ChromeMetrics.toolGap) {
+            ForEach(SketchTool.edgeOrder, id: \.self) { candidate in
+                toolButton(candidate)
+            }
+        }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 6)
+                .onChanged { drag in
+                    let order = SketchTool.edgeOrder
+                    let slot = ChromeMetrics.toolWidth + ChromeMetrics.toolGap
+                    let index = Int((drag.location.x / slot).rounded(.down))
+                    let candidate = order[min(max(index, 0), order.count - 1)]
+                    if candidate != tool {
+                        onTool(candidate)
+                    }
+                }
+        )
+        .animation(.spring(response: 0.25, dampingFraction: 0.85), value: tool)
+    }
+
     private func toolButton(_ candidate: SketchTool) -> some View {
         let selected = candidate == tool
         return Button {
@@ -246,10 +269,13 @@ struct BottomBar: View {
                 .foregroundStyle(.white)
                 .padding(.vertical, 8)
                 .frame(width: ChromeMetrics.toolWidth)
-                .background(
-                    selected ? Color.toolSelected : Color.clear,
-                    in: RoundedRectangle(cornerRadius: ChromeMetrics.toolCornerRadius, style: .continuous)
-                )
+                .background {
+                    if selected {
+                        RoundedRectangle(cornerRadius: ChromeMetrics.toolCornerRadius, style: .continuous)
+                            .fill(Color.toolSelected)
+                            .matchedGeometryEffect(id: "tool", in: toolHighlight)
+                    }
+                }
         }
         .accessibilityLabel(candidate.accessibilityName)
         .accessibilityAddTraits(selected ? .isSelected : [])
