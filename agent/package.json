@@ -5,8 +5,11 @@
   "description": "SketchIntent AI server. The iPad Send to AI button posts a sketch here.",
   "scripts": {
     "start": "node src/server.ts",
+    "start:gemini": "node src/server.ts --agent gemini",
+    "start:agy": "node src/server.ts --agent gemini",
+    "start:claude": "node src/server.ts --agent claude",
     "check": "tsc --noEmit",
-    "test": "node --test src/prompt.test.ts src/canvas.test.ts src/mac.test.ts"
+    "test": "node --test src/prompt.test.ts src/canvas.test.ts src/mac.test.ts src/gemini.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.310",

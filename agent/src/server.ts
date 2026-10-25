@@ -8,10 +8,22 @@ import { fileURLToPath } from "node:url";
 import { createSdkMcpServer, query, tool, type McpServerConfig, type PermissionMode, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { makeImage, type CanvasImage } from "./canvas.ts";
+import { executeGeminiTool, geminiCredentialNote, geminiError, runGeminiIntent } from "./gemini.ts";
 import { openOnMac } from "./mac.ts";
-import { buildPrompt, systemPrompt, toolStatus, type DrawnOn, type Memory, type SketchNote } from "./prompt.ts";
+import { agentHelp, buildPrompt, parseAgentArgs, systemPrompt, toolStatus, type AgentKind, type DrawnOn, type Memory, type SketchNote } from "./prompt.ts";
 
-const port = Number(process.env.SKETCHINTENT_AI_PORT ?? 2347);
+const parsedArgs = parseAgentArgs();
+if ("help" in parsedArgs) {
+  console.log(parsedArgs.help);
+  process.exit(0);
+}
+if ("error" in parsedArgs) {
+  console.error(`${parsedArgs.error}\n${agentHelp}`);
+  process.exit(2);
+}
+
+const config = parsedArgs;
+const port = config.port;
 const root = fileURLToPath(new URL("..", import.meta.url));
 const debugPngPath = join(root, "debug", "latest.png");
 const debugScreenPath = join(root, "debug", "screen.png");
@@ -97,6 +109,7 @@ type ClientEvent =
   | { type: "error"; message: string };
 
 let active: AbortController | null = null;
+let activeToolHandler: ((name: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>) | null = null;
 let nextTurn = 0;
 const loggedLines = new Map<number, Set<string>>();
 
@@ -420,10 +433,56 @@ async function runIntent(turn: number, body: IntentBody, cwd: string, prompt: st
     },
   };
 
+  const heartbeat = setInterval(() => writeEvent(response, turn, { type: "ping" }), heartbeatMs);
+  if (config.agent === "gemini") {
+    activeToolHandler = (name, args) =>
+      executeGeminiTool(
+        { name, args },
+        body,
+        {
+          isConnected: () => !response.writableEnded && !response.destroyed,
+          onEvent: (event) => writeEvent(response, turn, event),
+        },
+        (saved) => {
+          summary = saved;
+        },
+      );
+    try {
+      await runGeminiIntent(
+        body,
+        prompt,
+        {
+          cwd,
+          port,
+          model: config.model,
+          system: systemPrompt,
+          sketchPath: debugPngPath,
+          screenPath: body.screen ? debugScreenPath : undefined,
+          abort: abort.signal,
+          isConnected: () => !response.writableEnded && !response.destroyed,
+          onEvent: (event) => writeEvent(response, turn, event),
+          onLog: (message) => logTurn(turn, message),
+          onSummary: (saved, reply) => {
+            rememberTurn(body.folder, {
+              summary: saved || fallbackSummary(body.notes, body.spoken),
+              reply: reply.trim().slice(0, 500),
+            });
+            if (!saved) logTurn(turn, "→ no summary saved, keeping the notes instead");
+          },
+        },
+        () => summary,
+      );
+    } finally {
+      activeToolHandler = null;
+      clearInterval(heartbeat);
+      if (abort.signal.aborted) logTurn(turn, "→ cancelled");
+    }
+    return;
+  }
+
   const mcpServers = await loadMcpServers();
   const mcpNames = Object.keys(mcpServers);
   logTurn(turn, mcpNames.length === 0 ? "← mcp.json none" : `← mcp.json ${mcpNames.join(", ")}`);
-  const heartbeat = setInterval(() => writeEvent(response, turn, { type: "ping" }), heartbeatMs);
   try {
     const stream = query({
       prompt: oneTurn(message, inputClosed.signal),
@@ -441,7 +500,7 @@ async function runIntent(turn: number, body: IntentBody, cwd: string, prompt: st
         systemPrompt: { type: "preset", preset: "claude_code", append: systemPrompt },
         mcpServers: { ...mcpServers, sketchintent: memoryServer },
         permissionMode,
-        ...(process.env.SKETCHINTENT_MODEL ? { model: process.env.SKETCHINTENT_MODEL } : {}),
+        ...(config.model ? { model: config.model } : {}),
         // Only calls the permission mode could not decide reach here, and nobody is at the Mac to ask.
         canUseTool: async (toolName, input) => {
           if (toolName.startsWith("mcp__")) {
@@ -660,6 +719,22 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
     sendJSON(response, 200, { ok: true });
     return;
   }
+  if (request.method === "POST" && pathname === "/v1/tool") {
+    if (!activeToolHandler) {
+      sendJSON(response, 409, { error: "No active sketch turn." });
+      return;
+    }
+    try {
+      const parsed = JSON.parse((await readBody(request)).toString("utf8")) as Record<string, unknown>;
+      const toolName = typeof parsed.tool === "string" ? parsed.tool : "";
+      const args = typeof parsed.args === "object" && parsed.args !== null ? (parsed.args as Record<string, unknown>) : {};
+      const result = await activeToolHandler(toolName, args);
+      sendJSON(response, "error" in result ? 400 : 200, result);
+    } catch (error) {
+      sendJSON(response, 400, { error: errorMessage(error) });
+    }
+    return;
+  }
   if (request.method !== "POST" || request.url !== "/v1/intent") {
     sendJSON(response, 404, { error: "Not found." });
     return;
@@ -727,13 +802,15 @@ function errorMessage(error: unknown): string {
 }
 
 function agentError(error: string): string {
+  if (config.agent === "gemini") return geminiError(error);
   if (error === "authentication_failed") {
     return "Claude isn't signed in for this server. Run claude in Terminal and sign in, or set ANTHROPIC_API_KEY.";
   }
   return error;
 }
 
-function credentialNote(): string {
+function credentialNote(agent: AgentKind = config.agent): string {
+  if (agent === "gemini") return geminiCredentialNote();
   if (process.env.ANTHROPIC_API_KEY) return "Using ANTHROPIC_API_KEY.";
   if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return "Using CLAUDE_CODE_OAUTH_TOKEN.";
   const home = homedir();
@@ -762,14 +839,20 @@ server.on("error", (error) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  console.log(`[sketchintent-ai] Listening on 127.0.0.1:${port}.`);
+  const modelNote = config.model ? ` (${config.model})` : "";
+  console.log(`[sketchintent-ai] Listening on 127.0.0.1:${port}. Agent: ${config.agent}${modelNote}.`);
   console.log(`[sketchintent-ai] ${credentialNote()}`);
   console.log(`[sketchintent-ai] system ${systemPrompt}`);
   console.log(`[sketchintent-ai] Open http://127.0.0.1:${port}/debug/latest to see the sketch the agent received.`);
   console.log("[sketchintent-ai] The iPad reaches this through the SketchIntent USB connection.");
   console.log("[sketchintent-ai] Follow-up sketches remember earlier ones. POST /v1/intent/reset starts over.");
-  console.log("[sketchintent-ai] Uses the tools, MCP servers, plugins and skills of your Claude Code setup. Extra MCP servers go in agent/mcp.json.");
-  console.log(`[sketchintent-ai] Works in the folder the iPad chose, or ${defaultFolder}. Permission mode ${permissionMode}.`);
+  if (config.agent === "claude") {
+    console.log("[sketchintent-ai] Uses the tools, MCP servers, plugins and skills of your Claude Code setup. Extra MCP servers go in agent/mcp.json.");
+    console.log(`[sketchintent-ai] Works in the folder the iPad chose, or ${defaultFolder}. Permission mode ${permissionMode}.`);
+  } else {
+    console.log("[sketchintent-ai] Uses the tools, subagents, MCP servers, plugins and skills of your Antigravity (agy) setup.");
+    console.log(`[sketchintent-ai] Works in the folder the iPad chose, or ${defaultFolder}.`);
+  }
 });
 
 function shutdown() {

@@ -39,13 +39,115 @@ export function toolLabel(name: string): string {
 /// The status line for a tool call, or null for a call the app does not show.
 /// The "canvas" tone shows in blue on the iPad, apart from the agent's other work.
 export function toolStatus(name: string): { lead: string; name: string; tone?: "canvas" } | null {
-  if (name === rememberToolName) return null;
-  if (name === imageToolName) return { lead: "Rendering on ", name: "the canvas", tone: "canvas" };
-  if (name === openToolName) return { lead: "Opening on ", name: "the Mac" };
-  if (name === desktopToolName) return { lead: "Switching ", name: "Mac desktop" };
-  if (name === "Bash") return { lead: "Running ", name: "a command" };
-  if (name === "Write" || name === "Edit" || name === "NotebookEdit") return { lead: "Editing ", name: "files" };
+  if (name === rememberToolName || name === "remember") return null;
+  if (name === imageToolName || name === "show_image") return { lead: "Rendering on ", name: "the canvas", tone: "canvas" };
+  if (name === openToolName || name === "open_on_mac") return { lead: "Opening on ", name: "the Mac" };
+  if (name === desktopToolName || name === "go_to_desktop") return { lead: "Switching ", name: "Mac desktop" };
+  if (name === "Bash" || name === "run_command" || name === "send_command_input") return { lead: "Running ", name: "a command" };
+  if (
+    name === "Write" ||
+    name === "Edit" ||
+    name === "NotebookEdit" ||
+    name === "write_file" ||
+    name === "write_to_file" ||
+    name === "edit_file" ||
+    name === "replace_file_content" ||
+    name === "multi_replace_file_content" ||
+    name === "sed_file" ||
+    name === "notebook_edit"
+  ) {
+    return { lead: "Editing ", name: "files" };
+  }
   return { lead: "Calling ", name: toolLabel(name) };
+}
+
+export type AgentKind = "claude" | "gemini";
+
+export interface AgentConfig {
+  agent: AgentKind;
+  model?: string;
+  port: number;
+}
+
+export const agentHelp = [
+  "SketchIntent AI server receives sketches and voice notes from the iPad.",
+  "",
+  "Usage: npm run start:gemini",
+  "       node src/server.ts [--agent claude|gemini|agy] [--gemini] [--agy] [--claude]",
+  "                          [--model <name>] [--port 2347]",
+].join("\n");
+
+function normalizeAgent(value: string): AgentKind | null {
+  const lower = value.trim().toLowerCase();
+  if (lower === "claude") return "claude";
+  if (lower === "gemini" || lower === "agy" || lower === "antigravity") return "gemini";
+  return null;
+}
+
+export function parseAgentArgs(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env,
+): AgentConfig | { help: string } | { error: string } {
+  const npmAgent = env.npm_config_agent && env.npm_config_agent !== "true" ? env.npm_config_agent : undefined;
+  const rawEnvAgent =
+    npmAgent ??
+    env.SKETCHINTENT_AGENT ??
+    (env.npm_config_gemini || env.npm_config_agy ? "gemini" : env.npm_config_claude ? "claude" : "claude");
+  const initialAgent = normalizeAgent(rawEnvAgent);
+  if (!initialAgent) {
+    return { error: `Unknown agent "${npmAgent ?? env.SKETCHINTENT_AGENT}". Choose claude or gemini.` };
+  }
+  let agent: AgentKind = initialAgent;
+  let model = (env.npm_config_model && env.npm_config_model !== "true" ? env.npm_config_model : env.SKETCHINTENT_MODEL)?.trim() || undefined;
+  let port = Number(env.npm_config_port ?? env.SKETCHINTENT_AI_PORT ?? 2347);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) port = 2347;
+
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] ?? "";
+    const normalizedArg = normalizeAgent(arg);
+    const takeValue = (flag: string, inline?: string): string | { error: string } => {
+      if (inline !== undefined) return inline;
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("-")) return { error: `Missing value for ${flag}.` };
+      index += 1;
+      return next;
+    };
+    if (arg === "--help" || arg === "-h") {
+      return { help: agentHelp };
+    } else if (arg === "--gemini" || arg === "--agy" || normalizedArg === "gemini") {
+      agent = "gemini";
+    } else if (arg === "--claude" || normalizedArg === "claude") {
+      agent = "claude";
+    } else if (arg === "--agent" || arg.startsWith("--agent=")) {
+      const raw = takeValue("--agent", arg.startsWith("--agent=") ? arg.slice("--agent=".length) : undefined);
+      if (typeof raw !== "string") return raw;
+      const normalized = normalizeAgent(raw);
+      if (!normalized) {
+        return { error: `Unknown agent "${raw}". Choose claude or gemini.` };
+      }
+      agent = normalized;
+    } else if (arg === "--model" || arg.startsWith("--model=")) {
+      const raw = takeValue("--model", arg.startsWith("--model=") ? arg.slice("--model=".length) : undefined);
+      if (typeof raw !== "string") return raw;
+      model = raw.trim() || undefined;
+    } else if (arg === "--port" || arg.startsWith("--port=")) {
+      const raw = takeValue("--port", arg.startsWith("--port=") ? arg.slice("--port=".length) : undefined);
+      if (typeof raw !== "string") return raw;
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+        return { error: `Invalid port "${raw}".` };
+      }
+      port = parsed;
+    } else {
+      return { error: `Unknown option ${arg}.` };
+    }
+  }
+  if (!model && agent === "gemini" && env.GEMINI_MODEL?.trim()) {
+    model = env.GEMINI_MODEL.trim();
+  }
+  // Opus burns through usage quickly; Sonnet is plenty for sketch requests.
+  if (!model && agent === "claude") model = "sonnet";
+  return { agent, ...(model ? { model } : {}), port };
 }
 
 export function buildPrompt(

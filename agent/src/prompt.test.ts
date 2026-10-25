@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildPrompt, desktopToolName, imageToolName, openToolName, rememberToolName, systemPrompt, toolLabel, toolStatus } from "./prompt.ts";
+import { buildPrompt, desktopToolName, imageToolName, openToolName, parseAgentArgs, rememberToolName, systemPrompt, toolLabel, toolStatus } from "./prompt.ts";
 
 test("tool labels use the MCP server name", () => {
   assert.equal(toolLabel("mcp__figma-mcp__get_design_context"), "figma-mcp");
@@ -78,4 +78,40 @@ test("commands and file edits get plain status lines", () => {
   assert.deepEqual(toolStatus("Bash"), { lead: "Running ", name: "a command" });
   assert.deepEqual(toolStatus("Edit"), { lead: "Editing ", name: "files" });
   assert.deepEqual(toolStatus("Write"), { lead: "Editing ", name: "files" });
+  assert.equal(toolStatus("remember"), null);
+  assert.deepEqual(toolStatus("show_image"), { lead: "Rendering on ", name: "the canvas", tone: "canvas" });
+  assert.deepEqual(toolStatus("open_on_mac"), { lead: "Opening on ", name: "the Mac" });
+  assert.deepEqual(toolStatus("go_to_desktop"), { lead: "Switching ", name: "Mac desktop" });
+});
+
+test("parseAgentArgs reads launch flags and environment defaults", () => {
+  assert.deepEqual(parseAgentArgs([], {}), { agent: "claude", model: "sonnet", port: 2347 });
+  assert.deepEqual(parseAgentArgs(["--agent", "gemini"], {}), { agent: "gemini", port: 2347 });
+  assert.deepEqual(parseAgentArgs(["--agent=gemini", "--model", "gemini-2.5-flash", "--port", "2400"], {}), {
+    agent: "gemini",
+    model: "gemini-2.5-flash",
+    port: 2400,
+  });
+  assert.deepEqual(parseAgentArgs(["--gemini"], { GEMINI_MODEL: "gemini-2.5-pro" }), {
+    agent: "gemini",
+    model: "gemini-2.5-pro",
+    port: 2347,
+  });
+  assert.deepEqual(parseAgentArgs(["--claude"], { SKETCHINTENT_AGENT: "gemini" }), {
+    agent: "claude",
+    model: "sonnet",
+    port: 2347,
+  });
+  assert.deepEqual(parseAgentArgs(["gemini"], { npm_config_agent: "true" }), {
+    agent: "gemini",
+    port: 2347,
+  });
+  assert.deepEqual(parseAgentArgs([], { npm_config_agent: "gemini" }), {
+    agent: "gemini",
+    port: 2347,
+  });
+  assert.deepEqual(parseAgentArgs(["--model", "opus"], {}), { agent: "claude", model: "opus", port: 2347 });
+  assert.ok("help" in parseAgentArgs(["--help"], {}));
+  assert.ok("error" in parseAgentArgs(["--agent", "other"], {}));
+  assert.ok("error" in parseAgentArgs(["--unknown"], {}));
 });
