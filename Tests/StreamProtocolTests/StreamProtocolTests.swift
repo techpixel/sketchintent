@@ -144,6 +144,35 @@ final class StreamProtocolTests: XCTestCase {
         XCTAssertEqual(try StreamParser().append(skipped), [.heartbeat])
     }
 
+    func testDesktopPickerAndCancelRoundTrip() throws {
+        let packet = StreamFraming.encode(.desktops(index: 2, count: 4))
+            + StreamFraming.encode(.desktops(index: -1, count: 3))
+            + StreamFraming.encode(.cancelIntent(0x0102_0304))
+            + StreamFraming.encode(.input(.goToDesktop(index: 5)))
+        XCTAssertEqual(
+            try StreamParser().append(packet),
+            [
+                .desktops(index: 2, count: 4),
+                .desktops(index: -1, count: 3),
+                .cancelIntent(0x0102_0304),
+                .input(.goToDesktop(index: 5))
+            ]
+        )
+    }
+
+    func testTrackpadMagnifyRoundTrip() throws {
+        let pinch = StreamFraming.encode(.input(.trackpadMagnify(magnification: -250, phase: .began)))
+        XCTAssertEqual(Array(pinch.suffix(4)), [8, TrackpadScrollPhase.began.rawValue, 0xff, 0x06])
+        let packet = pinch + StreamFraming.encode(.input(.trackpadMagnify(magnification: 0, phase: .ended)))
+        XCTAssertEqual(
+            try StreamParser().append(packet),
+            [
+                .input(.trackpadMagnify(magnification: -250, phase: .began)),
+                .input(.trackpadMagnify(magnification: 0, phase: .ended))
+            ]
+        )
+    }
+
     func testTrackpadMoveAndTapRoundTrip() throws {
         let move = StreamFraming.encode(.input(.trackpadMove(dx: -2, dy: 30)))
         XCTAssertEqual(Array(move.suffix(5)), [5, 0xff, 0xfe, 0x00, 0x1e])
@@ -265,6 +294,54 @@ final class StreamProtocolTests: XCTestCase {
         XCTAssertEqual(
             try parser.append(rest),
             [.ink(ink), .ink(clear), .heartbeat]
+        )
+    }
+
+    func testIntentRoundTrip() throws {
+        let png = InkSnapshot.pngSignature + Data([0x01, 0x02, 0x03])
+        let request = IntentRequest(
+            id: 7,
+            width: 320,
+            height: 180,
+            notes: [IntentNote(text: "make this blue", x: 12.5, y: 40)],
+            png: png
+        )
+        let reply = IntentReply(id: 7, kind: .status, lead: "Calling ", name: "figma-mcp", text: "")
+        let done = IntentReply(id: 7, kind: .done)
+        let drawing = String(repeating: "[1,2],", count: 3_000)
+        let canvas = IntentReply(id: 7, kind: .canvas, text: "{\"strokes\":[{\"points\":[\(drawing)[3,4]]}]}")
+        let parser = StreamParser()
+        XCTAssertEqual(
+            try parser.append(
+                StreamFraming.encode(.intent(request))
+                    + StreamFraming.encode(.intentReply(reply))
+                    + StreamFraming.encode(.intentReply(canvas))
+                    + StreamFraming.encode(.intentReply(done))
+            ),
+            [.intent(request), .intentReply(reply), .intentReply(canvas), .intentReply(done)]
+        )
+        XCTAssertEqual(StreamFraming.encode(.intent(request))[4], 8)
+        XCTAssertEqual(StreamFraming.encode(.intentReply(reply))[4], 9)
+
+        let screen = InkSnapshot.pngSignature + Data([0x09])
+        let withScreen = IntentRequest(
+            id: 7,
+            width: 320,
+            height: 180,
+            notes: request.notes,
+            png: png,
+            screenWidth: 1280,
+            screenHeight: 800,
+            screenPng: screen
+        )
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(withScreen))), [.intent(withScreen)])
+
+        var inFolder = request
+        inFolder.folder = "/Users/me/Notes"
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(inFolder))), [.intent(inFolder)])
+        XCTAssertEqual(
+            try parser.append(StreamFraming.encode(.chooseFolder("/Users/me/Notes")) + StreamFraming.encode(.workingFolder(""))),
+            [.chooseFolder("/Users/me/Notes"), .workingFolder("")]
         )
     }
 }

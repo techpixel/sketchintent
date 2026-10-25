@@ -54,6 +54,8 @@ struct TrackpadPreferences: Equatable {
     var dragging: Bool
     /// `DragLock`. Off by default. Paired with `dragging`.
     var dragLock: Bool
+    /// `TrackpadPinch`. "Zoom in or out". On by default.
+    var zoom: Bool = true
 
     /// The tracking-speed notch a Mac uses before the slider is moved.
     static let factoryTrackingSpeed = 0.6875
@@ -134,6 +136,9 @@ struct TrackpadPreferences: Equatable {
         }
         if let dragLock = boolean(preference("DragLock", builtin: builtin, bluetooth: bluetooth)) {
             preferences.dragLock = dragLock
+        }
+        if let pinch = boolean(preference("TrackpadPinch", builtin: builtin, bluetooth: bluetooth)) {
+            preferences.zoom = pinch
         }
         if let natural = boolean(naturalScrolling) {
             preferences.naturalScrolling = natural

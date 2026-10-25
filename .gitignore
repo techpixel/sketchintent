@@ -1,5 +1,8 @@
 .build/
 .swiftpm/
+node_modules/
+agent/mcp.json
+agent/debug/
 .DS_Store
 DerivedData/
 xcuserdata/

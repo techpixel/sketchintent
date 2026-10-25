@@ -298,10 +298,17 @@ final class ScreenPictureView: UIView {
     private var showsPicture = true
     private var frozenWidth = 0
     private var frozenHeight = 0
+    private var liveWidth = 0
+    private var liveHeight = 0
+    /// Rounds the fitted picture, not the letterbox around it. Figma 48:696.
+    private let pictureMask = CAShapeLayer()
+    static let pictureCornerRadius: CGFloat = 16
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
+        clipsToBounds = true
+        layer.mask = pictureMask
         stillView.isHidden = true
         stillView.contentMode = .scaleToFill
         stillView.isUserInteractionEnabled = false
@@ -320,6 +327,14 @@ final class ScreenPictureView: UIView {
         applyPicture()
     }
 
+    /// Captured size of the live stream. The rounded mask follows the picture it fits to.
+    func setLiveSize(width: Int, height: Int) {
+        guard width != liveWidth || height != liveHeight else { return }
+        liveWidth = width
+        liveHeight = height
+        placePicture()
+    }
+
     /// `width` and `height` are the captured pixel size, the same numbers ink maps against.
     func setFrozenImage(_ image: UIImage?, width: Int, height: Int) {
         frozenWidth = width
@@ -332,8 +347,7 @@ final class ScreenPictureView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        display.frame = bounds
-        placeStill()
+        placePicture()
     }
 
     /// The live sample view is the only hit target, matching the picture before the still existed.
@@ -349,7 +363,34 @@ final class ScreenPictureView: UIView {
 
     private func applyPicture() {
         display.setPictureHidden(!showsPicture || wantsStill)
+        placePicture()
+    }
+
+    private func placePicture() {
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        display.frame = bounds
         placeStill()
+        placeMask()
+        CATransaction.commit()
+    }
+
+    private func placeMask() {
+        pictureMask.frame = bounds
+        let width = wantsStill ? frozenWidth : liveWidth
+        let height = wantsStill ? frozenHeight : liveHeight
+        guard let picture = FrameCoordinates.pictureRect(
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height),
+            frameWidth: width,
+            frameHeight: height
+        ) else {
+            pictureMask.path = UIBezierPath(roundedRect: bounds, cornerRadius: Self.pictureCornerRadius).cgPath
+            return
+        }
+        let rect = CGRect(x: picture.x, y: picture.y, width: picture.width, height: picture.height)
+        pictureMask.path = UIBezierPath(roundedRect: rect, cornerRadius: Self.pictureCornerRadius).cgPath
     }
 
     private func placeStill() {
@@ -372,6 +413,8 @@ final class ScreenPictureView: UIView {
 
 struct ScreenDisplay: UIViewRepresentable {
     let client: StreamClient
+    var liveWidth: Int
+    var liveHeight: Int
     /// Blank canvas keeps the live layer and the still hidden.
     var showsPicture: Bool
     /// Nil while the livestream is the picture on screen.
@@ -381,6 +424,7 @@ struct ScreenDisplay: UIViewRepresentable {
 
     func makeUIView(context: Context) -> ScreenPictureView {
         let view = ScreenPictureView()
+        view.setLiveSize(width: liveWidth, height: liveHeight)
         view.setShowsPicture(showsPicture)
         view.setFrozenImage(frozenImage, width: frozenWidth, height: frozenHeight)
         client.attachDisplay(view.display)
@@ -388,6 +432,7 @@ struct ScreenDisplay: UIViewRepresentable {
     }
 
     func updateUIView(_ view: ScreenPictureView, context: Context) {
+        view.setLiveSize(width: liveWidth, height: liveHeight)
         view.setShowsPicture(showsPicture)
         view.setFrozenImage(frozenImage, width: frozenWidth, height: frozenHeight)
         client.attachDisplay(view.display)

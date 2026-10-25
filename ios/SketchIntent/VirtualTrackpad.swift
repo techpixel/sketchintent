@@ -1,33 +1,35 @@
 import SwiftUI
 import UIKit
 
-/// Figma frame "virt trackpad" (20:302) size 712.9036×446, corner radius 16,
-/// scaled to the iPad and anchored to the bottom center. The plate is liquid
-/// glass tinted with frame 20:295's rgba(0, 0, 0, 0.5) fill. The whole surface
-/// is the trackpad.
+/// Figma frame "virt trackpad" (55:1077) size 712.904×509, corner radius 16,
+/// scaled to the iPad, centered, and flush with the bottom edge. A near-black
+/// plate with a 1pt grey rim. The lighter block in the bottom-right corner is
+/// the secondary-click corner. The whole surface is the trackpad.
 enum VirtualTrackpadMetrics {
     static let artboard = CGSize(width: 1366, height: 1024)
-    static let designSize = CGSize(width: 712.9036, height: 446)
+    static let designSize = CGSize(width: 712.904, height: 509)
     static let cornerRadius: CGFloat = 16
+    static let rimWidth: CGFloat = 1
     /// `UITouch.majorRadius` above this is a resting palm. A fingertip stays at or under it.
     static let fingertipMajorRadius: CGFloat = 32
-    /// Bottom corners occupy this fraction of the pad. A one-finger tap in the
-    /// bottom-right is always a right click. The bottom-left follows the Mac setting.
-    static let cornerFraction: CGFloat = 0.2
+    /// Bottom corners occupy this much of the pad, the size of the drawn corner
+    /// block (Figma 55:1082, 357×163.49). A one-finger tap in the bottom-right is
+    /// always a right click. The bottom-left, the same size, follows the Mac setting.
+    static let cornerWidthFraction: CGFloat = 357 / 712.904
+    static let cornerHeightFraction: CGFloat = 163.49 / 509
     /// Extra hit area around the pad. A fingertip aimed at the rim often reports
     /// its center just outside the plate, and that touch would otherwise miss.
     static let edgeHitOutset: CGFloat = 32
 
-    /// Uniform artboard scale. The pad is centered horizontally and sits 24pt
-    /// above the home indicator.
-    static func frame(in bounds: CGSize, safeAreaBottom: CGFloat = 0) -> CGRect {
+    /// Uniform artboard scale. The pad is centered horizontally and rests on the bottom edge.
+    static func frame(in bounds: CGSize) -> CGRect {
         guard bounds.width > 0, bounds.height > 0 else { return .zero }
         let scale = min(bounds.width / artboard.width, bounds.height / artboard.height)
         let width = designSize.width * scale
         let height = designSize.height * scale
         return CGRect(
             x: (bounds.width - width) / 2,
-            y: max(0, bounds.height - height - 24 - max(0, safeAreaBottom)),
+            y: max(0, bounds.height - height),
             width: width,
             height: height
         )
@@ -66,15 +68,7 @@ final class TrackpadHostView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        pad.frame = VirtualTrackpadMetrics.frame(
-            in: bounds.size,
-            safeAreaBottom: safeAreaInsets.bottom
-        )
-    }
-
-    override func safeAreaInsetsDidChange() {
-        super.safeAreaInsetsDidChange()
-        setNeedsLayout()
+        pad.frame = VirtualTrackpadMetrics.frame(in: bounds.size)
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
@@ -141,7 +135,8 @@ final class TrackpadHostView: UIView {
 }
 
 /// Translucent rounded pad. One finger moves the pointer. Two fingers scroll.
-/// Three fingers swiping horizontally switch desktops and do not move, scroll, or click.
+/// Two fingers spreading or pinching zoom on the Mac. Three fingers swiping
+/// horizontally switch desktops and do not move, scroll, or click.
 /// A tap is reported with its finger count and corner so the Mac can apply
 /// tap-to-click and secondary click. A palm is not a finger. Pencil strokes
 /// pass through to the canvas.
@@ -150,6 +145,9 @@ final class TrackpadSurfaceView: UIView {
     var onScroll: (Int16, Int16, TrackpadScrollPhase) -> Void = { _, _, _ in }
     var onTap: (UInt8, TrackpadTapZone) -> Void = { _, _ in }
     var onDrag: (Int16, Int16, PointerPhase, UInt8) -> Void = { _, _, _, _ in }
+    /// Change in finger separation since the previous sample. Greater than 1 zooms in.
+    /// The closing sample is 1 with phase ended or cancelled.
+    var onMagnify: (CGFloat, TrackpadScrollPhase) -> Void = { _, _ in }
     /// Finger direction, before the Natural swiping setting. `.left` means the fingers moved left.
     var onSwipe: (FingerSwipe) -> Void = { _ in }
 
@@ -170,6 +168,7 @@ final class TrackpadSurfaceView: UIView {
         case pending
         case moving
         case scrolling
+        case zooming
         case dragging
         case suppressed
     }
@@ -181,6 +180,9 @@ final class TrackpadSurfaceView: UIView {
     private var peakFingers = 0
     private var residualX: CGFloat = 0
     private var residualY: CGFloat = 0
+    /// Finger separation when the two-finger gesture started, and at the last zoom sample.
+    private var pinchStart: CGFloat = 0
+    private var pinchLast: CGFloat = 0
 
     /// Travel past this, in points, leaves the tap and becomes a move or a scroll.
     private static let slop: CGFloat = 8
@@ -190,7 +192,8 @@ final class TrackpadSurfaceView: UIView {
     /// and a fingertip that later widens stays a finger.
     private var fingerTouches: Set<ObjectIdentifier> = []
     private var rejectedTouches: Set<ObjectIdentifier> = []
-    private let plate = LiquidGlassPlate()
+    private let plate = UIView()
+    private let cornerBlock = UIView()
 
     private var centroid: CGPoint {
         guard !contacts.isEmpty else { return anchor }
@@ -205,11 +208,24 @@ final class TrackpadSurfaceView: UIView {
         isOpaque = false
         backgroundColor = .clear
         isMultipleTouchEnabled = true
-        plate.cornerRadius = VirtualTrackpadMetrics.cornerRadius
+        let rim = (UIColor(named: "CanvasLine") ?? .gray).cgColor
+        plate.isUserInteractionEnabled = false
+        plate.backgroundColor = UIColor(named: "TrackpadFill")
+        plate.layer.borderColor = rim
+        plate.layer.borderWidth = VirtualTrackpadMetrics.rimWidth
+        plate.layer.cornerCurve = .continuous
+        plate.clipsToBounds = true
+        cornerBlock.isUserInteractionEnabled = false
+        cornerBlock.backgroundColor = UIColor(named: "TrackpadCorner")
+        cornerBlock.layer.borderColor = rim
+        cornerBlock.layer.borderWidth = VirtualTrackpadMetrics.rimWidth
+        cornerBlock.layer.cornerCurve = .continuous
+        cornerBlock.layer.maskedCorners = [.layerMinXMinYCorner]
         addSubview(plate)
+        plate.addSubview(cornerBlock)
         isAccessibilityElement = true
         accessibilityLabel = "Trackpad"
-        accessibilityHint = "One finger moves the pointer. Two fingers scroll. Three fingers swipe left or right to switch desktops. A tap clicks when the Mac trackpad is set to tap to click."
+        accessibilityHint = "One finger moves the pointer. Two fingers scroll. Pinch to zoom on the Mac. Three fingers swipe left or right to switch desktops. A tap clicks when the Mac trackpad is set to tap to click."
         accessibilityTraits = [.allowsDirectInteraction]
         accessibilityIdentifier = "virtual-trackpad"
     }
@@ -222,7 +238,16 @@ final class TrackpadSurfaceView: UIView {
         super.layoutSubviews()
         let scale = bounds.width > 0 ? bounds.width / VirtualTrackpadMetrics.designSize.width : 1
         plate.frame = bounds
-        plate.cornerRadius = VirtualTrackpadMetrics.cornerRadius * scale
+        plate.layer.cornerRadius = VirtualTrackpadMetrics.cornerRadius * scale
+        let cornerWidth = bounds.width * VirtualTrackpadMetrics.cornerWidthFraction
+        let cornerHeight = bounds.height * VirtualTrackpadMetrics.cornerHeightFraction
+        cornerBlock.frame = CGRect(
+            x: bounds.width - cornerWidth,
+            y: bounds.height - cornerHeight,
+            width: cornerWidth,
+            height: cornerHeight
+        )
+        cornerBlock.layer.cornerRadius = VirtualTrackpadMetrics.cornerRadius * scale
     }
 
     /// Pencil drawing continues under the pad. A finger at the same point still hits it.
@@ -245,6 +270,13 @@ final class TrackpadSurfaceView: UIView {
             isFinger(touch) && !contacts.contains { $0.touch === touch }
         }
         guard !added.isEmpty else { return }
+        defer {
+            if contacts.count == 2 {
+                let separation = fingerSeparation()
+                pinchStart = separation
+                pinchLast = separation
+            }
+        }
         for touch in added {
             contacts.append(Contact(touch, at: clampToPad(touch.location(in: self))))
         }
@@ -254,7 +286,7 @@ final class TrackpadSurfaceView: UIView {
             return
         }
         if contacts.count == 3 {
-            if mode == .scrolling || mode == .dragging {
+            if mode == .scrolling || mode == .dragging || mode == .zooming {
                 suppress()
                 return
             }
@@ -264,7 +296,7 @@ final class TrackpadSurfaceView: UIView {
             residualY = 0
             return
         }
-        guard mode != .suppressed, mode != .scrolling, mode != .dragging else { return }
+        guard mode != .suppressed, mode != .scrolling, mode != .dragging, mode != .zooming else { return }
         if contacts.count == 2, mode == .moving {
             mode = .pending
             anchor = centroid
@@ -297,14 +329,32 @@ final class TrackpadSurfaceView: UIView {
             emitMove(from: anchor, to: point)
             anchor = point
         case (2, .pending):
-            guard distance(point, anchor) >= Self.slop else { return }
-            mode = .scrolling
-            traveled = true
-            emitScroll(from: anchor, to: point, phase: .began)
-            anchor = point
+            let separation = fingerSeparation()
+            let pinch = abs(separation - pinchStart)
+            let travel = distance(point, anchor)
+            if pinch >= Self.slop, pinch > travel {
+                mode = .zooming
+                traveled = true
+                let factor = pinchStart > 0.5 && separation > 0.5 ? separation / pinchStart : 1
+                onMagnify(factor, .began)
+                pinchLast = separation
+            } else if travel >= Self.slop, travel >= pinch {
+                mode = .scrolling
+                traveled = true
+                emitScroll(from: anchor, to: point, phase: .began)
+                anchor = point
+            }
         case (2, .scrolling):
             emitScroll(from: anchor, to: point, phase: .changed)
             anchor = point
+        case (2, .zooming):
+            let separation = fingerSeparation()
+            guard pinchLast > 0.5, separation > 0.5 else { return }
+            let factor = separation / pinchLast
+            pinchLast = separation
+            if abs(factor - 1) > 0.0001 {
+                onMagnify(factor, .changed)
+            }
         case (3, .pending):
             resolveThreeFingerTravel(to: point)
         case (3, .dragging):
@@ -337,6 +387,9 @@ final class TrackpadSurfaceView: UIView {
         }
         if mode == .scrolling {
             finishScroll(at: centroid, cancelled: cancelled)
+            mode = .suppressed
+        } else if mode == .zooming {
+            onMagnify(1, cancelled ? .cancelled : .ended)
             mode = .suppressed
         } else if mode == .dragging {
             finishDrag(at: centroid)
@@ -382,6 +435,8 @@ final class TrackpadSurfaceView: UIView {
     private func suppress() {
         if mode == .scrolling {
             finishScroll(at: centroid, cancelled: true)
+        } else if mode == .zooming {
+            onMagnify(1, .cancelled)
         } else if mode == .dragging {
             finishDrag(at: centroid)
         }
@@ -435,8 +490,8 @@ final class TrackpadSurfaceView: UIView {
     }
 
     private func zone(at point: CGPoint) -> TrackpadTapZone {
-        let width = bounds.width * VirtualTrackpadMetrics.cornerFraction
-        let height = bounds.height * VirtualTrackpadMetrics.cornerFraction
+        let width = bounds.width * VirtualTrackpadMetrics.cornerWidthFraction
+        let height = bounds.height * VirtualTrackpadMetrics.cornerHeightFraction
         guard width > 0, height > 0, point.y >= bounds.height - height else { return .other }
         if point.x <= width { return .bottomLeft }
         if point.x >= bounds.width - width { return .bottomRight }
@@ -450,7 +505,17 @@ final class TrackpadSurfaceView: UIView {
         peakFingers = 0
         residualX = 0
         residualY = 0
+        pinchStart = 0
+        pinchLast = 0
         anchor = .zero
+    }
+
+    private func fingerSeparation() -> CGFloat {
+        guard contacts.count >= 2 else { return 0 }
+        return hypot(
+            contacts[0].last.x - contacts[1].last.x,
+            contacts[0].last.y - contacts[1].last.y
+        )
     }
 
     /// Samples outside the plate sit on its rim, so travel before the finger
@@ -502,6 +567,7 @@ struct VirtualTrackpad: UIViewRepresentable {
     var onTap: (UInt8, TrackpadTapZone) -> Void
     var onDrag: (Int16, Int16, PointerPhase, UInt8) -> Void
     var onSwipe: (FingerSwipe) -> Void
+    var onMagnify: (CGFloat, TrackpadScrollPhase) -> Void
 
     func makeUIView(context: Context) -> TrackpadHostView {
         let host = TrackpadHostView()
@@ -510,6 +576,7 @@ struct VirtualTrackpad: UIViewRepresentable {
         host.pad.onTap = onTap
         host.pad.onDrag = onDrag
         host.pad.onSwipe = onSwipe
+        host.pad.onMagnify = onMagnify
         return host
     }
 
@@ -519,5 +586,6 @@ struct VirtualTrackpad: UIViewRepresentable {
         uiView.pad.onTap = onTap
         uiView.pad.onDrag = onDrag
         uiView.pad.onSwipe = onSwipe
+        uiView.pad.onMagnify = onMagnify
     }
 }

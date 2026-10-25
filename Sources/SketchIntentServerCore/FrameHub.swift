@@ -10,6 +10,7 @@ final class FrameHub {
     private var hello: StreamHello
     private var lastConfig: VideoConfig?
     private var lastSpaceID: String?
+    private var lastDesktops: (index: Int, count: Int)?
     private var frames = 0
     private var bytes = 0
 
@@ -32,6 +33,7 @@ final class FrameHub {
         let hello = self.hello
         let config = lastConfig
         let spaceID = lastSpaceID
+        let desktops = lastDesktops
         lock.unlock()
         if hello.width > 0 && hello.height > 0 {
             session.offerHello(hello)
@@ -41,6 +43,9 @@ final class FrameHub {
         }
         if let spaceID {
             session.offer(StreamFraming.encode(.space(spaceID)), kind: .control)
+        }
+        if let desktops {
+            session.offer(StreamFraming.encode(.desktops(index: desktops.index, count: desktops.count)), kind: .control)
         }
         onNeedsKeyframe?()
     }
@@ -100,6 +105,20 @@ final class FrameHub {
             session.offer(packet, kind: .control)
         }
         return true
+    }
+
+    /// Tells every iPad where the current desktop sits in Mission Control. Repeats are not sent.
+    func updateDesktops(index: Int, count: Int) {
+        lock.lock()
+        let changed = lastDesktops?.index != index || lastDesktops?.count != count
+        if changed { lastDesktops = (index, count) }
+        let current = changed ? Array(sessions.values) : []
+        lock.unlock()
+        guard changed else { return }
+        let packet = StreamFraming.encode(.desktops(index: index, count: count))
+        for session in current {
+            session.offer(packet, kind: .control)
+        }
     }
 
     func takeStats() -> (frames: Int, bytes: Int, clients: Int) {

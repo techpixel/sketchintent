@@ -407,6 +407,7 @@ final class VoiceNoteLayer: UIView {
     private var noticeAnchor: CGPoint?
     private var noticeText = ""
     private var dotViews: [UUID: UIView] = [:]
+    private var transcripts: [UUID: TranscriptBubble] = [:]
     private let liveDot = UIView()
     private var pulsing = false
 
@@ -483,6 +484,9 @@ final class VoiceNoteLayer: UIView {
         if !bubbleHost.isHidden, bubbleHost.frame.contains(point) {
             return .bubble
         }
+        if transcripts.values.contains(where: { !$0.isHidden && $0.frame.contains(point) }) {
+            return .bubble
+        }
         if let id = noteID(at: point) {
             return .dot(id)
         }
@@ -500,6 +504,7 @@ final class VoiceNoteLayer: UIView {
 
     private func render() {
         syncDots()
+        syncTranscripts()
         syncLiveDot()
         if let liveAnchor {
             showBubble(
@@ -515,18 +520,34 @@ final class VoiceNoteLayer: UIView {
                 near: noticeAnchor,
                 placeholder: nil
             )
-        } else if let openID, let note = notes.first(where: { $0.id == openID }) {
-            showBubble(
-                text: note.text,
-                symbol: "mic",
-                near: note.anchor,
-                placeholder: nil
-            )
         } else {
             bubbleHost.isHidden = true
         }
+        for bubble in transcripts.values {
+            bringSubviewToFront(bubble)
+        }
         bringSubviewToFront(liveDot)
         bringSubviewToFront(bubbleHost)
+    }
+
+    /// Every saved note keeps its transcript visible. A tap does not hide it.
+    private func syncTranscripts() {
+        let ids = Set(notes.map(\.id))
+        for (id, bubble) in transcripts where !ids.contains(id) {
+            bubble.removeFromSuperview()
+            transcripts.removeValue(forKey: id)
+        }
+        for note in notes {
+            let bubble: TranscriptBubble
+            if let existing = transcripts[note.id] {
+                bubble = existing
+            } else {
+                bubble = TranscriptBubble()
+                transcripts[note.id] = bubble
+                insertSubview(bubble, belowSubview: bubbleHost)
+            }
+            layout(bubble, text: note.text, symbol: "mic", near: note.anchor)
+        }
     }
 
     private func syncDots() {
@@ -637,6 +658,29 @@ final class VoiceNoteLayer: UIView {
         return CGPoint(x: x, y: y)
     }
 
+    private func layout(_ bubble: TranscriptBubble, text: String, symbol: String, near anchor: CGPoint) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shown = Self.tail(trimmed)
+        bubble.label.text = shown
+        bubble.label.textColor = .white
+        bubble.icon.image = UIImage(
+            systemName: symbol,
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .medium, scale: .medium)
+        )
+        let maxTextWidth = min(240, max(120, bounds.width - 88))
+        let textSize = bubble.label.sizeThatFits(CGSize(width: maxTextWidth, height: 220))
+        let textWidth = min(maxTextWidth, ceil(textSize.width))
+        let textHeight = min(220, ceil(textSize.height))
+        let width = textWidth + 54
+        let height = max(textHeight + 24, 46)
+        bubble.label.frame = CGRect(x: 42, y: (height - textHeight) / 2, width: textWidth, height: textHeight)
+        bubble.icon.frame = CGRect(x: 12, y: (height - 22) / 2, width: 22, height: 22)
+        bubble.bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        bubble.material.frame = bubble.bounds
+        bubble.center = bubbleOrigin(size: CGSize(width: width, height: height), near: anchor)
+        bubble.isHidden = shown.isEmpty
+    }
+
     private static func makeDot() -> UIView {
         let dot = UIView()
         dot.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
@@ -666,5 +710,37 @@ final class VoiceNoteLayer: UIView {
         let limit = 280
         guard text.count > limit else { return text }
         return "…" + text.suffix(limit)
+    }
+}
+
+/// One saved transcript. These stay on screen; tapping the page does not dismiss them.
+private final class TranscriptBubble: UIView {
+    let material = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    let icon = UIImageView()
+    let label = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.28
+        layer.shadowRadius = 16
+        layer.shadowOffset = CGSize(width: 0, height: 8)
+        material.clipsToBounds = true
+        material.layer.cornerCurve = .continuous
+        material.layer.cornerRadius = 18
+        label.font = .preferredFont(forTextStyle: .body)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = .white
+        label.numberOfLines = 0
+        icon.contentMode = .scaleAspectFit
+        icon.tintColor = .white
+        material.contentView.addSubview(icon)
+        material.contentView.addSubview(label)
+        addSubview(material)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 }

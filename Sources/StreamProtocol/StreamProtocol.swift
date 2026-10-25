@@ -6,8 +6,12 @@ public enum SketchIntentPorts {
     public static let usb: UInt16 = 2345
     /// Port the Mac listens on for the Simulator and for network clients.
     public static let tcp: UInt16 = 2346
+    /// Port the AI server listens on. The iPad posts a sketch here.
+    public static let ai: UInt16 = 2347
     /// Bonjour service type, without the trailing dot.
     public static let bonjourType = "_sketchintent._tcp"
+    /// Bonjour service type for the AI server, without the trailing dot.
+    public static let aiBonjourType = "_sketchintent-ai._tcp"
 }
 
 /// usbmuxd stores the TCP port with its two bytes swapped inside the plist integer.
@@ -110,6 +114,8 @@ public enum TrackpadTapZone: UInt8, Equatable {
 /// Kind byte 3 is a trackpad scroll. Kind byte 4 is a trackpad click.
 /// Kind byte 5 is a one-finger pointer move. Kind byte 6 is a trackpad tap.
 /// Kind byte 7 is a three-finger drag. The Mac applies it only when three-finger drag is on.
+/// Kind byte 8 is a two-finger pinch, posted on the Mac as a magnify gesture.
+/// Kind byte 9 opens one desktop by its position in Mission Control.
 public enum RemoteInput: Equatable {
     case switchDesktop(DesktopDirection)
     /// Pencil point in captured-frame pixels. `x` and `y` are inside the video frame, not the iPad view.
@@ -129,6 +135,11 @@ public enum RemoteInput: Equatable {
     /// Three-finger travel on the pad. `phase` is down, move, or up. The Mac holds
     /// the left button only when three-finger drag is enabled.
     case trackpadDrag(dx: Int16, dy: Int16, phase: PointerPhase, fingers: UInt8)
+    /// Pinch at the Mac cursor. `magnification` is the change in finger separation since the
+    /// last sample, minus 1, in ten-thousandths: 100 is 1% wider. Positive zooms in.
+    case trackpadMagnify(magnification: Int16, phase: TrackpadScrollPhase)
+    /// Zero-based position of the desktop to open on the streamed display.
+    case goToDesktop(index: UInt8)
 }
 
 /// Maps a point in the iPad's video view into captured-frame pixels.
@@ -202,6 +213,88 @@ public struct InkSnapshot: Equatable {
     public static let pngSignature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 }
 
+/// A voice note in pixels of the sketch image. The origin is the top left.
+public struct IntentNote: Codable, Equatable {
+    public var text: String
+    public var x: Double
+    public var y: Double
+
+    public init(text: String, x: Double, y: Double) {
+        self.text = text
+        self.x = x
+        self.y = y
+    }
+}
+
+/// One sketch the iPad asks the agent to read.
+/// `png` is the crop the voice notes point into. `screenPng` is the whole Mac frame, for context.
+public struct IntentRequest: Equatable {
+    public var id: UInt32
+    public var width: Int
+    public var height: Int
+    public var notes: [IntentNote]
+    public var png: Data
+    public var screenWidth: Int
+    public var screenHeight: Int
+    public var screenPng: Data
+    /// Absolute path on the Mac. Empty until a folder is chosen in Settings.
+    public var folder: String
+
+    public init(
+        id: UInt32,
+        width: Int,
+        height: Int,
+        notes: [IntentNote],
+        png: Data,
+        screenWidth: Int = 0,
+        screenHeight: Int = 0,
+        screenPng: Data = Data(),
+        folder: String = ""
+    ) {
+        self.id = id
+        self.width = width
+        self.height = height
+        self.notes = notes
+        self.png = png
+        self.screenWidth = screenWidth
+        self.screenHeight = screenHeight
+        self.screenPng = screenPng
+        self.folder = folder
+    }
+}
+
+/// One event in the agent's reply.
+public struct IntentReply: Equatable {
+    public enum Kind: UInt8, Equatable {
+        case status = 1
+        case text = 2
+        case done = 3
+        case error = 4
+        /// Ink and notes the agent put on the sketch. `text` is JSON: see `AgentCanvas` on the iPad.
+        case canvas = 5
+    }
+
+    /// Longest `text` a reply carries. A canvas drawing is JSON, so it is never cut short:
+    /// the AI server keeps it under this size instead.
+    public static func textLimit(for kind: Kind) -> Int {
+        kind == .canvas ? 512_000 : 8_000
+    }
+
+    public var id: UInt32
+    public var kind: Kind
+    public var lead: String
+    public var name: String
+    public var text: String
+
+    public init(id: UInt32, kind: Kind, lead: String = "", name: String = "", text: String = "") {
+        self.id = id
+        self.kind = kind
+        self.lead = lead
+        self.name = name
+        self.text = text
+    }
+}
+
 public enum StreamMessage: Equatable {
     case hello(StreamHello)
     case videoConfig(VideoConfig)
@@ -212,6 +305,19 @@ public enum StreamMessage: Equatable {
     case space(String)
     /// Pen ink drawn on the iPad, in captured-frame pixels. Not a video frame.
     case ink(InkSnapshot)
+    /// A sketch for the AI server. The iPad sends it. The Mac reads it.
+    case intent(IntentRequest)
+    /// One line of the agent's reply. The Mac sends it. The iPad reads it.
+    case intentReply(IntentReply)
+    /// The iPad asks the Mac to present a folder panel. The payload is the current path, or empty.
+    case chooseFolder(String)
+    /// The folder the user picked, or empty when the panel was cancelled. The Mac sends it.
+    case workingFolder(String)
+    /// Zero-based position of the desktop on screen, and how many desktops the display has.
+    /// The Mac sends it. `index` is -1 when the current desktop is not in the list.
+    case desktops(index: Int, count: Int)
+    /// The iPad stops the agent working on this intent id.
+    case cancelIntent(UInt32)
 }
 
 public enum StreamProtocolError: Error, Equatable, CustomStringConvertible {
@@ -239,6 +345,12 @@ enum StreamMessageType: UInt8 {
     case input = 5
     case space = 6
     case ink = 7
+    case intent = 8
+    case intentReply = 9
+    case chooseFolder = 10
+    case workingFolder = 11
+    case desktops = 12
+    case cancelIntent = 13
 }
 
 public enum StreamFraming {
@@ -270,6 +382,28 @@ public enum StreamFraming {
         case .ink(let ink):
             type = .ink
             payload = ink.encodedPayload()
+        case .intent(let request):
+            type = .intent
+            payload = request.encodedPayload()
+        case .intentReply(let reply):
+            type = .intentReply
+            payload = reply.encodedPayload()
+        case .chooseFolder(let path):
+            type = .chooseFolder
+            payload = WorkingFolder.encode(path)
+        case .workingFolder(let path):
+            type = .workingFolder
+            payload = WorkingFolder.encode(path)
+        case .desktops(let index, let count):
+            type = .desktops
+            let clampedCount = UInt8(clamping: max(0, count))
+            let clampedIndex = index >= 0 && index < Int(clampedCount) ? UInt8(index) : UInt8.max
+            payload = Data([clampedIndex, clampedCount])
+        case .cancelIntent(let id):
+            type = .cancelIntent
+            var bytes = Data()
+            bytes.appendBE(id)
+            payload = bytes
         }
 
         var packet = Data(capacity: 5 + payload.count)
@@ -348,6 +482,33 @@ public final class StreamParser {
                 if let ink = InkSnapshot(payload: payload) {
                     messages.append(.ink(ink))
                 }
+            case .intent:
+                if let request = IntentRequest(payload: payload) {
+                    messages.append(.intent(request))
+                }
+            case .intentReply:
+                if let reply = IntentReply(payload: payload) {
+                    messages.append(.intentReply(reply))
+                }
+            case .chooseFolder:
+                if let path = WorkingFolder.decode(payload) {
+                    messages.append(.chooseFolder(path))
+                }
+            case .desktops:
+                if payload.count == 2 {
+                    let count = Int(payload[1])
+                    let index = Int(payload[0]) < count ? Int(payload[0]) : -1
+                    messages.append(.desktops(index: index, count: count))
+                }
+            case .cancelIntent:
+                if payload.count == 4 {
+                    let id = payload.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+                    messages.append(.cancelIntent(id))
+                }
+            case .workingFolder:
+                if let path = WorkingFolder.decode(payload) {
+                    messages.append(.workingFolder(path))
+                }
             }
         }
 
@@ -412,6 +573,119 @@ private extension InkSnapshot {
     }
 }
 
+private extension IntentRequest {
+    func encodedPayload() -> Data {
+        let notes = (try? JSONEncoder().encode(self.notes)) ?? Data("[]".utf8)
+        var payload = Data(capacity: 16 + notes.count + png.count)
+        payload.appendBE(id)
+        payload.appendBE(UInt32(clamping: max(0, width)))
+        payload.appendBE(UInt32(clamping: max(0, height)))
+        payload.appendBE(UInt32(notes.count))
+        payload.append(notes)
+        payload.appendBE(UInt32(png.count))
+        payload.append(png)
+        let folder = WorkingFolder.encode(self.folder)
+        payload.appendBE(UInt16(folder.count))
+        payload.append(folder)
+        if !screenPng.isEmpty {
+            payload.appendBE(UInt32(clamping: max(0, screenWidth)))
+            payload.appendBE(UInt32(clamping: max(0, screenHeight)))
+            payload.appendBE(UInt32(screenPng.count))
+            payload.append(screenPng)
+        }
+        return payload
+    }
+
+    init?(payload: Data) {
+        var cursor = PayloadCursor(payload)
+        guard let id = cursor.u32(),
+              let width = cursor.u32(),
+              let height = cursor.u32(),
+              let noteCount = cursor.u32(),
+              let notes = cursor.bytes(Int(noteCount)),
+              let decoded = try? JSONDecoder().decode([IntentNote].self, from: notes),
+              let pngCount = cursor.u32(),
+              let png = cursor.bytes(Int(pngCount)),
+              width > 0, height > 0, png.starts(with: InkSnapshot.pngSignature),
+              let folderCount = cursor.u16(),
+              let folderBytes = cursor.bytes(Int(folderCount)),
+              let folder = WorkingFolder.decode(folderBytes) else { return nil }
+        if cursor.isAtEnd {
+            self.init(id: id, width: Int(width), height: Int(height), notes: decoded, png: png, folder: folder)
+            return
+        }
+        guard let screenWidth = cursor.u32(),
+              let screenHeight = cursor.u32(),
+              let screenCount = cursor.u32(),
+              let screenPng = cursor.bytes(Int(screenCount)),
+              cursor.isAtEnd,
+              screenWidth > 0, screenHeight > 0, screenPng.starts(with: InkSnapshot.pngSignature) else { return nil }
+        self.init(
+            id: id,
+            width: Int(width),
+            height: Int(height),
+            notes: decoded,
+            png: png,
+            screenWidth: Int(screenWidth),
+            screenHeight: Int(screenHeight),
+            screenPng: screenPng,
+            folder: folder
+        )
+    }
+}
+
+enum WorkingFolder {
+    static func encode(_ path: String) -> Data {
+        Data(path.utf8.prefix(1024))
+    }
+
+    /// Empty is allowed. Any other path must be an absolute Mac path.
+    static func decode(_ payload: Data) -> String? {
+        if payload.isEmpty { return "" }
+        guard payload.count <= 1024,
+              !payload.contains(0),
+              let path = String(data: payload, encoding: .utf8),
+              path.hasPrefix("/") else { return nil }
+        return path
+    }
+}
+
+private extension IntentReply {
+    func encodedPayload() -> Data {
+        let lead = Data(lead.utf8.prefix(200))
+        let name = Data(name.utf8.prefix(80))
+        let text = Data(text.utf8.prefix(IntentReply.textLimit(for: kind)))
+        var payload = Data(capacity: 11 + lead.count + name.count + text.count)
+        payload.appendBE(id)
+        payload.append(kind.rawValue)
+        payload.appendBE(UInt16(lead.count))
+        payload.append(lead)
+        payload.appendBE(UInt16(name.count))
+        payload.append(name)
+        payload.appendBE(UInt32(text.count))
+        payload.append(text)
+        return payload
+    }
+
+    init?(payload: Data) {
+        var cursor = PayloadCursor(payload)
+        guard let id = cursor.u32(),
+              let kindRaw = cursor.u8(),
+              let kind = Kind(rawValue: kindRaw),
+              let leadCount = cursor.u16(),
+              let leadBytes = cursor.bytes(Int(leadCount)),
+              let nameCount = cursor.u16(),
+              let nameBytes = cursor.bytes(Int(nameCount)),
+              let textCount = cursor.u32(),
+              let textBytes = cursor.bytes(Int(textCount)),
+              cursor.isAtEnd,
+              let lead = String(data: leadBytes, encoding: .utf8),
+              let name = String(data: nameBytes, encoding: .utf8),
+              let text = String(data: textBytes, encoding: .utf8) else { return nil }
+        self.init(id: id, kind: kind, lead: lead, name: name, text: text)
+    }
+}
+
 private extension RemoteInput {
     func encodedPayload() -> Data {
         switch self {
@@ -442,6 +716,12 @@ private extension RemoteInput {
             payload.appendBE(dx)
             payload.appendBE(dy)
             return payload
+        case .trackpadMagnify(let magnification, let phase):
+            var payload = Data([8, phase.rawValue])
+            payload.appendBE(magnification)
+            return payload
+        case .goToDesktop(let index):
+            return Data([9, index])
         }
     }
 
@@ -491,6 +771,13 @@ private extension RemoteInput {
             let dx = Int16(bitPattern: UInt16(payload[3]) << 8 | UInt16(payload[4]))
             let dy = Int16(bitPattern: UInt16(payload[5]) << 8 | UInt16(payload[6]))
             self = .trackpadDrag(dx: dx, dy: dy, phase: phase, fingers: payload[2])
+        case 8:
+            guard payload.count == 4, let phase = TrackpadScrollPhase(rawValue: payload[1]) else { return nil }
+            let magnification = Int16(bitPattern: UInt16(payload[2]) << 8 | UInt16(payload[3]))
+            self = .trackpadMagnify(magnification: magnification, phase: phase)
+        case 9:
+            guard payload.count == 2 else { return nil }
+            self = .goToDesktop(index: payload[1])
         default:
             return nil
         }

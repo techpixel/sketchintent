@@ -1,10 +1,53 @@
 import PencilKit
 import SwiftUI
 import UIKit
+import WebKit
 
 enum FingerSwipe {
     case left
     case right
+}
+
+/// Pen ink colors in the bottom bar. Red, blue, and yellow are Figma 55:950.
+/// White and black follow them.
+enum InkColor: String, CaseIterable {
+    case red
+    case blue
+    case yellow
+    case white
+    case black
+
+    var color: UIColor {
+        switch self {
+        case .red: return UIColor(named: "InkRed") ?? .systemRed
+        case .blue: return UIColor(named: "InkBlue") ?? .systemBlue
+        case .yellow: return UIColor(named: "InkYellow") ?? .systemYellow
+        case .white: return .white
+        case .black: return .black
+        }
+    }
+
+    var accessibilityName: String {
+        switch self {
+        case .red: return "Red"
+        case .blue: return "Blue"
+        case .yellow: return "Yellow"
+        case .white: return "White"
+        case .black: return "Black"
+        }
+    }
+}
+
+extension PKDrawing {
+    /// Ink in the colors it was drawn with. PencilKit otherwise renders under the
+    /// current trait, and this app is dark, so black ink would come out white.
+    func literalImage(from rect: CGRect, scale: CGFloat) -> UIImage {
+        var rendered = UIImage()
+        UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
+            rendered = image(from: rect, scale: scale)
+        }
+        return rendered
+    }
 }
 
 enum SketchTool: Equatable, CaseIterable {
@@ -25,11 +68,12 @@ enum SketchTool: Equatable, CaseIterable {
         return order[(index + 1) % order.count]
     }
 
+    /// Figma 55:956. `microphone` is newer than the deployment target, so `mic` stands in where it is missing.
     var symbolName: String {
         switch self {
-        case .pen: return "pencil"
-        case .eraser: return "eraser"
-        case .voice: return "mic"
+        case .pen: return "pencil.tip"
+        case .eraser: return "eraser.fill"
+        case .voice: return UIImage(systemName: "microphone") == nil ? "mic" : "microphone"
         case .lasso: return "lasso"
         }
     }
@@ -79,9 +123,32 @@ final class SketchCanvas: ObservableObject {
         overlay?.snapshot()
     }
 
+    /// The screen under the ink, plus each voice note in that image's pixel space.
+    func intentSketch(screen: UIImage?) -> IntentSketch? {
+        overlay?.intentSketch(screen: screen)
+    }
+
     /// Removes this desktop's pen ink and shapes, and tells the Mac to clear that overlay.
     func clearSketch() {
         overlay?.clearCurrentSketch()
+    }
+
+    /// Renders the agent's code and places the image on the desktop the sketch came from.
+    func showAgentRender(_ render: AgentRender, placement: AgentPlacement) {
+        overlay?.showAgentRender(render, placement: placement)
+    }
+
+    /// Remembers the sketch that was just sent to the agent.
+    func markSent() {
+        overlay?.markSent()
+    }
+
+    /// Clears the ink, shapes and voice notes the agent acted on. Images the agent rendered
+    /// for that sketch stay. A sketch that changed after it was sent, or a different desktop,
+    /// is left alone. Returns true when the page is empty afterwards.
+    @discardableResult
+    func clearSentSketch() -> Bool {
+        overlay?.clearSentSketch() ?? false
     }
 
     fileprivate func attach(_ overlay: PencilOverlayView) {
@@ -104,19 +171,22 @@ final class SketchCanvas: ObservableObject {
 /// being drawn has a white glow so it stays visible on the screen. The glow goes
 /// away when the Pencil lifts. When the Pencil holds still at the end of
 /// a pen stroke, that stroke snaps to a line, circle, square, or clean curve.
-/// A Pencil tap on a voice-note dot shows its transcript, and a tap off that dot
-/// hides the transcript. Holding still on the dot records, and the text is saved
+/// Each voice note keeps its transcript on screen. Holding still on the dot records, and the text is saved
 /// onto that dot. Selecting a stroke or shape, then moving, resizing, or rotating
 /// it, is the lasso.
 /// The same pen ink is
 /// sent to the Mac. Voice notes stay on the iPad with their desktop.
-/// A finger on an empty page drives the Mac with the pen or the eraser.
+/// A finger on an empty page drives the Mac with the pen or the eraser, and a
+/// two-finger pinch there zooms on the Mac.
 /// Lasso keeps the finger off the Mac. A Pencil touch never sends pointer input.
 struct PencilOverlay: UIViewRepresentable {
     var spaceID: String?
     var canvas: SketchCanvas
     var tool: SketchTool
     var strokeWidth: CGFloat
+    var inkColor: UIColor
+    /// A faint light edge on every stroke, so dark ink reads on the black canvas.
+    var outlinesInk = false
     var acceptsTap: Bool
     /// PencilKit takes a three-finger swipe only while a frozen sketch is on screen.
     var acceptsCanvasSwipe: Bool
@@ -129,6 +199,8 @@ struct PencilOverlay: UIViewRepresentable {
     var onTap: () -> Void
     var onDoubleTap: () -> Void
     var onFingerSwipe: (FingerSwipe) -> Void
+    /// Separation ratio since the last sample. The closing sample is 1.
+    var onFingerPinch: (CGFloat, TrackpadScrollPhase) -> Void = { _, _ in }
     var onToggleTool: () -> Void
     var onSketchBegan: () -> Void = {}
     var onSketchAbandoned: (String) -> Void = { _ in }
@@ -148,6 +220,7 @@ struct PencilOverlay: UIViewRepresentable {
         view.installGestures(target: context.coordinator)
         view.installPencilDoubleTap(delegate: context.coordinator)
         view.setAcceptsCanvasSwipe(acceptsCanvasSwipe)
+        view.onFingerPinch = onFingerPinch
         view.onInkChange = { [weak canvas] hasInk in
             canvas?.noteInk(hasInk)
         }
@@ -161,7 +234,8 @@ struct PencilOverlay: UIViewRepresentable {
             onFinger: onFingerPointer,
             onCancel: onFingerCancel
         )
-        view.apply(tool: tool, strokeWidth: strokeWidth)
+        view.apply(tool: tool, strokeWidth: strokeWidth, color: inkColor)
+        view.setOutlinesInk(outlinesInk)
         return view
     }
 
@@ -185,7 +259,9 @@ struct PencilOverlay: UIViewRepresentable {
             onCancel: onFingerCancel
         )
         uiView.setAcceptsCanvasSwipe(acceptsCanvasSwipe)
-        uiView.apply(tool: tool, strokeWidth: strokeWidth)
+        uiView.onFingerPinch = onFingerPinch
+        uiView.apply(tool: tool, strokeWidth: strokeWidth, color: inkColor)
+        uiView.setOutlinesInk(outlinesInk)
         if let spaceID {
             uiView.showSpace(spaceID)
         }
@@ -235,11 +311,16 @@ struct PencilOverlay: UIViewRepresentable {
 
         @objc func tapped(_ recognizer: UITapGestureRecognizer) {
             guard recognizer.state == .ended, acceptsTap else { return }
-            if let host = recognizer.view?.superview as? PencilOverlayView {
-                let point = recognizer.location(in: host)
-                if host.handleCanvasTap(at: point) {
-                    return
+            var view = recognizer.view
+            while let current = view {
+                if let host = current as? PencilOverlayView {
+                    let point = recognizer.location(in: host)
+                    if host.handleCanvasTap(at: point) {
+                        return
+                    }
+                    break
                 }
+                view = current.superview
             }
             onTap()
         }
@@ -363,11 +444,18 @@ private final class HaloFrameLink: NSObject {
 final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private let halo = UIImageView()
     private let canvas = InkCanvasView()
+    private var lastPinchScale: CGFloat = 1
+    /// The open pinch began while the finger drove the Mac, so its end is sent too.
+    private var pinchSendsToMac = false
+    private let fingerPinch = UIPinchGestureRecognizer()
+    var onFingerPinch: (CGFloat, TrackpadScrollPhase) -> Void = { _, _ in }
     private var drawings: [String: PKDrawing] = [:]
     private var currentSpaceID: String?
     private var appliedTool: SketchTool?
     /// Tool width for new pen strokes and snapped shapes. Point size is this plus 2.
     private var strokeWidth: CGFloat = StrokeSettings.defaultWidth
+    /// Color for new pen strokes and snapped shapes. Ink already on the page keeps its color.
+    private var inkColor: UIColor = InkColor.red.color
     var onInkChange: ((Bool) -> Void)?
     /// PNG of this space's pen ink in captured-frame pixels. Empty data clears the Mac.
     var onInk: (Data, Int, Int, String) -> Void = { _, _, _, _ in }
@@ -403,6 +491,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var shape: FittedShape
         var strokeIndex: Int
         var width: CGFloat
+        var color: UIColor
         var opacity: CGFloat
         var force: CGFloat
     }
@@ -446,8 +535,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var drawing: PKDrawing
         var marks: [ShapeMark]
         var selectedShapeID: UUID?
+        var images: [AgentImage] = []
     }
     /// UndoManager retains its target. This proxy keeps that retain from cycling back to the overlay.
+    /// The selector form is required. The closure form of `registerUndo` shares a callback with
+    /// PencilKit, which then casts a `PKStrokeProviderSlice` to this proxy and crashes.
     private final class SketchUndoProxy: NSObject {
         weak var owner: PencilOverlayView?
         let snapshot: SketchUndoSnapshot
@@ -455,7 +547,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             self.owner = owner
             self.snapshot = snapshot
         }
-        @objc func apply() {
+        @objc func apply(_ sender: Any?) {
             owner?.applySketchSnapshot(snapshot)
         }
     }
@@ -494,6 +586,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var lassoLifted: [LiftedInk] = []
     private var lassoBaseBox: LassoBox?
     private var lassoLiveTransform = CGAffineTransform.identity
+    /// When a pen drag starts on a corrected shape's box, ink begun during that drag is dropped.
+    private var boxDragStarted: Date?
     private let shapeHandles = ShapeHandleView()
     private var desktopPan: ThreeFingerDesktopPan?
     private var inkWork: DispatchWorkItem?
@@ -514,6 +608,15 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var notes: [VoiceNote] = []
     private var notesBySpace: [String: [VoiceNote]] = [:]
     private var openNoteID: UUID?
+    /// The sketch as it was sent to the agent, so only that sketch is cleared when the agent finishes.
+    private var sent: (spaceID: String?, sketch: SketchUndoSnapshot, notes: [VoiceNote])?
+    /// What the agent drew on the sent sketch. Clearing that sketch keeps these.
+    private var agentAdditions: [AgentImage] = []
+    /// The agent's rendered guesses on this desktop, under the ink.
+    private var agentImages: [AgentImage] = []
+    private var agentImagesBySpace: [String: [AgentImage]] = [:]
+    private let agentImageLayer = AgentImageLayer()
+    private var agentRenderers: Set<AgentHTMLRenderer> = []
     private let noteLayer = VoiceNoteLayer()
     private let voicePermissions = VoicePermissionGate()
     private let voiceTranscriber = VoiceTranscriber()
@@ -559,9 +662,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var time: TimeInterval
     }
 
-    /// Time the Pencil must stay in one place before dictation starts.
-    /// Moving farther than `voiceSlop` before then keeps the pen stroke.
-    private static let voiceHoldDelay: TimeInterval = 0.5
+    /// Time the Pencil must stay in one place on the dictation tool before recording starts.
+    /// Moving farther than `voiceSlop` before then cancels the hold.
+    private static let voiceHoldDelay: TimeInterval = 0.25
     private static let voiceSlop: CGFloat = 12
     /// How long the Pencil rests before the stroke under it is corrected.
     private static let penHoldDelay: TimeInterval = 0.4
@@ -587,6 +690,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// Live ink while a stroke is down stays under this width so the link is not flooded.
     private static let liveInkMaxWidth = 1280
     private static let liveInkMaxBytes = 400_000
+    /// The crop and the whole screen share the stream's frame limit. Base64 on the Mac needs the rest.
+    private static let intentByteBudget = 8_000_000
+    private static let screenPngBudget = 4_000_000
 
     var hasInk: Bool {
         !canvas.drawing.strokes.isEmpty
@@ -595,6 +701,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// A pen stroke, erase, shape drag, or lasso transform is in progress.
     private var inkGestureOpen: Bool {
         penStrokeOpen || eraserOpen || shapeAdjust != nil || lassoTransforming
+    }
+
+    /// The canvas mode is black, so black ink gets a light edge there. Over the Mac
+    /// picture, ink stays as drawn.
+    func setOutlinesInk(_ outlines: Bool) {
+        canvas.layer.shadowOpacity = outlines ? 0.6 : 0
     }
 
     func setFrameSize(width: Int, height: Int) {
@@ -630,10 +742,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// Dictation is the mic tool: a still hold records, and the pen only draws.
     /// A finger on the picture drives the Mac with the pen or the eraser, until the page has ink.
     /// Dictation and lasso keep the finger off the Mac.
-    func apply(tool: SketchTool, strokeWidth: CGFloat = StrokeSettings.defaultWidth) {
+    func apply(tool: SketchTool, strokeWidth: CGFloat = StrokeSettings.defaultWidth, color: UIColor = InkColor.red.color) {
         let width = StrokeSettings.clamped(strokeWidth)
-        let widthChanged = self.strokeWidth != width
+        let widthChanged = self.strokeWidth != width || !inkColor.isEqual(color)
         self.strokeWidth = width
+        inkColor = color
         let erasing = tool == .eraser
         let annotating = tool == .voice
         let selecting = tool == .lasso
@@ -674,7 +787,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         if appliedTool != tool || (tool == .pen && widthChanged) {
             appliedTool = tool
             if tool == .pen {
-                canvas.tool = PKInkingTool(.monoline, color: .black, width: width)
+                canvas.tool = PKInkingTool(.monoline, color: color, width: width)
             }
         }
         // Assigning the pen tool resets the drawing gesture's touch types. Put
@@ -706,7 +819,184 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let strokeBounds = canvas.drawing.bounds
         guard hasInk, strokeBounds.width > 0, strokeBounds.height > 0 else { return nil }
         let scale = max(window?.screen.scale ?? traitCollection.displayScale, 1)
-        return canvas.drawing.image(from: strokeBounds.insetBy(dx: -16, dy: -16), scale: scale)
+        return canvas.drawing.literalImage(from: strokeBounds.insetBy(dx: -16, dy: -16), scale: scale)
+    }
+
+    /// The Mac screen with the ink on top, cropped to the strokes and the voice notes.
+    /// Note points are pixels in that image, origin at the top left.
+    func intentSketch(screen: UIImage?) -> IntentSketch? {
+        let placed = notes.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let anchors = placed.map { drawingPoint($0.anchor) }
+        var rect = canvas.drawing.bounds
+        if rect.isNull || rect.isInfinite || rect.width <= 0 || rect.height <= 0 {
+            rect = .null
+        }
+        for anchor in anchors {
+            let point = CGRect(origin: anchor, size: .zero)
+            rect = rect.isNull ? point : rect.union(point)
+        }
+        for image in agentImages {
+            rect = rect.isNull ? image.frame : rect.union(image.frame)
+        }
+        guard !rect.isNull, !rect.isInfinite else { return nil }
+        rect = rect.insetBy(dx: -16, dy: -16)
+        guard rect.width > 1, rect.height > 1 else { return nil }
+        let scale = max(window?.screen.scale ?? traitCollection.displayScale, 1)
+        // PencilKit draws into the current graphics context. Building the ink image
+        // inside the renderer below returns a blank bitmap, so render it first.
+        let ink = canvas.drawing.literalImage(from: rect, scale: scale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: rect.size, format: format)
+        let image = renderer.image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: rect.size))
+            drawScreen(screen, into: rect)
+            for image in agentImages {
+                image.image.draw(in: image.frame.offsetBy(dx: -rect.minX, dy: -rect.minY))
+            }
+            ink.draw(in: CGRect(origin: .zero, size: rect.size))
+        }
+        guard let png = image.pngData() else { return nil }
+        let mapped = zip(placed, anchors).map { note, anchor in
+            IntentNote(
+                text: note.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                x: Double((anchor.x - rect.minX) * scale),
+                y: Double((anchor.y - rect.minY) * scale)
+            )
+        }
+        let whole = fullScreenImage(screen, room: max(500_000, Self.intentByteBudget - png.count))
+        let picture = whole == nil ? nil : pictureDrawingRect()
+        return IntentSketch(
+            png: png,
+            width: Int(image.size.width * image.scale),
+            height: Int(image.size.height * image.scale),
+            notes: mapped,
+            screenPng: whole?.png ?? Data(),
+            screenWidth: whole?.width ?? 0,
+            screenHeight: whole?.height ?? 0,
+            placement: AgentPlacement(
+                spaceID: currentSpaceID,
+                sketchOrigin: rect.origin,
+                sketchPixelsPerPoint: scale,
+                screenOrigin: picture?.origin,
+                screenPixelsPerPoint: picture.flatMap { picture in
+                    whole.map { CGFloat($0.width) / picture.width }
+                }
+            )
+        )
+    }
+
+    /// The whole Mac frame with the ink on it. Shrunk until it fits beside the cropped sketch.
+    private func fullScreenImage(_ screen: UIImage?, room: Int) -> (png: Data, width: Int, height: Int)? {
+        guard let screen, let picture = pictureDrawingRect(), picture.width > 1, picture.height > 1,
+              frameWidth > 1, frameHeight > 1 else { return nil }
+        var pixelWidth = frameWidth
+        let budget = min(Self.screenPngBudget, room)
+        for _ in 0..<6 {
+            let pixelHeight = max(2, Int((Double(frameHeight) * Double(pixelWidth) / Double(frameWidth)).rounded()))
+            let renderScale = max(CGFloat(pixelWidth) / picture.width, 0.5)
+            let ink = canvas.drawing.literalImage(from: picture, scale: renderScale)
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            let renderer = UIGraphicsImageRenderer(
+                size: CGSize(width: pixelWidth, height: pixelHeight),
+                format: format
+            )
+            let pixelsPerPoint = CGFloat(pixelWidth) / picture.width
+            let image = renderer.image { _ in
+                screen.draw(in: CGRect(x: 0, y: 0, width: CGFloat(pixelWidth), height: CGFloat(pixelHeight)))
+                for agentImage in agentImages {
+                    let frame = agentImage.frame
+                    agentImage.image.draw(in: CGRect(
+                        x: (frame.minX - picture.minX) * pixelsPerPoint,
+                        y: (frame.minY - picture.minY) * pixelsPerPoint,
+                        width: frame.width * pixelsPerPoint,
+                        height: frame.height * pixelsPerPoint
+                    ))
+                }
+                ink.draw(in: CGRect(x: 0, y: 0, width: CGFloat(pixelWidth), height: CGFloat(pixelHeight)))
+            }
+            guard let png = image.pngData(), !png.isEmpty else { return nil }
+            if png.count <= budget || pixelWidth <= 960 { return (png, pixelWidth, pixelHeight) }
+            pixelWidth = max(960, pixelWidth / 2)
+        }
+        return nil
+    }
+
+    func markSent() {
+        sent = (currentSpaceID, sketchSnapshot(), notes)
+        agentAdditions = []
+    }
+
+    /// Renders the agent's code at its frame and places the image under the ink, on the
+    /// desktop the sketch came from even when another one is showing. One undo removes it.
+    func showAgentRender(_ render: AgentRender, placement: AgentPlacement) {
+        let useScreen = render.space == "screen"
+        let origin = (useScreen ? placement.screenOrigin : nil) ?? placement.sketchOrigin
+        let perPoint = max((useScreen ? placement.screenPixelsPerPoint : nil) ?? placement.sketchPixelsPerPoint, 0.01)
+        let frame = CGRect(
+            x: origin.x + CGFloat(render.x) / perPoint,
+            y: origin.y + CGFloat(render.y) / perPoint,
+            width: CGFloat(render.width) / perPoint,
+            height: CGFloat(render.height) / perPoint
+        )
+        guard frame.width >= 1, frame.height >= 1, frame.width <= 4096, frame.height <= 4096 else { return }
+        let target = placement.spaceID ?? currentSpaceID
+        let renderer = AgentHTMLRenderer()
+        agentRenderers.insert(renderer)
+        renderer.render(html: render.html, size: frame.size, in: self) { [weak self] image in
+            guard let self else { return }
+            self.agentRenderers.remove(renderer)
+            guard let image else { return }
+            self.placeAgentImage(AgentImage(id: UUID(), frame: frame, image: image), spaceID: target)
+        }
+    }
+
+    private func placeAgentImage(_ image: AgentImage, spaceID target: String?) {
+        guard target == currentSpaceID else {
+            if let target {
+                agentImagesBySpace[target, default: []].append(image)
+            }
+            return
+        }
+        registerSketchUndo(sketchSnapshot())
+        setAgentImages(agentImages + [image])
+        // The agent's image is not the person changing the sent sketch.
+        if let sentSketch = sent, sentSketch.spaceID == currentSpaceID {
+            sent = (sentSketch.spaceID, sketchSnapshot(), notes)
+            agentAdditions.append(image)
+        }
+    }
+
+    private func setAgentImages(_ images: [AgentImage]) {
+        agentImages = images
+        if let currentSpaceID {
+            agentImagesBySpace[currentSpaceID] = images
+        }
+        agentImageLayer.show(images)
+        reportInk()
+    }
+
+    func clearSentSketch() -> Bool {
+        guard let sent else { return false }
+        self.sent = nil
+        let kept = agentAdditions
+        agentAdditions = []
+        guard sent.spaceID == currentSpaceID, sent.notes == notes, openNoteID == nil,
+              !penStrokeOpen, !sketchContentDiffers(sent.sketch, sketchSnapshot()) else { return false }
+        clearCurrentSketch()
+        notes = []
+        if let currentSpaceID {
+            notesBySpace[currentSpaceID] = []
+        }
+        noteLayer.setSaved(notes: [], openID: nil)
+        // The agent's rendered guess stays, so the person can mark it up and send it back.
+        // It still sits on the frozen picture it was drawn against.
+        setAgentImages(kept)
+        return kept.isEmpty
     }
 
     /// Drops the pen ink and fitted shapes on the desktop that is showing.
@@ -743,10 +1033,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             shapesBySpace[currentSpaceID] = []
             drawings[currentSpaceID] = PKDrawing()
         }
+        setAgentImages([])
         gestureUndoSnapshot = nil
         pendingUndoSnapshot = nil
         shapeDragUndo = nil
-        if !undoSnapshot.drawing.strokes.isEmpty || !undoSnapshot.marks.isEmpty {
+        if !undoSnapshot.drawing.strokes.isEmpty || !undoSnapshot.marks.isEmpty || !undoSnapshot.images.isEmpty {
             registerSketchUndo(undoSnapshot)
         }
         isApplyingSmoothedStroke = true
@@ -773,23 +1064,33 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         halo.layer.shadowOffset = .zero
         halo.layer.masksToBounds = false
         halo.isHidden = true
+        clipsToBounds = true
+        agentImageLayer.isUserInteractionEnabled = false
+        addSubview(agentImageLayer)
         addSubview(halo)
 
         canvas.frame = bounds
-        canvas.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        canvas.autoresizingMask = []
         canvas.delegate = self
+        // Ink keeps its literal color. PencilKit would otherwise invert black and white in dark mode.
+        canvas.overrideUserInterfaceStyle = .light
+        canvas.layer.shadowColor = UIColor.white.cgColor
+        canvas.layer.shadowOffset = .zero
+        canvas.layer.shadowRadius = 1.2
+        canvas.layer.shadowOpacity = 0
         addSubview(canvas)
         shapeHandles.frame = bounds
-        shapeHandles.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        shapeHandles.autoresizingMask = []
         shapeHandles.isUserInteractionEnabled = false
         addSubview(shapeHandles)
         noteLayer.frame = bounds
-        noteLayer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        noteLayer.autoresizingMask = []
         noteLayer.isUserInteractionEnabled = false
         addSubview(noteLayer)
+        installPinchGesture()
         canvas.onFingerPointer = { [weak self] phase, point in
             guard let self else { return }
-            self.handleFinger(phase: phase, at: self.canvas.convert(point, to: self))
+            self.handleFinger(phase: phase, at: point)
         }
         canvas.onFingerCancel = { [weak self] in
             self?.abortFingerPointer()
@@ -812,7 +1113,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         canvas.addGestureRecognizer(penHold)
         canvas.onPencilVoice = { [weak self] phase, samples in
             guard let self else { return }
-            let points = samples.map { self.canvas.convert($0, to: self) }
+            let points = samples
             switch phase {
             case .began:
                 guard let anchor = points.first else { return }
@@ -896,6 +1197,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         undoTap.cancelsTouchesInView = false
         undoTap.delaysTouchesBegan = false
         undoTap.delaysTouchesEnded = false
+        undoTap.require(toFail: fingerPinch)
         let redoTap = FingerTapRecognizer(target: self, action: #selector(sketchRedoTapped(_:)))
         redoTap.numberOfTapsRequired = 1
         redoTap.numberOfTouchesRequired = 3
@@ -976,7 +1278,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             drawings[currentSpaceID] = canvas.drawing
             notesBySpace[currentSpaceID] = notes
             shapesBySpace[currentSpaceID] = shapeMarks
+            agentImagesBySpace[currentSpaceID] = agentImages
         }
+        let adoptingImages = currentSpaceID == nil && !agentImages.isEmpty
         let adoptingExistingInk = currentSpaceID == nil && !canvas.drawing.strokes.isEmpty
         let adoptingNotes = currentSpaceID == nil && !notes.isEmpty
         let adoptingShapes = currentSpaceID == nil && !shapeMarks.isEmpty
@@ -997,6 +1301,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         } else {
             shapeMarks = shapesBySpace[id] ?? []
         }
+        if adoptingImages {
+            agentImagesBySpace[id] = agentImages
+        } else {
+            agentImages = agentImagesBySpace[id] ?? []
+            agentImageLayer.show(agentImages)
+        }
         shapeAdjust = nil
         selectedShapeID = nil
         selectedStroke = nil
@@ -1015,12 +1325,60 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         publishInk(immediate: true)
     }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
+    private func placeLayers() {
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         canvas.frame = bounds
+        agentImageLayer.frame = bounds
         shapeHandles.frame = bounds
         noteLayer.frame = bounds
+        CATransaction.commit()
         noteLayer.relayout()
+    }
+
+    private func installPinchGesture() {
+        let finger: [NSNumber] = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.indirect.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        ]
+        fingerPinch.addTarget(self, action: #selector(handlePinch(_:)))
+        fingerPinch.allowedTouchTypes = finger
+        fingerPinch.cancelsTouchesInView = false
+        fingerPinch.delaysTouchesBegan = false
+        fingerPinch.delaysTouchesEnded = false
+        addGestureRecognizer(fingerPinch)
+    }
+
+    /// The picture does not zoom on the iPad. The pinch is sent to the Mac.
+    @objc private func handlePinch(_ pinch: UIPinchGestureRecognizer) {
+        switch pinch.state {
+        case .began:
+            lastPinchScale = pinch.scale
+            pinchSendsToMac = sendsFingerPointer
+            if pinchSendsToMac {
+                onFingerPinch(pinch.scale, .began)
+            }
+        case .changed:
+            let factor = lastPinchScale > 0 ? pinch.scale / lastPinchScale : 1
+            lastPinchScale = pinch.scale
+            if pinchSendsToMac, abs(factor - 1) > 0.0001 {
+                onFingerPinch(factor, .changed)
+            }
+        case .ended, .cancelled, .failed:
+            if pinchSendsToMac {
+                onFingerPinch(1, pinch.state == .ended ? .ended : .cancelled)
+            }
+            pinchSendsToMac = false
+        default:
+            break
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        placeLayers()
         if bounds.width > 1, bounds.height > 1, bounds.size != inkLayoutSize {
             inkLayoutSize = bounds.size
             if !inkGestureOpen {
@@ -1029,20 +1387,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
     }
 
-    /// Finger taps on a dot open its note. A tap on the open bubble leaves it up.
-    /// Anywhere else closes it and lets the status-badge tap run.
-    /// A Pencil tap uses the pen tracker: the dot shows the note, and a tap off the dot hides it.
+    /// A finger tap on a transcript or its dot stays on the note. Transcripts stay visible.
     func handleCanvasTap(at point: CGPoint) -> Bool {
         switch noteLayer.hit(at: convert(point, to: noteLayer)) {
-        case .bubble:
-            return true
-        case .dot(let id):
-            openSavedNote(id)
+        case .bubble, .dot:
             return true
         case .none:
-            guard openNoteID != nil else { return false }
-            openNoteID = nil
-            noteLayer.setSaved(notes: notes, openID: nil)
             return false
         }
     }
@@ -1393,8 +1743,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     /// Records the pen stroke under the Pencil. Resting at the end of a moving stroke corrects it.
-    /// A short tap on a voice-note dot shows its transcript. A tap off an open transcript hides it.
-    /// Dictation itself is the mic tool. A drag that starts on empty canvas still draws a new stroke.
+    /// Transcripts stay visible. Dictation itself is the mic tool.
+    /// A drag that starts on empty canvas still draws a new stroke.
     private func trackPenHold(phase: UITouch.Phase, touches: [UITouch]) {
         guard penToolIsDrawing, let touch = touches.last else { return }
         switch phase {
@@ -1406,12 +1756,15 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 dictationInkToken = nil
             }
             let point = touch.preciseLocation(in: canvas)
-            if let adjust = shapeAdjustHit(at: point) {
+            if let box = selectedShapeBox(), let hit = lassoBoxHit(at: point, box: box),
+               let index = selectedShapeIndex(), shapeMarks.indices.contains(index) {
                 penHoldItem?.cancel()
                 penHoldSamples = []
                 pendingStrokeTap = nil
                 pendingTranscriptDismiss = nil
-                beginShapeAdjust(adjust, touch: touch)
+                lassoSelection = [shapeMarks[index].strokeIndex]
+                boxDragStarted = Date()
+                beginLassoTransform(hit, at: point, box: box)
                 return
             }
             pendingStrokeTap = nil
@@ -1429,6 +1782,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             penHoldAnchorIndex = max(penHoldSamples.count - 1, 0)
             schedulePenHold()
         case .moved:
+            if lassoDrag != nil {
+                updateLassoTransform(to: touch.preciseLocation(in: canvas))
+                return
+            }
             if shapeAdjust != nil {
                 updateShapeAdjust(to: touch.preciseLocation(in: canvas))
                 return
@@ -1460,6 +1817,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 schedulePenHold()
             }
         case .ended:
+            if lassoDrag != nil {
+                endLassoInteraction(commitLoop: true)
+                clearPenHoldTracking()
+                return
+            }
             if shapeAdjust != nil {
                 let baseline = shapeTapBaseline
                 finishShapeAdjust()
@@ -1484,15 +1846,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 clearPenHoldTracking()
                 return
             }
-            var hideTranscript = false
             if let dismiss = pendingTranscriptDismiss {
                 pendingTranscriptDismiss = nil
                 let moved = hypot(point.x - dismiss.point.x, point.y - dismiss.point.y)
-                if moved <= Self.strokeTapSlop, openNoteID != nil {
-                    openNoteID = nil
-                    noteLayer.setSaved(notes: notes, openID: nil)
-                    hideTranscript = true
-                } else if moved > Self.strokeTapSlop {
+                if moved <= Self.strokeTapSlop {
+                    removeTapDotIfPresent()
+                } else {
                     tapDotCleanup = nil
                 }
             }
@@ -1506,12 +1865,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                     return
                 }
             }
-            if hideTranscript {
-                removeTapDotIfPresent()
-            }
             clearPenHoldTracking()
         case .cancelled:
             if committingPenHold { return }
+            if lassoDrag != nil {
+                endLassoInteraction(commitLoop: false)
+                clearPenHoldTracking()
+                return
+            }
             pendingTranscriptDismiss = nil
             if shapeAdjust != nil {
                 let baseline = shapeTapBaseline
@@ -1569,7 +1930,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             source = samples.map(\.location)
         }
         if let shape = ShapeFit.fit(source) {
-            let corrected = stroke(for: shape, pointSize: StrokeSmoothing.pointSize(forToolWidth: strokeWidth))
+            let corrected = stroke(for: shape, pointSize: StrokeSmoothing.pointSize(forToolWidth: strokeWidth), color: inkColor)
             if strokes.count > countBefore {
                 strokes[strokes.count - 1] = corrected
             } else {
@@ -1582,14 +1943,15 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 shape: shape,
                 strokeIndex: index,
                 width: StrokeSmoothing.pointSize(forToolWidth: strokeWidth),
+                color: inkColor,
                 opacity: 1,
                 force: 1
             )
             shapeMarks.append(mark)
-            selectedShapeID = nil
+            selectedShapeID = mark.id
         } else if strokes.count > countBefore, let smoothed = StrokeSmoothing.smoothedPenStroke(from: strokes[strokes.count - 1], toolWidth: strokeWidth) {
             strokes[strokes.count - 1] = smoothed
-        } else if let smoothed = StrokeSmoothing.smoothedStroke(from: samples, toolWidth: strokeWidth) {
+        } else if let smoothed = StrokeSmoothing.smoothedStroke(from: samples, toolWidth: strokeWidth, color: inkColor) {
             strokes.append(smoothed)
         } else {
             resumePenDrawing()
@@ -1632,7 +1994,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     /// Keeps the hold correction when PencilKit writes the raw stroke as the sketch finishes.
     private func sketchSnapshot() -> SketchUndoSnapshot {
-        SketchUndoSnapshot(drawing: canvas.drawing, marks: shapeMarks, selectedShapeID: selectedShapeID)
+        SketchUndoSnapshot(drawing: canvas.drawing, marks: shapeMarks, selectedShapeID: selectedShapeID, images: agentImages)
     }
 
     private func sketchContentDiffers(_ lhs: SketchUndoSnapshot, _ rhs: SketchUndoSnapshot) -> Bool {
@@ -1658,9 +2020,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let openedGroup = beginSketchUndoGroupIfNeeded()
         guard sketchUndo.groupingLevel > 0 else { return }
         let proxy = SketchUndoProxy(owner: self, snapshot: snapshot)
-        sketchUndo.registerUndo(withTarget: proxy) { proxy in
-            proxy.apply()
-        }
+        sketchUndo.registerUndo(withTarget: proxy, selector: #selector(SketchUndoProxy.apply(_:)), object: nil)
         sketchUndo.setActionName("Sketch")
         if openedGroup, sketchUndo.groupingLevel > 0 {
             sketchUndo.endUndoGrouping()
@@ -1684,9 +2044,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private func registerSketchInverse(_ snapshot: SketchUndoSnapshot) {
         guard sketchUndo.groupingLevel > 0 else { return }
         let proxy = SketchUndoProxy(owner: self, snapshot: snapshot)
-        sketchUndo.registerUndo(withTarget: proxy) { proxy in
-            proxy.apply()
-        }
+        sketchUndo.registerUndo(withTarget: proxy, selector: #selector(SketchUndoProxy.apply(_:)), object: nil)
     }
 
     private func applySketchSnapshot(_ snapshot: SketchUndoSnapshot) {
@@ -1714,6 +2072,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             drawings[currentSpaceID] = snapshot.drawing
             shapesBySpace[currentSpaceID] = snapshot.marks
         }
+        setAgentImages(snapshot.images)
         registerSketchInverse(redo)
         refreshShapeHandles()
         refreshLassoChrome()
@@ -1795,6 +2154,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private func selectedShapeIndex() -> Int? {
         guard let selectedShapeID else { return nil }
         return shapeMarks.firstIndex(where: { $0.id == selectedShapeID })
+    }
+
+    private func selectedShapeBox() -> LassoBox? {
+        guard let index = selectedShapeIndex(), shapeMarks.indices.contains(index) else { return nil }
+        return LassoBox.fitting(shapeMarks[index].shape)
     }
 
     private func shapeMarkIndex(for adjust: ShapeAdjust?) -> Int? {
@@ -1926,7 +2290,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         guard shapeMarks.indices.contains(index) else { return }
         let mark = shapeMarks[index]
         shapeHandles.pendingStrokes = []
-        shapeHandles.pendingStroke = stroke(for: mark.shape, pointSize: mark.width)
+        shapeHandles.pendingStroke = stroke(for: mark.shape, pointSize: mark.width, color: mark.color)
         refreshShapeHandles()
         guard !shapePreviewScheduled else { return }
         shapePreviewScheduled = true
@@ -2004,7 +2368,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let mark = shapeMarks[index]
         var strokes = canvas.drawing.strokes
         adjustingInk = nil
-        strokes.append(stroke(for: mark.shape, pointSize: mark.width))
+        strokes.append(stroke(for: mark.shape, pointSize: mark.width, color: mark.color))
         shapeMarks[index].strokeIndex = strokes.count - 1
         holdLockedStrokes = strokes
         isApplyingSmoothedStroke = true
@@ -2019,7 +2383,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let mark = shapeMarks[index]
         var strokes = canvas.drawing.strokes
         guard strokes.indices.contains(mark.strokeIndex) else { return }
-        strokes[mark.strokeIndex] = stroke(for: mark.shape, pointSize: mark.width)
+        strokes[mark.strokeIndex] = stroke(for: mark.shape, pointSize: mark.width, color: mark.color)
         holdLockedStrokes = strokes
         isApplyingSmoothedStroke = true
         canvas.drawing = PKDrawing(strokes: strokes)
@@ -2031,7 +2395,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// Fitted line, circle, square, rectangle, and curve. Same monoline the pen draws.
     /// PencilKit stores tool width `W` as point size `W + 2` and paints `2 * (size - 2)`,
     /// so a point size of 4 is half as thick as the freehand stroke.
-    private func stroke(for shape: FittedShape, pointSize: CGFloat) -> PKStroke {
+    private func stroke(for shape: FittedShape, pointSize: CGFloat, color: UIColor) -> PKStroke {
         let size = pointSize
         let points = shape.outline().enumerated().map { index, location in
             StrokeSmoothing.point(
@@ -2045,7 +2409,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             )
         }
         return PKStroke(
-            ink: StrokeSmoothing.ink(pointSize: size),
+            ink: StrokeSmoothing.ink(pointSize: size, color: color),
             path: PKStrokePath(controlPoints: points, creationDate: Date()),
             transform: .identity,
             mask: nil
@@ -2459,6 +2823,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     private func clearFreehandChrome() {
         shapeHandles.selectionCorners = []
+        shapeHandles.selectionEdges = []
         shapeHandles.selectionRotate = nil
         shapeHandles.selectionRotateAnchor = nil
     }
@@ -2468,6 +2833,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         shapeHandles.rotateHandle = nil
         shapeHandles.rotateAnchor = nil
         shapeHandles.selectionCorners = marks.corners
+        shapeHandles.selectionEdges = []
         shapeHandles.selectionRotate = marks.rotate
         shapeHandles.selectionRotateAnchor = marks.anchor
     }
@@ -2512,6 +2878,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     private func refreshShapeHandles() {
+        if lassoDrag != nil { return }
         guard penToolIsDrawing, strokeAdjust == nil, let selectedShapeID, let mark = shapeMarks.first(where: { $0.id == selectedShapeID }) else {
             if strokeAdjust == nil {
                 shapeHandles.handles = []
@@ -2525,12 +2892,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             }
             return
         }
-        shapeHandles.handles = mark.shape.handles
-        shapeHandles.rotateHandle = mark.shape.rotateHandle
-        shapeHandles.rotateAnchor = mark.shape.rotateAnchor
-        shapeHandles.selectionCorners = dashedBox(for: mark.shape)
-        shapeHandles.selectionRotate = nil
-        shapeHandles.selectionRotateAnchor = nil
+        let box = LassoBox.fitting(mark.shape)
+        shapeHandles.handles = []
+        shapeHandles.rotateHandle = nil
+        shapeHandles.rotateAnchor = nil
+        shapeHandles.selectionCorners = box.corners
+        shapeHandles.selectionEdges = box.edgePoints
+        shapeHandles.selectionRotate = box.rotateHandle
+        shapeHandles.selectionRotateAnchor = box.topAnchor
     }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
@@ -2643,14 +3012,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         halo.isHidden = false
-        halo.image = drawing.image(from: rect, scale: scale)
+        halo.image = drawing.literalImage(from: rect, scale: scale)
         halo.frame = rect
         CATransaction.commit()
     }
 
     private func reportInk() {
         let editing = shapeAdjust != nil || lassoTransforming || !lassoLifted.isEmpty
-        onInkChange?(hasInk || editing)
+        onInkChange?(hasInk || editing || !agentImages.isEmpty)
     }
 
     /// Sends this desktop's pen ink on stroke end, erase end, shape or lasso commit, and clear.
@@ -2714,6 +3083,18 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         onInk(png, width, height, spaceID)
     }
 
+    /// Draws the frozen Mac frame into the cropped sketch. The frame fills the same
+    /// letterboxed rect the ink was drawn on, so a note lands on the screen content under it.
+    private func drawScreen(_ screen: UIImage?, into crop: CGRect) {
+        guard let screen, let picture = pictureDrawingRect(), picture.width > 1, picture.height > 1 else { return }
+        screen.draw(in: CGRect(
+            x: picture.minX - crop.minX,
+            y: picture.minY - crop.minY,
+            width: picture.width,
+            height: picture.height
+        ))
+    }
+
     /// The letterboxed picture, in PencilKit drawing coordinates. Same fit as `FrameCoordinates`.
     private func pictureDrawingRect() -> CGRect? {
         guard frameWidth > 1, frameHeight > 1, bounds.width > 1, bounds.height > 1 else { return nil }
@@ -2742,7 +3123,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let pixelWidth = min(frameWidth, max(2, maxPixelWidth))
         let pixelHeight = max(2, Int((Double(frameHeight) * Double(pixelWidth) / Double(frameWidth)).rounded()))
         let renderScale = max(CGFloat(pixelWidth) / drawingRect.width, 0.5)
-        let ink = canvas.drawing.image(from: drawingRect, scale: renderScale)
+        let ink = canvas.drawing.literalImage(from: drawingRect, scale: renderScale)
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = false
@@ -2986,15 +3367,95 @@ private struct LassoBox: Equatable {
     var halfHeight: CGFloat
     var rotation: CGFloat
 
+    enum Edge: CaseIterable {
+        case top, right, bottom, left
+
+        var opposite: Edge {
+            switch self {
+            case .top: return .bottom
+            case .right: return .left
+            case .bottom: return .top
+            case .left: return .right
+            }
+        }
+
+        /// True when dragging this edge changes the box's width.
+        var stretchesWidth: Bool {
+            self == .left || self == .right
+        }
+    }
+
     var corners: [CGPoint] {
         [
             CGPoint(x: -halfWidth, y: -halfHeight),
             CGPoint(x: halfWidth, y: -halfHeight),
             CGPoint(x: halfWidth, y: halfHeight),
             CGPoint(x: -halfWidth, y: halfHeight)
-        ].map { local in
-            let turned = ShapeFit.rotate(local, by: rotation)
-            return CGPoint(x: center.x + turned.x, y: center.y + turned.y)
+        ].map { canvasPoint($0) }
+    }
+
+    /// Midpoints of the four sides. Dragging one stretches that axis.
+    var edgePoints: [CGPoint] {
+        Edge.allCases.map { edgePoint($0) }
+    }
+
+    func edgePoint(_ edge: Edge) -> CGPoint {
+        let local: CGPoint
+        switch edge {
+        case .top: local = CGPoint(x: 0, y: -halfHeight)
+        case .right: local = CGPoint(x: halfWidth, y: 0)
+        case .bottom: local = CGPoint(x: 0, y: halfHeight)
+        case .left: local = CGPoint(x: -halfWidth, y: 0)
+        }
+        return canvasPoint(local)
+    }
+
+    /// Unit direction from the opposite edge toward `edge`.
+    func axis(toward edge: Edge) -> CGPoint {
+        switch edge {
+        case .right: return ShapeFit.rotate(CGPoint(x: 1, y: 0), by: rotation)
+        case .left: return ShapeFit.rotate(CGPoint(x: -1, y: 0), by: rotation)
+        case .bottom: return ShapeFit.rotate(CGPoint(x: 0, y: 1), by: rotation)
+        case .top: return ShapeFit.rotate(CGPoint(x: 0, y: -1), by: rotation)
+        }
+    }
+
+    func span(for edge: Edge) -> CGFloat {
+        edge.stretchesWidth ? halfWidth * 2 : halfHeight * 2
+    }
+
+    private func canvasPoint(_ local: CGPoint) -> CGPoint {
+        let turned = ShapeFit.rotate(local, by: rotation)
+        return CGPoint(x: center.x + turned.x, y: center.y + turned.y)
+    }
+
+    /// Oriented box around a corrected shape, padded so the handles sit just outside the ink.
+    static func fitting(_ shape: FittedShape) -> LassoBox {
+        let pad: CGFloat = 10
+        switch shape {
+        case let .square(center, side, rotation):
+            let half = side / 2 + pad
+            return LassoBox(center: center, halfWidth: half, halfHeight: half, rotation: rotation)
+        case let .rectangle(center, width, height, rotation):
+            return LassoBox(
+                center: center,
+                halfWidth: width / 2 + pad,
+                halfHeight: height / 2 + pad,
+                rotation: rotation
+            )
+        case let .circle(center, radius, _):
+            let half = radius + pad
+            return LassoBox(center: center, halfWidth: half, halfHeight: half, rotation: 0)
+        case let .line(start, end):
+            let center = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
+            let length = hypot(end.x - start.x, end.y - start.y)
+            let angle = atan2(end.y - start.y, end.x - start.x)
+            return LassoBox(center: center, halfWidth: length / 2 + pad, halfHeight: pad + 8, rotation: angle)
+        case .curve:
+            let bounds = shape.outline().reduce(CGRect.null) { rect, point in
+                rect.union(CGRect(origin: point, size: .zero))
+            }
+            return enclosing(bounds) ?? LassoBox(center: shape.center, halfWidth: 18, halfHeight: 18, rotation: 0)
         }
     }
 
@@ -3048,12 +3509,14 @@ private enum LassoDrag {
     case loop
     case move(start: CGPoint)
     case resize(center: CGPoint, startDistance: CGFloat)
+    case stretch(LassoBox.Edge)
     case rotate(center: CGPoint, lastAngle: CGFloat, accumulated: CGFloat)
 }
 
 private enum LassoBoxHit {
     case body
     case corner
+    case edge(LassoBox.Edge)
     case rotate
 }
 
@@ -3085,7 +3548,7 @@ private extension PencilOverlayView {
             } else {
                 refreshLassoChrome()
             }
-        case .move, .resize, .rotate:
+        case .move, .resize, .stretch, .rotate:
             finishLassoTransform()
         case nil:
             break
@@ -3107,11 +3570,14 @@ private extension PencilOverlayView {
     }
 
     func refreshLassoChrome() {
-        guard lassoArmed else {
+        guard lassoArmed || lassoDrag != nil else {
             shapeHandles.lassoLoop = []
-            shapeHandles.selectionCorners = []
-            shapeHandles.selectionRotate = nil
-            shapeHandles.selectionRotateAnchor = nil
+            if selectedShapeID == nil {
+                shapeHandles.selectionCorners = []
+                shapeHandles.selectionEdges = []
+                shapeHandles.selectionRotate = nil
+                shapeHandles.selectionRotateAnchor = nil
+            }
             return
         }
         if !lassoTransforming {
@@ -3129,11 +3595,14 @@ private extension PencilOverlayView {
         }
         shapeHandles.lassoLoop = drawingLoop ? lassoLoop : []
         if let lassoBox, !drawingLoop {
+            shapeHandles.handles = []
             shapeHandles.selectionCorners = lassoBox.corners
+            shapeHandles.selectionEdges = lassoBox.edgePoints
             shapeHandles.selectionRotate = lassoBox.rotateHandle
             shapeHandles.selectionRotateAnchor = lassoBox.topAnchor
         } else {
             shapeHandles.selectionCorners = []
+            shapeHandles.selectionEdges = []
             shapeHandles.selectionRotate = nil
             shapeHandles.selectionRotateAnchor = nil
         }
@@ -3157,7 +3626,7 @@ private extension PencilOverlayView {
                 lassoLoop.append(sample)
             }
             refreshLassoChrome()
-        case .move, .resize, .rotate:
+        case .move, .resize, .stretch, .rotate:
             updateLassoTransform(to: point)
         case nil:
             break
@@ -3182,6 +3651,8 @@ private extension PencilOverlayView {
         case .corner:
             let distance = max(hypot(point.x - box.center.x, point.y - box.center.y), 1)
             lassoDrag = .resize(center: box.center, startDistance: distance)
+        case let .edge(edge):
+            lassoDrag = .stretch(edge)
         case .rotate:
             let angle = atan2(point.y - box.center.y, point.x - box.center.x)
             lassoDrag = .rotate(center: box.center, lastAngle: angle, accumulated: 0)
@@ -3207,6 +3678,24 @@ private extension PencilOverlayView {
             var box = base
             box.halfWidth = base.halfWidth * scale
             box.halfHeight = base.halfHeight * scale
+            lassoBox = box
+        case let .stretch(edge):
+            let anchor = base.edgePoint(edge.opposite)
+            let axis = base.axis(toward: edge)
+            let span = max(base.span(for: edge), 1)
+            let projected = (point.x - anchor.x) * axis.x + (point.y - anchor.y) * axis.y
+            let scale = min(8, max(0.05, projected / span))
+            lassoLiveTransform = scaleAlong(anchor: anchor, axis: axis, factor: scale)
+            var box = base
+            if edge.stretchesWidth {
+                box.halfWidth = span * scale / 2
+            } else {
+                box.halfHeight = span * scale / 2
+            }
+            box.center = CGPoint(
+                x: anchor.x + axis.x * span * scale / 2,
+                y: anchor.y + axis.y * span * scale / 2
+            )
             lassoBox = box
         case let .rotate(center, lastAngle, accumulated):
             let angle = atan2(point.y - center.y, point.x - center.x)
@@ -3241,7 +3730,39 @@ private extension PencilOverlayView {
             return
         }
         commitLiftedStrokes(lifted, transform: transform)
+        dropStrayBoxInk()
+        if !lassoArmed, lassoSelection.count == 1,
+           let index = lassoSelection.first,
+           let mark = shapeMarks.first(where: { $0.strokeIndex == index }) {
+            selectedShapeID = mark.id
+        }
         refreshLassoChrome()
+        refreshShapeHandles()
+    }
+
+    /// Drops a pen speck laid down while a transform box was dragged.
+    private func dropStrayBoxInk() {
+        guard let started = boxDragStarted else { return }
+        boxDragStarted = nil
+        let keep = Set(lassoSelection)
+        let strokes = canvas.drawing.strokes
+        var kept: [PKStroke] = []
+        var map: [Int: Int] = [:]
+        for (index, stroke) in strokes.enumerated() {
+            let stray = !keep.contains(index) && stroke.path.creationDate >= started.addingTimeInterval(-0.05)
+            if stray { continue }
+            map[index] = kept.count
+            kept.append(stroke)
+        }
+        guard kept.count != strokes.count else { return }
+        for mark in shapeMarks.indices {
+            shapeMarks[mark].strokeIndex = map[shapeMarks[mark].strokeIndex] ?? -1
+        }
+        lassoSelection = lassoSelection.compactMap { map[$0] }
+        holdLockedStrokes = nil
+        isApplyingSmoothedStroke = true
+        canvas.drawing = PKDrawing(strokes: kept)
+        isApplyingSmoothedStroke = false
     }
 
     func showLassoPreview(immediate: Bool) {
@@ -3377,13 +3898,27 @@ private extension PencilOverlayView {
         for corner in box.corners {
             cornerDistance = min(cornerDistance, hypot(point.x - corner.x, point.y - corner.y))
         }
+        var edgeDistance = CGFloat.greatestFiniteMagnitude
+        var edge: LassoBox.Edge?
+        for candidate in LassoBox.Edge.allCases {
+            let distance = hypot(point.x - box.edgePoint(candidate).x, point.y - box.edgePoint(candidate).y)
+            if distance < edgeDistance {
+                edgeDistance = distance
+                edge = candidate
+            }
+        }
         let rotateHit = rotateDistance <= 26
         let cornerHit = cornerDistance <= 24
-        if rotateHit, cornerHit {
-            return rotateDistance <= cornerDistance ? .rotate : .corner
+        let edgeHit = edgeDistance <= 24
+        if rotateHit, !cornerHit || rotateDistance <= cornerDistance, !edgeHit || rotateDistance <= edgeDistance {
+            return .rotate
         }
-        if rotateHit { return .rotate }
-        if cornerHit { return .corner }
+        if cornerHit, !edgeHit || cornerDistance <= edgeDistance {
+            return .corner
+        }
+        if edgeHit, let edge {
+            return .edge(edge)
+        }
         if box.contains(point) { return .body }
         return nil
     }
@@ -3463,6 +3998,17 @@ private extension PencilOverlayView {
         CGAffineTransform(translationX: -center.x, y: -center.y)
             .concatenating(change)
             .concatenating(CGAffineTransform(translationX: center.x, y: center.y))
+    }
+
+    /// Scales along `axis` around `anchor` and leaves the perpendicular axis alone.
+    /// `concatenating` applies the receiver first.
+    func scaleAlong(anchor: CGPoint, axis: CGPoint, factor: CGFloat) -> CGAffineTransform {
+        let angle = atan2(axis.y, axis.x)
+        return CGAffineTransform(translationX: -anchor.x, y: -anchor.y)
+            .concatenating(CGAffineTransform(rotationAngle: -angle))
+            .concatenating(CGAffineTransform(scaleX: factor, y: 1))
+            .concatenating(CGAffineTransform(rotationAngle: angle))
+            .concatenating(CGAffineTransform(translationX: anchor.x, y: anchor.y))
     }
 
     func polygonBounds(_ polygon: [CGPoint]) -> CGRect {
@@ -3786,12 +4332,12 @@ final class InkCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
         return super.gestureRecognizerShouldBegin(gestureRecognizer)
     }
 
-    /// PKCanvasView is a scroll view. Its pan still tracks every finger and
-    /// would cancel a three-finger swipe and a one-finger double tap, so that
-    /// pan starts at two fingers and stops at two. One finger stays with the
-    /// tap recognizer and the finger-pointer stream. This screen does not zoom.
+    /// PKCanvasView is a scroll view. Its own pan and pinch stay off so a
+    /// one-finger double tap, a two-finger undo tap, and a three-finger swipe
+    /// are not cancelled. A finger pinch is the overlay's, sent to the Mac.
     func keepScrollPanOffDesktopSwipe() {
         isScrollEnabled = false
+        panGestureRecognizer.isEnabled = false
         panGestureRecognizer.minimumNumberOfTouches = 2
         panGestureRecognizer.maximumNumberOfTouches = 2
         panGestureRecognizer.cancelsTouchesInView = false
@@ -3823,6 +4369,9 @@ private final class ShapeHandleView: UIView {
         didSet { redrawChrome() }
     }
     var selectionCorners: [CGPoint] = [] {
+        didSet { redrawChrome() }
+    }
+    var selectionEdges: [CGPoint] = [] {
         didSet { redrawChrome() }
     }
     var selectionRotate: CGPoint? {
@@ -3886,7 +4435,7 @@ private final class ShapeHandleView: UIView {
         let scale = max(window?.screen.scale ?? traitCollection.displayScale, 1)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        inkView.image = drawing.image(from: strokeBounds, scale: scale)
+        inkView.image = drawing.literalImage(from: strokeBounds, scale: scale)
         inkView.frame = strokeBounds
         CATransaction.commit()
     }
@@ -3964,6 +4513,9 @@ private final class ShapeHandleView: UIView {
         for corner in selectionCorners {
             drawKnob(at: corner, in: context)
         }
+        for edge in selectionEdges {
+            drawKnob(at: edge, in: context)
+        }
         if let selectionRotate {
             drawKnob(at: selectionRotate, in: context)
         }
@@ -3998,8 +4550,8 @@ private enum StrokeSmoothing {
     }
 
     /// Ink whose painted weight matches a stored monoline point size.
-    static func ink(pointSize: CGFloat) -> PKInk {
-        PKInkingTool(.monoline, color: .black, width: max(pointSize - 2, 1)).ink
+    static func ink(pointSize: CGFloat, color: UIColor) -> PKInk {
+        PKInkingTool(.monoline, color: color, width: max(pointSize - 2, 1)).ink
     }
 
     /// Nil when the stroke should be kept as PencilKit produced it.
@@ -4033,7 +4585,7 @@ private enum StrokeSmoothing {
             creationDate: path.creationDate
         )
         return PKStroke(
-            ink: ink(pointSize: size),
+            ink: ink(pointSize: size, color: stroke.ink.color),
             path: smoothedPath,
             transform: stroke.transform,
             mask: stroke.mask,
@@ -4042,8 +4594,8 @@ private enum StrokeSmoothing {
     }
 
     /// A pen stroke built from samples taken while the Pencil is still down.
-    static func smoothedStroke(from samples: [PKStrokePoint], toolWidth: CGFloat) -> PKStroke? {
-        let ink = ink(pointSize: pointSize(forToolWidth: toolWidth))
+    static func smoothedStroke(from samples: [PKStrokePoint], toolWidth: CGFloat, color: UIColor) -> PKStroke? {
+        let ink = ink(pointSize: pointSize(forToolWidth: toolWidth), color: color)
         guard samples.count >= 3, ink.inkType == .pen || ink.inkType == .monoline else { return nil }
         let raw = PKStroke(
             ink: ink,
@@ -4100,5 +4652,103 @@ private enum StrokeSmoothing {
             altitude: altitude,
             secondaryScale: 0
         )
+    }
+}
+
+/// One rendered guess from the agent, in canvas points.
+struct AgentImage {
+    let id: UUID
+    var frame: CGRect
+    var image: UIImage
+}
+
+/// The agent's images, under the halo and the ink. Touches pass through to the canvas.
+final class AgentImageLayer: UIView {
+    private var views: [UUID: UIImageView] = [:]
+
+    func show(_ images: [AgentImage]) {
+        let ids = Set(images.map(\.id))
+        for (id, view) in views where !ids.contains(id) {
+            view.removeFromSuperview()
+            views[id] = nil
+        }
+        for image in images {
+            let view = views[image.id] ?? {
+                let view = UIImageView()
+                view.contentMode = .scaleToFill
+                view.layer.borderColor = (UIColor(named: "CanvasLine") ?? .gray).cgColor
+                view.layer.borderWidth = 1
+                view.isAccessibilityElement = true
+                view.accessibilityLabel = "The agent's rendering"
+                addSubview(view)
+                views[image.id] = view
+                return view
+            }()
+            view.image = image.image
+            view.frame = image.frame
+        }
+    }
+}
+
+/// Renders the agent's HTML in an off-screen web view the size of its image, then
+/// snapshots it. The view sits outside the overlay's clipped bounds while it loads.
+final class AgentHTMLRenderer: NSObject, WKNavigationDelegate {
+    private var webView: WKWebView?
+    private var completion: ((UIImage?) -> Void)?
+    private var size: CGSize = .zero
+    /// Scripts and fonts get this long after the page loads before the snapshot.
+    private static let settleDelay: TimeInterval = 0.4
+    private static let timeout: TimeInterval = 12
+
+    func render(html: String, size: CGSize, in host: UIView, completion: @escaping (UIImage?) -> Void) {
+        self.size = size
+        self.completion = completion
+        let configuration = WKWebViewConfiguration()
+        configuration.suppressesIncrementalRendering = true
+        let webView = WKWebView(
+            frame: CGRect(x: -size.width - 64, y: 0, width: size.width, height: size.height),
+            configuration: configuration
+        )
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.isScrollEnabled = false
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        webView.isUserInteractionEnabled = false
+        webView.navigationDelegate = self
+        host.addSubview(webView)
+        self.webView = webView
+        webView.loadHTMLString(html, baseURL: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.timeout) { [weak self] in
+            self?.finish(nil)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleDelay) { [weak self] in
+            guard let self, let webView = self.webView else { return }
+            let configuration = WKSnapshotConfiguration()
+            configuration.rect = CGRect(origin: .zero, size: self.size)
+            configuration.afterScreenUpdates = true
+            webView.takeSnapshot(with: configuration) { [weak self] image, _ in
+                self?.finish(image)
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        finish(nil)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        finish(nil)
+    }
+
+    private func finish(_ image: UIImage?) {
+        guard let completion else { return }
+        self.completion = nil
+        webView?.navigationDelegate = nil
+        webView?.removeFromSuperview()
+        webView = nil
+        completion(image)
     }
 }

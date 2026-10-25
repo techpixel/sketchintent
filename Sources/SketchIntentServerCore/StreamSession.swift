@@ -16,6 +16,9 @@ final class StreamSession {
     var onBehind: (() -> Void)?
     var onInput: ((RemoteInput) -> Void)?
     var onInk: ((InkSnapshot) -> Void)?
+    var onIntent: ((IntentRequest) -> Void)?
+    var onChooseFolder: ((String) -> Void)?
+    var onCancelIntent: ((UInt32) -> Void)?
 
     /// Steady state keeps one frame in flight and one waiting. A third means the link is behind.
     private let maxQueuedFrames = 2
@@ -140,6 +143,12 @@ final class StreamSession {
                         onInput?(input)
                     case .ink(let ink):
                         onInk?(ink)
+                    case .intent(let request):
+                        onIntent?(request)
+                    case .chooseFolder(let path):
+                        onChooseFolder?(path)
+                    case .cancelIntent(let id):
+                        onCancelIntent?(id)
                     default:
                         break
                     }

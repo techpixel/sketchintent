@@ -20,6 +20,7 @@
 		F00000000000000000000029 /* StrokeSmoothing.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000028 /* StrokeSmoothing.swift */; };
 		F0000000000000000000002B /* ShapeFit.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000002A /* ShapeFit.swift */; };
 		F0000000000000000000002D /* LiquidGlassPlate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000002C /* LiquidGlassPlate.swift */; };
+		F0000000000000000000002F /* IntentClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000002E /* IntentClient.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +39,7 @@
 		F00000000000000000000028 /* StrokeSmoothing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrokeSmoothing.swift; sourceTree = "<group>"; };
 		F0000000000000000000002A /* ShapeFit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShapeFit.swift; sourceTree = "<group>"; };
 		F0000000000000000000002C /* LiquidGlassPlate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlassPlate.swift; sourceTree = "<group>"; };
+		F0000000000000000000002E /* IntentClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntentClient.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -83,6 +85,7 @@
 				F00000000000000000000022 /* MarkupChrome.swift */,
 				F00000000000000000000024 /* VoiceAnnotation.swift */,
 				F00000000000000000000026 /* VirtualTrackpad.swift */,
+				F0000000000000000000002E /* IntentClient.swift */,
 				F00000000000000000000019 /* Assets.xcassets */,
 			);
 			path = SketchIntent;
@@ -176,6 +179,7 @@
 				F00000000000000000000023 /* MarkupChrome.swift in Sources */,
 				F00000000000000000000025 /* VoiceAnnotation.swift in Sources */,
 				F00000000000000000000027 /* VirtualTrackpad.swift in Sources */,
+				F0000000000000000000002F /* IntentClient.swift in Sources */,
 				F00000000000000000000008 /* StreamProtocol.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

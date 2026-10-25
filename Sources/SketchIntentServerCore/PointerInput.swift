@@ -89,6 +89,48 @@ struct DirectTouchEvent: Equatable {
     }
 }
 
+/// `NSEventTypeMagnify` as a posted event. `CGEventType` has no magnify case, so this is
+/// the private gesture layout AppKit reads back: raw type 29 (`NSEventTypeGesture`),
+/// field 110 the HID event type (8, `kIOHIDEventTypeZoom`), field 113 the magnification,
+/// and field 132 the `IOHIDEventPhaseBits`, whose values match `CGScrollPhase`.
+/// The window server delivers it to the window under `point`, like a trackpad pinch.
+struct MagnifyGestureEvent: Equatable {
+    /// `NSEventTypeGesture`.
+    static let eventType = CGEventType(rawValue: 29)!
+    /// `kIOHIDEventTypeZoom`.
+    static let zoomHIDType: Int64 = 8
+    static let hidTypeField = CGEventField(rawValue: 110)!
+    static let magnificationField = CGEventField(rawValue: 113)!
+    static let phaseField = CGEventField(rawValue: 132)!
+
+    var point: CGPoint
+    /// `NSEvent.magnification`: 0.01 is 1% larger.
+    var magnification: Double
+    var phase: CGScrollPhase
+
+    func makeEvent(source: CGEventSource? = nil) -> CGEvent? {
+        guard let event = CGEvent(source: source) else { return nil }
+        event.type = Self.eventType
+        event.location = point
+        event.setIntegerValueField(Self.hidTypeField, value: Self.zoomHIDType)
+        event.setIntegerValueField(Self.phaseField, value: Int64(phase.rawValue))
+        event.setDoubleValueField(Self.magnificationField, value: magnification)
+        return event
+    }
+}
+
+enum PointerAccessError: Error, CustomStringConvertible {
+    case accessibilityDenied
+
+    var description: String {
+        """
+        Accessibility permission is off, so touch and trackpad input cannot reach this Mac.
+        Approve the system prompt, or enable this app in System Settings → Privacy & Security → Accessibility.
+        If you launched the server from a terminal or Cursor, enable that host app as well. Then run the server again.
+        """
+    }
+}
+
 enum PointerInjection: Equatable {
     case move(CGPoint)
     /// Left mouse-down immediately followed by mouse-up. TN3212's tap emulation.
@@ -493,6 +535,28 @@ final class MacPointer {
         }
     }
 
+    /// Two-finger pinch, as a magnify gesture at the cursor. `magnification` is in
+    /// ten-thousandths, as on the wire. It follows the Mac's "Zoom in or out" setting.
+    func postTrackpadMagnify(magnification: Int16, phase: TrackpadScrollPhase) {
+        let allowed = phase == .began ? preferences(force: true).zoom : preferences().zoom
+        lock.lock()
+        let momentumEnd = phase == .began ? cancelMomentumLocked() : nil
+        let releaseDrag = phase == .began && cancelTrackpadDragLocked()
+        let trusted = accessibilityTrusted()
+        lock.unlock()
+        postScroll(momentumEnd)
+        if releaseDrag { releaseTrackpadButton() }
+        guard trusted, allowed else { return }
+        if phase == .changed, magnification == 0 { return }
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let cursor = CGEvent(source: source)?.location else { return }
+        MagnifyGestureEvent(
+            point: cursor,
+            magnification: Double(magnification) / 10_000,
+            phase: phase.cgScrollPhase
+        ).makeEvent(source: source)?.post(tap: .cghidEventTap)
+    }
+
     /// A tap on the pad. The button comes from tap-to-click and secondary click.
     /// A preference that produces no click still stops an open coast.
     func postTrackpadTap(fingers: UInt8, zone: TrackpadTapZone) {
@@ -828,6 +892,15 @@ final class MacPointer {
             return indexed
         }
         return CGMainDisplayID()
+    }
+
+    /// Checked at launch. Posting pointer events needs Accessibility, which macOS grants
+    /// to the process that launched the server. Asks for it, then fails if it is still off.
+    static func ensureAccess() throws {
+        let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        let trusted = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
+        let canPost = CGPreflightPostEventAccess() || CGRequestPostEventAccess()
+        guard trusted, canPost else { throw PointerAccessError.accessibilityDenied }
     }
 
     private func accessibilityTrusted() -> Bool {

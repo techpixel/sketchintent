@@ -165,35 +165,75 @@ enum FittedShape: Equatable {
         }
     }
 
-    /// Applies a move, turn, or uniform scale. Rotation stays in the model, so a later resize keeps it.
+    /// Applies a move, turn, uniform scale, or a one-axis stretch.
+    /// A square becomes a rectangle when the two axes scale differently.
     func applying(_ transform: CGAffineTransform) -> FittedShape {
-        let scale = max(hypot(transform.a, transform.c), 0.001)
-        let rotation = atan2(transform.b, transform.a)
         switch self {
         case let .line(start, end):
             return .line(start.applying(transform), end.applying(transform))
         case let .circle(center, radius, handleAngle):
-            return .circle(
-                center: center.applying(transform),
-                radius: max(0.001, radius * scale),
-                handleAngle: wrappedAngle(handleAngle + rotation)
+            let scaled = axisScale(of: center, rotation: 0, by: transform)
+            let turn = atan2(transform.b, transform.a)
+            if abs(scaled.x - scaled.y) < 0.02 {
+                return .circle(
+                    center: scaled.center,
+                    radius: max(0.001, radius * scaled.x),
+                    handleAngle: wrappedAngle(handleAngle + turn)
+                )
+            }
+            return .rectangle(
+                center: scaled.center,
+                width: max(0.001, radius * 2 * scaled.x),
+                height: max(0.001, radius * 2 * scaled.y),
+                rotation: scaled.rotation
             )
         case let .square(center, side, squareRotation):
-            return .square(
-                center: center.applying(transform),
-                side: max(0.001, side * scale),
-                rotation: wrappedAngle(squareRotation + rotation)
+            let scaled = axisScale(of: center, rotation: squareRotation, by: transform)
+            if abs(scaled.x - scaled.y) < 0.02 {
+                return .square(
+                    center: scaled.center,
+                    side: max(0.001, side * scaled.x),
+                    rotation: wrappedAngle(scaled.rotation)
+                )
+            }
+            return .rectangle(
+                center: scaled.center,
+                width: max(0.001, side * scaled.x),
+                height: max(0.001, side * scaled.y),
+                rotation: wrappedAngle(scaled.rotation)
             )
         case let .rectangle(center, width, height, rectRotation):
+            let scaled = axisScale(of: center, rotation: rectRotation, by: transform)
             return .rectangle(
-                center: center.applying(transform),
-                width: max(0.001, width * scale),
-                height: max(0.001, height * scale),
-                rotation: wrappedAngle(rectRotation + rotation)
+                center: scaled.center,
+                width: max(0.001, width * scaled.x),
+                height: max(0.001, height * scaled.y),
+                rotation: wrappedAngle(scaled.rotation)
             )
         case let .curve(controls, closed):
             return .curve(controls: controls.map { $0.applying(transform) }, closed: closed)
         }
+    }
+
+    /// How `transform` scales the local axes through `center`.
+    private func axisScale(
+        of center: CGPoint,
+        rotation: CGFloat,
+        by transform: CGAffineTransform
+    ) -> (x: CGFloat, y: CGFloat, center: CGPoint, rotation: CGFloat) {
+        let xAxis = ShapeFit.rotate(CGPoint(x: 1, y: 0), by: rotation)
+        let yAxis = ShapeFit.rotate(CGPoint(x: 0, y: 1), by: rotation)
+        let moved = center.applying(transform)
+        let mappedX = CGPoint(x: center.x + xAxis.x, y: center.y + xAxis.y).applying(transform)
+        let mappedY = CGPoint(x: center.x + yAxis.x, y: center.y + yAxis.y).applying(transform)
+        let newX = CGPoint(x: mappedX.x - moved.x, y: mappedX.y - moved.y)
+        let newY = CGPoint(x: mappedY.x - moved.x, y: mappedY.y - moved.y)
+        return (
+            max(hypot(newX.x, newX.y), 0.001),
+            max(hypot(newY.x, newY.y), 0.001),
+            moved,
+            atan2(newX.y, newX.x)
+        )
     }
 
     /// Interior of a closed shape. A line and an open curve have no interior.

@@ -26,6 +26,7 @@ public final class Server {
     public func run() throws {
         signal(SIGPIPE, SIG_IGN)
         try ScreenCapturer.ensureAccess()
+        try MacPointer.ensureAccess()
         let hostName = Host.current().localizedName ?? "This Mac"
         let megabits = config.bitrate / 1_000_000
         print("""
@@ -33,6 +34,7 @@ public final class Server {
           USB    device port \(config.usbPort) through usbmuxd
           TCP    0.0.0.0:\(config.tcpPort)
           Video  H.264 \(config.fps) fps, \(megabits) Mbps, max width \(config.maxWidth)
+          AI     127.0.0.1:\(SketchIntentPorts.ai), reached through this connection
         """)
 
         hub.onNeedsKeyframe = { [capturer] in
@@ -70,9 +72,10 @@ public final class Server {
         advertiser.start(name: hostName, port: Int(config.tcpPort))
 
         scheduleOnMainQueue(every: 0.2) { [hub, ink] in
-            guard let id = DesktopSwitcher.currentLayout()?.spaceID else { return }
-            if hub.updateSpace(id) {
-                ink.noteSpace(id)
+            guard let layout = DesktopSwitcher.currentLayout() else { return }
+            hub.updateDesktops(index: layout.currentIndex, count: layout.spaceIDs.count)
+            if hub.updateSpace(layout.spaceID) {
+                ink.noteSpace(layout.spaceID)
             }
         }
 
@@ -108,7 +111,9 @@ public final class Server {
     ) {
         let session = StreamSession(fd: fd, label: label)
         print("[sketchintent] Client connected (\(label)).")
-        session.onStop = {
+        let relay = IntentRelay()
+        session.onStop = { [relay] in
+            relay.cancel()
             print("[sketchintent] Client disconnected (\(label)).")
             onDisconnect?()
         }
@@ -128,10 +133,27 @@ public final class Server {
                 pointer.postTrackpadTap(fingers: fingers, zone: zone)
             case .trackpadDrag(let dx, let dy, let phase, let fingers):
                 pointer.postTrackpadDrag(dx: dx, dy: dy, phase: phase, fingers: fingers)
+            case .trackpadMagnify(let magnification, let phase):
+                pointer.postTrackpadMagnify(magnification: magnification, phase: phase)
+            case .goToDesktop(let index):
+                DesktopSwitcher.switchDesktop(toIndex: Int(index))
             }
         }
         session.onInk = { snapshot in
             ink.show(snapshot)
+        }
+        session.onIntent = { [weak session, relay] request in
+            relay.start(request) { reply in
+                session?.offer(StreamFraming.encode(.intentReply(reply)), kind: .control)
+            }
+        }
+        session.onCancelIntent = { [relay] id in
+            relay.cancel(id)
+        }
+        session.onChooseFolder = { [weak session] current in
+            FolderPicker.choose(startingAt: current) { chosen in
+                session?.offer(StreamFraming.encode(.workingFolder(chosen)), kind: .control)
+            }
         }
         hub.add(session)
         session.start()

@@ -21,15 +21,11 @@ enum StrokeSettings {
     static let defaultWidth = 4.0
     static let minimumWidth = 1.0
     static let maximumWidth = 20.0
+    static let colorKey = "inkColor"
 
     static func clamped(_ width: Double) -> CGFloat {
         CGFloat(min(maximumWidth, max(minimumWidth, width)))
     }
-}
-
-private struct SharedSketch: Identifiable {
-    let id = UUID()
-    let image: UIImage
 }
 
 /// The Mac picture, and its pixel size, from the moment a desktop's sketch started.
@@ -42,25 +38,24 @@ private struct FrozenPicture {
 struct ContentView: View {
     @StateObject private var client = StreamClient()
     @StateObject private var sketch = SketchCanvas()
+    @StateObject private var intent = IntentClient()
     @State private var tool = SketchTool.pen
-    @State private var showsChrome = true
+    @State private var showsSidebar = false
     @State private var showsSettings = false
     @State private var showsTrackpad = false
-    @State private var sharedSketch: SharedSketch?
     @State private var desktopHint: DesktopDirection?
     @State private var hintToken = 0
     @State private var toolSelection = UISelectionFeedbackGenerator()
     @State private var frozenBySpace: [String: FrozenPicture] = [:]
+    /// Where each sent sketch sits on the canvas, by intent id, for the agent's drawing.
+    @State private var agentPlacements: [UInt32: AgentPlacement] = [:]
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
     @AppStorage(TrackpadSettings.speedKey) private var trackingSpeed = TrackpadSettings.defaultSpeed
     @AppStorage(StrokeSettings.widthKey) private var strokeWidth = StrokeSettings.defaultWidth
+    @AppStorage(StrokeSettings.colorKey) private var inkColorName = InkColor.red.rawValue
     @State private var trackingResidualX = 0.0
     @State private var trackingResidualY = 0.0
-
-    private var showsStatusChrome: Bool {
-        !canvasReady || showsChrome
-    }
 
     /// The page accepts drawing and chrome once a picture is up, and immediately in blank-canvas mode.
     private var canvasReady: Bool {
@@ -76,6 +71,7 @@ struct ContentView: View {
     /// Dictation and lasso keep the finger off the Mac. A Pencil touch never uses it.
     private var sendsFingerPointer: Bool {
         !sketch.hasInk
+            && !blankCanvas
             && tool != .voice
             && tool != .lasso
             && hasCapturedFrameSize
@@ -109,108 +105,52 @@ struct ContentView: View {
         return !client.hasFrame
     }
 
+    private var inkColor: InkColor {
+        InkColor(rawValue: inkColorName) ?? .red
+    }
+
+    private var surface: CanvasSurface {
+        blankCanvas ? .canvas : .desktop(client.desktopIndex)
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            ScreenDisplay(
-                client: client,
-                showsPicture: !blankCanvas,
-                frozenImage: shownFrozen?.image,
-                frozenWidth: shownFrozen?.width ?? 0,
-                frozenHeight: shownFrozen?.height ?? 0
-            )
-            .ignoresSafeArea()
-            .opacity(blankCanvas ? 0 : 1)
-            .accessibilityHidden(blankCanvas)
-            PencilOverlay(
-                spaceID: client.spaceID,
-                canvas: sketch,
-                tool: tool,
-                strokeWidth: StrokeSettings.clamped(strokeWidth),
-                acceptsTap: canvasReady,
-                acceptsCanvasSwipe: shownFrozen != nil && sketch.hasInk,
-                sendsFingerPointer: sendsFingerPointer,
-                frameWidth: sketchFrameWidth,
-                frameHeight: sketchFrameHeight,
-                onFingerPointer: { phase, x, y in
-                    // A finger on the picture: a tap clicks, a drag scrolls, a hold right-clicks.
-                    client.send(.pointer(phase, x: x, y: y, contact: .finger))
-                },
-                onFingerCancel: { x, y in
-                    // A second finger ends that contact. Button-up cancels it so a
-                    // three-finger swipe can switch desktops: a still finger stays
-                    // cancelled, and an open scroll or right-click finishes.
-                    client.send(.pointer(.up, x: x, y: y, contact: .button))
-                },
-                onInk: { png, width, height, spaceID in
-                    client.sendInk(png: png, width: width, height: height, spaceID: spaceID)
-                },
-                onTap: { canvasTapped() },
-                onDoubleTap: { fingerDoubleTapped() },
-                onFingerSwipe: { swipe in
-                    guard !sketch.hasInk else { return }
-                    switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
-                },
-                onToggleTool: { toggleToolFromPencil() },
-                onSketchBegan: { freezeFrameForCurrentSpace() },
-                onSketchAbandoned: { frozenBySpace[$0] = nil }
-            )
-            .ignoresSafeArea()
-            .accessibilityHidden(true)
-            if showsWaiting {
-                waiting
-                    .allowsHitTesting(!blankCanvas)
-            }
-
-            if showsStatusChrome {
-                VStack {
-                    statusBadge
-                    Spacer()
-                }
-                .padding(.leading, 20)
-                .padding(.trailing, 72)
-                .padding(.top, 12)
-                .allowsHitTesting(false)
-            }
-
-            if client.hasFrame && showsStatusChrome {
-                VStack {
-                    Spacer()
-                    HStack {
-                        Text("\(client.framesPerSecond) fps")
-                            .font(.subheadline.weight(.medium).monospacedDigit())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(.ultraThinMaterial, in: Capsule())
-                        Spacer()
+            VStack(spacing: 0) {
+                TopBar(
+                    showsSidebar: $showsSidebar,
+                    workingFolder: client.workingFolder,
+                    isChoosingFolder: client.isChoosingFolder,
+                    isConnected: client.isConnected,
+                    surface: surface,
+                    desktopCount: client.desktopCount,
+                    canSend: sketch.hasInk && !intent.isSending,
+                    isSending: intent.isSending,
+                    onChooseFolder: { client.requestWorkingFolder() },
+                    onClearFolder: { client.clearWorkingFolder() },
+                    onSurface: selectSurface,
+                    onSend: sendSketch,
+                    onStop: stopAgent,
+                    onSettings: { showsSettings = true }
+                )
+                HStack(spacing: 0) {
+                    if showsSidebar {
+                        AgentSidebar(turns: intent.turns, isSending: intent.isSending, onStop: stopAgent)
+                    }
+                    VStack(spacing: 0) {
+                        stage
+                        BottomBar(
+                            tool: tool,
+                            inkColor: inkColor,
+                            canClear: sketch.hasInk || shownFrozen != nil,
+                            onTool: chooseTool,
+                            onColor: { inkColorName = $0.rawValue },
+                            onClear: clearSketch
+                        )
                     }
                 }
-                .padding(.leading, 20)
-                .padding(.bottom, 16)
-                .allowsHitTesting(false)
             }
-
-            if sketch.hasInk || shownFrozen != nil {
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button(action: clearSketch) {
-                            Image(systemName: "trash")
-                                .symbolRenderingMode(.monochrome)
-                                .font(.system(size: 20, weight: .medium))
-                                .imageScale(.medium)
-                                .foregroundStyle(.white)
-                                .frame(width: 44, height: 44)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                        .accessibilityLabel("Clear sketch")
-                    }
-                    Spacer()
-                }
-                .padding(.top, 10)
-                .padding(.trailing, showsStatusChrome ? 74 : 20)
-            }
+            .ignoresSafeArea()
 
             if showsTrackpad && canvasReady {
                 VirtualTrackpad(
@@ -233,49 +173,38 @@ struct ContentView: View {
                     onSwipe: { swipe in
                         guard !sketch.hasInk else { return }
                         switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
+                    },
+                    onMagnify: { factor, phase in
+                        client.send(.trackpadMagnify(magnification: macMagnification(factor), phase: phase))
                     }
                 )
                 .ignoresSafeArea()
                 .transition(.opacity)
             }
-
-            if let desktopHint {
-                Image(systemName: desktopHint == .left ? "chevron.left" : "chevron.right")
-                    .symbolRenderingMode(.monochrome)
-                    .font(.system(size: 64, weight: .medium))
-                    .imageScale(.medium)
-                    .foregroundStyle(.white.opacity(0.85))
-                    .accessibilityHidden(true)
-                    .padding(28)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
-
-            MarkupChrome(
-                showsTools: canvasReady,
-                showsGear: showsStatusChrome,
-                tool: tool,
-                canSend: sketch.hasInk,
-                onTool: { tool = $0 },
-                onSend: sendSketch,
-                onSettings: { showsSettings = true }
-            )
-            .ignoresSafeArea()
         }
         .preferredColorScheme(.dark)
-        .statusBarHidden(canvasReady && !showsChrome)
-        .persistentSystemOverlays(canvasReady && !showsChrome ? .hidden : .visible)
+        .statusBarHidden(true)
+        .persistentSystemOverlays(canvasReady ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.18), value: desktopHint)
         .animation(.easeOut(duration: 0.16), value: showsTrackpad)
         .sheet(isPresented: $showsSettings) {
-            SettingsSheet()
-        }
-        .sheet(item: $sharedSketch) { sketch in
-            ActivityView(image: sketch.image)
+            SettingsSheet(client: client)
         }
         .onAppear {
             client.start()
+            client.onIntentReply = { reply in
+                if reply.kind == .canvas {
+                    showAgentRender(reply)
+                    return
+                }
+                if reply.kind == .done || reply.kind == .error {
+                    agentPlacements[reply.id] = nil
+                }
+                if intent.apply(reply), sketch.clearSentSketch() {
+                    frozenBySpace[client.spaceID ?? ""] = nil
+                    frozenBySpace[""] = nil
+                }
+            }
             toolSelection.prepare()
             updateIdleTimer()
         }
@@ -307,25 +236,147 @@ struct ContentView: View {
         }
     }
 
+    /// The Mac picture, or the dotted canvas, between the two bars. Ink sits on top of either.
+    /// The canvas keeps its own sketch and never draws on the Mac.
+    private var stage: some View {
+        ZStack {
+            if blankCanvas {
+                DotCanvas()
+            }
+            ScreenDisplay(
+                client: client,
+                liveWidth: client.frameWidth,
+                liveHeight: client.frameHeight,
+                showsPicture: !blankCanvas,
+                frozenImage: shownFrozen?.image,
+                frozenWidth: shownFrozen?.width ?? 0,
+                frozenHeight: shownFrozen?.height ?? 0
+            )
+            .opacity(blankCanvas ? 0 : 1)
+            .accessibilityHidden(blankCanvas)
+            PencilOverlay(
+                spaceID: blankCanvas ? Self.canvasSketchID : client.spaceID,
+                canvas: sketch,
+                tool: tool,
+                strokeWidth: StrokeSettings.clamped(strokeWidth),
+                inkColor: inkColor.color,
+                outlinesInk: blankCanvas,
+                acceptsTap: canvasReady,
+                acceptsCanvasSwipe: shownFrozen != nil && sketch.hasInk,
+                sendsFingerPointer: sendsFingerPointer,
+                frameWidth: blankCanvas ? 0 : sketchFrameWidth,
+                frameHeight: blankCanvas ? 0 : sketchFrameHeight,
+                onFingerPointer: { phase, x, y in
+                    // A finger on the picture: a tap clicks, a drag scrolls, a hold right-clicks.
+                    client.send(.pointer(phase, x: x, y: y, contact: .finger))
+                },
+                onFingerCancel: { x, y in
+                    // A second finger ends that contact. Button-up cancels it so a
+                    // three-finger swipe can switch desktops: a still finger stays
+                    // cancelled, and an open scroll or right-click finishes.
+                    client.send(.pointer(.up, x: x, y: y, contact: .button))
+                },
+                onInk: { png, width, height, spaceID in
+                    client.sendInk(png: png, width: width, height: height, spaceID: spaceID)
+                },
+                onTap: { canvasTapped() },
+                onDoubleTap: { fingerDoubleTapped() },
+                onFingerSwipe: { swipe in
+                    guard !sketch.hasInk else { return }
+                    switchDesktop(desktopDirection(for: swipe, natural: naturalSwiping))
+                },
+                onFingerPinch: { factor, phase in
+                    client.send(.trackpadMagnify(magnification: macMagnification(factor), phase: phase))
+                },
+                onToggleTool: { toggleToolFromPencil() },
+                onSketchBegan: { freezeFrameForCurrentSpace() },
+                onSketchAbandoned: { frozenBySpace[$0] = nil }
+            )
+            .accessibilityHidden(true)
+            if showsWaiting {
+                waiting
+                    .allowsHitTesting(!blankCanvas)
+            }
+            if let desktopHint {
+                Image(systemName: desktopHint == .left ? "chevron.left" : "chevron.right")
+                    .symbolRenderingMode(.monochrome)
+                    .font(.system(size: 64, weight: .medium))
+                    .imageScale(.medium)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .accessibilityHidden(true)
+                    .padding(28)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Sketch key for the dotted canvas. Mac desktops use their Mission Control id.
+    private static let canvasSketchID = "canvas"
+
     private func updateIdleTimer() {
         UIApplication.shared.isIdleTimerDisabled = client.hasFrame || blankCanvas
     }
 
     private func sendSketch() {
-        guard let image = sketch.snapshot() else { return }
-        sharedSketch = SharedSketch(image: image)
+        guard !intent.isSending, let sketch = sketch.intentSketch(screen: screenForIntent()) else { return }
+        showsSidebar = true
+        guard client.isConnected else {
+            intent.fail("The Mac isn't connected")
+            return
+        }
+        let request = intent.begin(sketch, folder: client.workingFolder)
+        agentPlacements = [request.id: sketch.placement]
+        if client.sendIntent(request) {
+            self.sketch.markSent()
+        } else {
+            intent.fail("The sketch is too large to send")
+        }
     }
 
-    /// One-finger tap. Shows or hides the status badge. While the trackpad is up,
-    /// that tap only dismisses the trackpad. The finger's pointer packets follow
-    /// the touch. This toggle waits until a double-tap has failed. A double-tap
-    /// shows the trackpad.
+    /// An image from the agent's show_image tool, for a sketch it is still working on.
+    private func showAgentRender(_ reply: IntentReply) {
+        guard intent.isWorking(on: reply.id),
+              let placement = agentPlacements[reply.id],
+              let data = reply.text.data(using: .utf8),
+              let render = try? JSONDecoder().decode(AgentRender.self, from: data) else { return }
+        sketch.showAgentRender(render, placement: placement)
+    }
+
+    /// Stops the agent on the iPad and on the Mac.
+    private func stopAgent() {
+        guard let id = intent.stop() else { return }
+        client.cancelIntent(id)
+    }
+
+    /// Canvas shows the dotted page. A space shows that Mac desktop, and opens it on the Mac.
+    private func selectSurface(_ next: CanvasSurface) {
+        switch next {
+        case .canvas:
+            blankCanvas = true
+        case .desktop(let index):
+            blankCanvas = false
+            guard index >= 0, index != client.desktopIndex, index <= Int(UInt8.max) else { return }
+            client.send(.goToDesktop(index: UInt8(index)))
+        }
+    }
+
+    private func chooseTool(_ next: SketchTool) {
+        guard next != tool else { return }
+        toolSelection.selectionChanged()
+        toolSelection.prepare()
+        tool = next
+    }
+
+    /// One-finger tap. While the trackpad is up, that tap dismisses it. The finger's
+    /// pointer packets follow the touch. This waits until a double-tap has failed.
+    /// A double-tap shows the trackpad.
     private func canvasTapped() {
         if showsTrackpad {
             showsTrackpad = false
-            return
         }
-        showsChrome.toggle()
     }
 
     /// Removes this desktop's sketch and returns the picture to the live Mac frame.
@@ -334,6 +385,20 @@ struct ContentView: View {
         frozenBySpace[client.spaceID ?? ""] = nil
         frozenBySpace[""] = nil
     }
+    /// The Mac picture under the ink. A sketch freezes that picture when the first stroke starts.
+    /// Sending again captures it if that freeze missed.
+    private func screenForIntent() -> UIImage? {
+        guard !blankCanvas else { return nil }
+        if let image = shownFrozen?.image { return image }
+        guard let captured = client.captureDisplayedFrame() else { return nil }
+        frozenBySpace[client.spaceID ?? ""] = FrozenPicture(
+            image: captured.image,
+            width: captured.width,
+            height: captured.height
+        )
+        return captured.image
+    }
+
     private func freezeFrameForCurrentSpace() {
         guard !blankCanvas, client.hasFrame else { return }
         let key = client.spaceID ?? ""
@@ -354,6 +419,12 @@ struct ContentView: View {
         toolSelection.selectionChanged()
         toolSelection.prepare()
         tool = tool.nextOnDial
+    }
+
+    /// Separation ratio since the last sample, as the wire's ten-thousandths. 1 is no change.
+    private func macMagnification(_ factor: CGFloat) -> Int16 {
+        guard factor.isFinite, factor > 0 else { return 0 }
+        return Int16(clamping: Int(((factor - 1) * 10_000).rounded()))
     }
 
     /// Leftover fraction so a slow tracking speed still moves the pointer.
@@ -412,20 +483,11 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: 460, alignment: .leading)
-        }
-        .padding(32)
-    }
-
-    private var statusBadge: some View {
-        HStack {
             Text(client.badge)
                 .font(.subheadline.weight(.medium).monospacedDigit())
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(.ultraThinMaterial, in: Capsule())
-            Spacer()
+                .foregroundStyle(.white.opacity(0.6))
         }
+        .padding(32)
     }
 
     private var instructions: [String] {
@@ -448,16 +510,45 @@ struct ContentView: View {
 }
 
 private struct SettingsSheet: View {
+    @ObservedObject var client: StreamClient
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(TrackpadSettings.speedKey) private var trackingSpeed = TrackpadSettings.defaultSpeed
-    @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
     @AppStorage(StrokeSettings.widthKey) private var strokeWidth = StrokeSettings.defaultWidth
     @AppStorage(CartesiaSettings.key) private var cartesiaAPIKey = ""
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Button {
+                        client.requestWorkingFolder()
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Working folder")
+                                Text(client.workingFolder.isEmpty ? "Not chosen" : client.workingFolder)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            Spacer()
+                            if client.isChoosingFolder {
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(!client.isConnected || client.isChoosingFolder)
+                    if !client.workingFolder.isEmpty {
+                        Button("Clear folder", role: .destructive) {
+                            client.clearWorkingFolder()
+                        }
+                    }
+                } footer: {
+                    Text(client.isConnected
+                        ? "Opens a folder panel on the Mac. The agent works in that folder."
+                        : "Connect to the Mac to choose the folder the agent works in.")
+                }
                 Section {
                     Slider(
                         value: $strokeWidth,
@@ -502,11 +593,6 @@ private struct SettingsSheet: View {
                     Text("Scales pointer movement, scrolling, and three-finger drag on the virtual trackpad. The Mac's tracking speed still applies.")
                 }
                 Section {
-                    Toggle("Blank canvas", isOn: $blankCanvas)
-                } footer: {
-                    Text(blankCanvasDetail)
-                }
-                Section {
                     SecureField("Cartesia API key", text: $cartesiaAPIKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -545,21 +631,4 @@ private struct SettingsSheet: View {
         }
         return "Off, swiping is inverted. A three-finger swipe left opens the desktop on the left, and a swipe right opens the desktop on the right."
     }
-
-    private var blankCanvasDetail: String {
-        if blankCanvas {
-            return "On, the page is black and the Mac picture stays hidden. Drawing, voice notes, and desktop swipes keep working while the connection stays up."
-        }
-        return "Off, the live Mac screen shows here."
-    }
-}
-
-private struct ActivityView: UIViewControllerRepresentable {
-    let image: UIImage
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [image], applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

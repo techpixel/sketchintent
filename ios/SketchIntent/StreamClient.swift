@@ -12,8 +12,16 @@ final class StreamClient: ObservableObject {
     @Published var frameHeight = 0
     /// Mission Control id of the desktop on screen. Sketches are stored under this.
     @Published var spaceID: String?
+    /// Zero-based position of that desktop in Mission Control, or -1 when unknown.
+    @Published private(set) var desktopIndex = -1
+    /// Desktops on the streamed display. Zero until the Mac reports them.
+    @Published private(set) var desktopCount = 0
     /// True once the socket to the Mac is ready. Blank canvas uses this before any picture arrives.
     @Published var isConnected = false
+    /// Absolute path on the Mac where the agent works. Empty until one is chosen.
+    @Published private(set) var workingFolder = UserDefaults.standard.string(forKey: StreamClient.folderKey) ?? ""
+    /// True while the Mac folder panel is open.
+    @Published private(set) var isChoosingFolder = false
     #if targetEnvironment(simulator)
     @Published var badge = "Looking for SketchIntent Server"
     #else
@@ -79,6 +87,52 @@ final class StreamClient: ObservableObject {
             guard let self, let connection = self.connection, self.connectionWasReady else { return }
             connection.send(content: packet, completion: .contentProcessed { _ in })
         }
+    }
+
+    /// The sketch travels on the socket the Mac already opened, USB included.
+    /// False when that socket is down or the packet would exceed the frame limit.
+    func sendIntent(_ request: IntentRequest) -> Bool {
+        let packet = StreamFraming.encode(.intent(request))
+        guard packet.count <= 4 + StreamFraming.maxPayloadLength else { return false }
+        var sent = false
+        queue.sync {
+            guard connectionWasReady, let connection else { return }
+            sent = true
+            connection.send(content: packet, completion: .contentProcessed { _ in })
+        }
+        return sent
+    }
+
+    var onIntentReply: ((IntentReply) -> Void)?
+
+    /// Asks the Mac to stop the agent working on `id`.
+    func cancelIntent(_ id: UInt32) {
+        let packet = StreamFraming.encode(.cancelIntent(id))
+        queue.async { [weak self] in
+            guard let self, let connection = self.connection, self.connectionWasReady else { return }
+            connection.send(content: packet, completion: .contentProcessed { _ in })
+        }
+    }
+
+    private static let folderKey = "agentWorkingFolder"
+
+    /// Asks the Mac to open a folder panel. The current folder, if any, is where the panel starts.
+    func requestWorkingFolder() {
+        guard isConnected, !isChoosingFolder else { return }
+        isChoosingFolder = true
+        let packet = StreamFraming.encode(.chooseFolder(workingFolder))
+        queue.async { [weak self] in
+            guard let self, let connection = self.connection, self.connectionWasReady else {
+                DispatchQueue.main.async { self?.isChoosingFolder = false }
+                return
+            }
+            connection.send(content: packet, completion: .contentProcessed { _ in })
+        }
+    }
+
+    func clearWorkingFolder() {
+        workingFolder = ""
+        UserDefaults.standard.removeObject(forKey: Self.folderKey)
     }
 
     /// Latest pen-ink PNG for the active desktop. An empty PNG clears the Mac overlay.
@@ -227,9 +281,19 @@ final class StreamClient: ObservableObject {
         }
         DispatchQueue.main.async {
             self.isConnected = false
+            self.isChoosingFolder = false
+            self.desktopIndex = -1
+            self.desktopCount = 0
             self.isLive = false
             self.updateBadge()
         }
+    }
+
+    private func applyWorkingFolder(_ path: String) {
+        isChoosingFolder = false
+        guard path.hasPrefix("/") else { return }
+        workingFolder = path
+        UserDefaults.standard.set(path, forKey: Self.folderKey)
     }
 
     private func setConnected(_ connected: Bool) {
@@ -284,7 +348,21 @@ final class StreamClient: ObservableObject {
                 noteFrame()
             case .space(let id):
                 announcedSpace = id
-            case .heartbeat, .input, .ink:
+            case .intentReply(let reply):
+                let handler = onIntentReply
+                DispatchQueue.main.async {
+                    handler?(reply)
+                }
+            case .workingFolder(let path):
+                DispatchQueue.main.async {
+                    self.applyWorkingFolder(path)
+                }
+            case .desktops(let index, let count):
+                DispatchQueue.main.async {
+                    if self.desktopIndex != index { self.desktopIndex = index }
+                    if self.desktopCount != count { self.desktopCount = count }
+                }
+            case .heartbeat, .input, .ink, .intent, .chooseFolder, .cancelIntent:
                 break
             }
         }

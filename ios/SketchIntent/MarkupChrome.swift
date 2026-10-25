@@ -1,392 +1,441 @@
 import SwiftUI
 import UIKit
 
-/// Floating markup controls. The send tab hangs from the top edge. The tool
-/// slider is attached to the right edge. Empty space falls through to the canvas.
-struct MarkupChrome: UIViewControllerRepresentable {
-    var showsTools: Bool
-    var showsGear: Bool
-    var tool: SketchTool
+/// Spacing from the "ui v2" frames, Figma 48:695, 53:884, 55:947, and 55:981.
+enum ChromeMetrics {
+    static let topBarHeight: CGFloat = 69
+    static let bottomBarHeight: CGFloat = 68
+    static let sidebarWidth: CGFloat = 320
+    static let edgeInset: CGFloat = 16
+    static let pillHeight: CGFloat = 33
+    static let pillCornerRadius: CGFloat = 8
+    static let buttonCornerRadius: CGFloat = 16
+    static let sendWidth: CGFloat = 200
+    static let toolWidth: CGFloat = 50
+    static let toolCornerRadius: CGFloat = 8
+    static let toolGap: CGFloat = 8
+    /// The color swatches sit 20pt from the right edge.
+    static let swatchTrailing: CGFloat = 20
+    static let swatchSide: CGFloat = 38
+    static let swatchDot: CGFloat = 28
+    static let swatchGap: CGFloat = 9
+    static let canvasCornerRadius: CGFloat = 16
+    static let dotSpacing: CGFloat = 24
+    static let dotDiameter: CGFloat = 4
+    static let dotInset: CGFloat = 9
+}
+
+private extension Color {
+    static let agentYellow = Color("AgentYellow")
+    static let agentBlue = Color("AgentBlue")
+    static let chromePill = Color("ChromePill")
+    static let chromeButton = Color("ChromeButton")
+    static let toolSelected = Color("ToolSelected")
+    static let canvasLine = Color("CanvasLine")
+}
+
+/// What the middle of the screen shows: the dotted canvas, or one Mac desktop.
+enum CanvasSurface: Hashable {
+    case canvas
+    /// Zero-based position in Mission Control.
+    case desktop(Int)
+}
+
+/// Sidebar toggle, working folder, desktop picker, send, and settings. Figma 51:823.
+struct TopBar: View {
+    @Binding var showsSidebar: Bool
+    var workingFolder: String
+    var isChoosingFolder: Bool
+    var isConnected: Bool
+    var surface: CanvasSurface
+    var desktopCount: Int
     var canSend: Bool
-    var onTool: (SketchTool) -> Void
+    var isSending: Bool
+    var onChooseFolder: () -> Void
+    var onClearFolder: () -> Void
+    var onSurface: (CanvasSurface) -> Void
     var onSend: () -> Void
+    var onStop: () -> Void
     var onSettings: () -> Void
 
-    func makeUIViewController(context: Context) -> MarkupChromeController {
-        let controller = MarkupChromeController()
-        controller.onTool = onTool
-        controller.onSend = onSend
-        controller.onSettings = onSettings
-        return controller
-    }
-
-    func updateUIViewController(_ controller: MarkupChromeController, context: Context) {
-        controller.onTool = onTool
-        controller.onSend = onSend
-        controller.onSettings = onSettings
-        controller.showsTools = showsTools
-        controller.showsGear = showsGear
-        controller.tool = tool
-        controller.canSend = canSend
-        controller.reload()
-    }
-}
-
-/// Spacing shared by the send tab (Figma 28:356) and the tool slider (Figma 28:326).
-private enum ChromeMetrics {
-    /// `rounded-bl` / `rounded-br` of 16 on the send tab. The slider uses the same radius on its free corners.
-    static let cornerRadius: CGFloat = 16
-    static let sendWidth: CGFloat = 200
-    static let sendHeight: CGFloat = 49
-    static let sliderWidth: CGFloat = 60
-    /// Node 28:326 is 385pt tall with 8pt padding and 10pt gaps around three equal segments.
-    static let sliderLength: CGFloat = 385
-    static let sliderPadding: CGFloat = 8
-    static let sliderGap: CGFloat = 10
-    static let segmentCornerRadius: CGFloat = 8
-    static let segmentLength: CGFloat = (sliderLength - sliderPadding * 2 - sliderGap * 2) / 3
-    /// Selected tool chip from node 28:340. Not a system token.
-    static let selectedFill = UIColor(red: 0, green: 113 / 255, blue: 227 / 255, alpha: 0.4)
-}
-
-/// Medium weight and medium scale for every chrome symbol.
-private func chromeSymbolConfiguration(pointSize: CGFloat) -> UIImage.SymbolConfiguration {
-    UIImage.SymbolConfiguration(pointSize: pointSize, weight: .medium, scale: .medium)
-}
-
-final class MarkupChromeController: UIViewController {
-    var showsTools = false
-    var showsGear = false
-    var tool = SketchTool.pen
-    var canSend = false
-    var onTool: (SketchTool) -> Void = { _ in }
-    var onSend: () -> Void = {}
-    var onSettings: () -> Void = {}
-
-    private let toolSlider = ToolSliderView()
-    private let sendButton = UIButton(type: .system)
-    private let sendPlate = GlassTab(roundedCorners: [.bottomLeft, .bottomRight])
-    private let gearButton = UIButton(type: .system)
-    private let gearPlate = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
-    private let selection = UISelectionFeedbackGenerator()
-
-    override func loadView() {
-        view = PassthroughHost()
-        view.backgroundColor = .clear
-    }
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        toolSlider.onSelect = { [weak self] tool in
-            self?.choose(tool)
-        }
-        view.addSubview(toolSlider)
-
-        sendPlate.isUserInteractionEnabled = true
-        style(
-            sendButton,
-            symbol: "arrow.up",
-            pointSize: 22,
-            contentInsets: NSDirectionalEdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8)
-        )
-        sendButton.accessibilityLabel = "Send sketch"
-        sendButton.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
-        sendPlate.addSubview(sendButton)
-        view.addSubview(sendPlate)
-
-        configure(gearPlate, radius: 22)
-        style(gearButton, symbol: "gearshape", pointSize: 20)
-        gearButton.accessibilityLabel = "Settings"
-        gearButton.addTarget(self, action: #selector(settingsTapped), for: .touchUpInside)
-        gearPlate.contentView.addSubview(gearButton)
-        view.addSubview(gearPlate)
-
-        selection.prepare()
-        toolSlider.setSelected(tool)
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        let safe = view.safeAreaInsets
-        let bounds = view.bounds
-
-        sendPlate.frame = CGRect(
-            x: (bounds.width - ChromeMetrics.sendWidth) / 2,
-            y: 0,
-            width: ChromeMetrics.sendWidth,
-            height: ChromeMetrics.sendHeight
-        )
-        sendButton.frame = sendPlate.bounds
-
-        let sliderHeight = ToolSliderView.preferredHeight
-        var sliderY = (bounds.height - sliderHeight) / 2
-        let gearBottom = safe.top + 10 + 44
-        if sliderY < gearBottom + 12 {
-            sliderY = min(gearBottom + 12, max(0, bounds.height - sliderHeight))
-        }
-        toolSlider.frame = CGRect(
-            x: bounds.width - ChromeMetrics.sliderWidth,
-            y: max(0, sliderY),
-            width: ChromeMetrics.sliderWidth,
-            height: sliderHeight
-        )
-
-        let gearSide: CGFloat = 44
-        gearPlate.frame = CGRect(
-            x: bounds.width - safe.right - 20 - gearSide,
-            y: safe.top + 10,
-            width: gearSide,
-            height: gearSide
-        )
-        gearButton.frame = gearPlate.bounds
-    }
-
-    func reload() {
-        guard isViewLoaded else { return }
-        let toolsVisible = showsTools
-        sendPlate.isHidden = !toolsVisible
-        toolSlider.isHidden = !toolsVisible
-        gearPlate.isHidden = !showsGear
-        sendButton.isEnabled = canSend
-        sendPlate.alpha = canSend ? 1 : 0.4
-        toolSlider.setSelected(tool)
-    }
-
-    private func configure(_ plate: UIVisualEffectView, radius: CGFloat) {
-        plate.clipsToBounds = true
-        plate.layer.cornerCurve = .continuous
-        plate.layer.cornerRadius = radius
-        plate.isUserInteractionEnabled = true
-    }
-
-    private func style(
-        _ button: UIButton,
-        symbol: String,
-        pointSize: CGFloat,
-        contentInsets: NSDirectionalEdgeInsets = .zero
-    ) {
-        let symbolConfiguration = chromeSymbolConfiguration(pointSize: pointSize)
-        var configuration = UIButton.Configuration.plain()
-        configuration.image = UIImage(systemName: symbol, withConfiguration: symbolConfiguration)
-        configuration.preferredSymbolConfigurationForImage = symbolConfiguration
-        configuration.baseForegroundColor = .white
-        configuration.contentInsets = contentInsets
-        configuration.background.cornerRadius = 18
-        button.configuration = configuration
-    }
-
-    private func choose(_ next: SketchTool) {
-        guard tool != next else { return }
-        selection.selectionChanged()
-        selection.prepare()
-        tool = next
-        toolSlider.setSelected(next)
-        onTool(next)
-    }
-
-    @objc private func sendTapped() {
-        guard canSend else { return }
-        onSend()
-    }
-
-    @objc private func settingsTapped() {
-        onSettings()
-    }
-}
-
-/// Glass tab. Only `roundedCorners` are curved; the edge that sits on the screen stays square.
-private class GlassTab: UIView {
-    var roundedCorners: UIRectCorner {
-        didSet { setNeedsLayout() }
-    }
-
-    private let plate = LiquidGlassPlate()
-
-    init(roundedCorners: UIRectCorner) {
-        self.roundedCorners = roundedCorners
-        super.init(frame: .zero)
-        isOpaque = false
-        backgroundColor = .clear
-        plate.roundedCorners = roundedCorners
-        plate.cornerRadius = ChromeMetrics.cornerRadius
-        addSubview(plate)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        plate.frame = bounds
-        plate.roundedCorners = roundedCorners
-        plate.cornerRadius = ChromeMetrics.cornerRadius
-    }
-
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        bounds.contains(point)
-    }
-}
-
-/// Vertical tool control flush with the right edge. A vertical swipe steps the
-/// tool. A tap selects the segment under the finger.
-private final class ToolSliderView: GlassTab, UIGestureRecognizerDelegate {
-    static var preferredHeight: CGFloat {
-        let count = CGFloat(SketchTool.edgeOrder.count)
-        guard count > 0 else { return 0 }
-        return ChromeMetrics.sliderPadding * 2
-            + ChromeMetrics.segmentLength * count
-            + ChromeMetrics.sliderGap * max(0, count - 1)
-    }
-
-    private(set) var selectedTool = SketchTool.pen
-    var onSelect: ((SketchTool) -> Void)?
-    private var panMovedTool = false
-    private var highlights: [SketchTool: UIView] = [:]
-    private var buttons: [SketchTool: ToolSegmentControl] = [:]
-
-    init() {
-        super.init(roundedCorners: [.topLeft, .bottomLeft])
-        isAccessibilityElement = false
-        for tool in SketchTool.edgeOrder {
-            let highlight = UIView()
-            highlight.isUserInteractionEnabled = false
-            highlight.layer.cornerRadius = ChromeMetrics.segmentCornerRadius
-            highlight.backgroundColor = .clear
-            addSubview(highlight)
-            highlights[tool] = highlight
-
-            let button = ToolSegmentControl(type: .system)
-            button.isUserInteractionEnabled = false
-            button.accessibilityLabel = tool.accessibilityName
-            button.onActivate = { [weak self] in
-                self?.onSelect?(tool)
+    var body: some View {
+        ZStack {
+            HStack(spacing: 16) {
+                sidebarToggle
+                HStack(spacing: 8) {
+                    folderMenu
+                    surfaceMenu
+                }
+                Spacer(minLength: ChromeMetrics.sendWidth + 32)
+                Button(action: onSettings) {
+                    Image(systemName: "gear")
+                        .font(.title2)
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .accessibilityLabel("Settings")
             }
-            let symbolConfiguration = chromeSymbolConfiguration(pointSize: 22)
-            var configuration = UIButton.Configuration.plain()
-            configuration.image = UIImage(systemName: tool.symbolName, withConfiguration: symbolConfiguration)
-            configuration.preferredSymbolConfigurationForImage = symbolConfiguration
-            configuration.baseForegroundColor = .white
-            button.configuration = configuration
-            buttons[tool] = button
-            addSubview(button)
+            sendButton
         }
-        accessibilityElements = SketchTool.edgeOrder.compactMap { buttons[$0] }
-
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
-        pan.maximumNumberOfTouches = 1
-        pan.delegate = self
-        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
-        tap.require(toFail: pan)
-        addGestureRecognizer(pan)
-        addGestureRecognizer(tap)
-        setSelected(selectedTool)
+        .padding(.horizontal, ChromeMetrics.edgeInset)
+        .frame(height: ChromeMetrics.topBarHeight)
     }
 
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let segmentWidth = bounds.width - ChromeMetrics.sliderPadding * 2
-        var y = ChromeMetrics.sliderPadding
-        for tool in SketchTool.edgeOrder {
-            let frame = CGRect(x: ChromeMetrics.sliderPadding, y: y, width: segmentWidth, height: ChromeMetrics.segmentLength)
-            highlights[tool]?.frame = frame
-            buttons[tool]?.frame = frame
-            y += ChromeMetrics.segmentLength + ChromeMetrics.sliderGap
+    private var sidebarToggle: some View {
+        Button {
+            showsSidebar.toggle()
+        } label: {
+            Image(systemName: "sidebar.leading")
+                .font(.title2)
+                .foregroundStyle(showsSidebar ? Color.black : Color.white)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 8)
+                .background(
+                    showsSidebar ? Color.white : Color.clear,
+                    in: RoundedRectangle(cornerRadius: ChromeMetrics.toolCornerRadius, style: .continuous)
+                )
         }
+        .accessibilityLabel("Agent")
+        .accessibilityAddTraits(showsSidebar ? .isSelected : [])
     }
 
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard isUserInteractionEnabled, !isHidden, alpha > 0.01, bounds.contains(point) else { return nil }
-        return self
-    }
-
-    func setSelected(_ tool: SketchTool) {
-        selectedTool = tool
-        for (candidate, highlight) in highlights {
-            highlight.backgroundColor = candidate == tool ? ChromeMetrics.selectedFill : .clear
-        }
-        for (candidate, button) in buttons {
-            button.accessibilityTraits = candidate == tool ? [.button, .selected] : .button
-        }
-    }
-
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        false
-    }
-
-    private func tool(at point: CGPoint) -> SketchTool? {
-        let tools = SketchTool.edgeOrder
-        guard bounds.contains(point), !tools.isEmpty else { return nil }
-        let stride = ChromeMetrics.segmentLength + ChromeMetrics.sliderGap
-        let local = point.y - ChromeMetrics.sliderPadding
-        var best = tools[0]
-        var bestDistance = CGFloat.greatestFiniteMagnitude
-        for (index, tool) in tools.enumerated() {
-            let mid = CGFloat(index) * stride + ChromeMetrics.segmentLength / 2
-            let distance = abs(local - mid)
-            if distance < bestDistance {
-                bestDistance = distance
-                best = tool
+    private var folderMenu: some View {
+        Menu {
+            Button("Choose Folder on Mac…", systemImage: "folder") {
+                onChooseFolder()
+            }
+            .disabled(!isConnected || isChoosingFolder)
+            if !workingFolder.isEmpty {
+                Button("Clear Folder", systemImage: "xmark", role: .destructive) {
+                    onClearFolder()
+                }
+            }
+        } label: {
+            ChromePill {
+                HStack(spacing: 4) {
+                    if isChoosingFolder {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "folder")
+                    }
+                    Text(folderName)
+                        .lineLimit(1)
+                }
             }
         }
-        return best
+        .accessibilityLabel("Working folder")
+        .accessibilityValue(workingFolder.isEmpty ? "Not chosen" : workingFolder)
     }
 
-    private func step(down: Bool) {
-        let tools = SketchTool.edgeOrder
-        guard !tools.isEmpty else { return }
-        guard let index = tools.firstIndex(of: selectedTool) else {
-            onSelect?(down ? tools[0] : tools[tools.count - 1])
-            return
-        }
-        let nextIndex = down
-            ? (index + 1) % tools.count
-            : (index - 1 + tools.count) % tools.count
-        onSelect?(tools[nextIndex])
+    private var folderName: String {
+        guard !workingFolder.isEmpty else { return "No folder" }
+        let name = (workingFolder as NSString).lastPathComponent
+        return name.isEmpty ? workingFolder : name
     }
 
-    @objc private func tapped(_ gesture: UITapGestureRecognizer) {
-        guard gesture.state == .ended, let tool = tool(at: gesture.location(in: self)) else { return }
-        onSelect?(tool)
-    }
-
-    @objc private func panned(_ gesture: UIPanGestureRecognizer) {
-        let point = gesture.location(in: self)
-        switch gesture.state {
-        case .began:
-            panMovedTool = false
-        case .changed:
-            guard let tool = tool(at: point), tool != selectedTool else { return }
-            panMovedTool = true
-            onSelect?(tool)
-        case .ended, .cancelled:
-            let translation = gesture.translation(in: self)
-            if !panMovedTool, abs(translation.y) >= 36, abs(translation.y) > abs(translation.x) {
-                step(down: translation.y > 0)
+    private var surfaceMenu: some View {
+        Menu {
+            Picker("Show", selection: Binding(get: { surface }, set: onSurface)) {
+                Text("Canvas").tag(CanvasSurface.canvas)
+                ForEach(0..<desktopCount, id: \.self) { index in
+                    Text("Space \(index + 1)").tag(CanvasSurface.desktop(index))
+                }
             }
-        default:
-            break
+            .pickerStyle(.inline)
+        } label: {
+            ChromePill {
+                Text(surfaceName)
+                    .lineLimit(1)
+            }
+        }
+        .accessibilityLabel("Canvas or desktop")
+        .accessibilityValue(surfaceName)
+    }
+
+    private var surfaceName: String {
+        switch surface {
+        case .canvas:
+            return "Canvas"
+        case .desktop(let index):
+            return index >= 0 ? "Space \(index + 1)" : "Space"
+        }
+    }
+
+    /// Yellow arrow while there is a sketch to send. Pause stops the agent while it works.
+    private var sendButton: some View {
+        Button(action: isSending ? onStop : onSend) {
+            Image(systemName: isSending ? "pause.fill" : "arrow.up")
+                .font(.title2.weight(.medium))
+                .foregroundStyle(isSending ? Color.white : Color.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .frame(width: ChromeMetrics.sendWidth)
+                .background(
+                    isSending ? Color.chromeButton : Color.agentYellow,
+                    in: RoundedRectangle(cornerRadius: ChromeMetrics.buttonCornerRadius, style: .continuous)
+                )
+        }
+        .disabled(!isSending && !canSend)
+        .opacity(isSending || canSend ? 1 : 0.4)
+        .accessibilityLabel(isSending ? "Stop agent" : "Send to AI")
+    }
+}
+
+/// Grey pill with a trailing chevron. Figma 53:907.
+private struct ChromePill<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: 12) {
+            content
+            Image(systemName: "chevron.down")
+                .font(.footnote.weight(.semibold))
+        }
+        .font(.callout)
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .frame(height: ChromeMetrics.pillHeight)
+        .background(Color.chromePill, in: RoundedRectangle(cornerRadius: ChromeMetrics.pillCornerRadius, style: .continuous))
+    }
+}
+
+/// Tools on the left, ink colors on the right. Figma 48:732.
+struct BottomBar: View {
+    var tool: SketchTool
+    var inkColor: InkColor
+    var canClear: Bool
+    var onTool: (SketchTool) -> Void
+    var onColor: (InkColor) -> Void
+    var onClear: () -> Void
+
+    var body: some View {
+        HStack(spacing: ChromeMetrics.toolGap) {
+            ForEach(SketchTool.edgeOrder, id: \.self) { candidate in
+                toolButton(candidate)
+            }
+            if canClear {
+                Button(action: onClear) {
+                    Image(systemName: "trash")
+                        .font(.title2)
+                        .foregroundStyle(.white)
+                        .padding(.vertical, 8)
+                        .frame(width: ChromeMetrics.toolWidth)
+                }
+                .accessibilityLabel("Clear sketch")
+            }
+            Spacer(minLength: 16)
+            HStack(spacing: ChromeMetrics.swatchGap) {
+                ForEach(InkColor.allCases, id: \.self) { candidate in
+                    swatch(candidate)
+                }
+            }
+            .padding(.trailing, ChromeMetrics.swatchTrailing - ChromeMetrics.edgeInset)
+        }
+        .padding(.horizontal, ChromeMetrics.edgeInset)
+        .frame(height: ChromeMetrics.bottomBarHeight)
+    }
+
+    private func toolButton(_ candidate: SketchTool) -> some View {
+        let selected = candidate == tool
+        return Button {
+            onTool(candidate)
+        } label: {
+            Image(systemName: candidate.symbolName)
+                .font(.title2)
+                .foregroundStyle(.white)
+                .padding(.vertical, 8)
+                .frame(width: ChromeMetrics.toolWidth)
+                .background(
+                    selected ? Color.toolSelected : Color.clear,
+                    in: RoundedRectangle(cornerRadius: ChromeMetrics.toolCornerRadius, style: .continuous)
+                )
+        }
+        .accessibilityLabel(candidate.accessibilityName)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    /// A 28pt dot. The chosen color also gets a 2pt ring. Black has a grey rim
+    /// so it shows on the black bar, and its ring is grey for the same reason.
+    private func swatch(_ candidate: InkColor) -> some View {
+        let selected = candidate == inkColor
+        let fill = Color(uiColor: candidate.color)
+        let ring = candidate == .black ? Color.canvasLine : fill
+        return Button {
+            onColor(candidate)
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(fill)
+                    .frame(width: ChromeMetrics.swatchDot, height: ChromeMetrics.swatchDot)
+                if candidate == .black {
+                    Circle()
+                        .strokeBorder(Color.canvasLine, lineWidth: 1)
+                        .frame(width: ChromeMetrics.swatchDot, height: ChromeMetrics.swatchDot)
+                }
+                if selected {
+                    Circle()
+                        .strokeBorder(ring, lineWidth: 2)
+                        .frame(width: ChromeMetrics.swatchSide, height: ChromeMetrics.swatchSide)
+                }
+            }
+            .frame(width: ChromeMetrics.swatchSide, height: ChromeMetrics.swatchSide)
+        }
+        .accessibilityLabel("\(candidate.accessibilityName) ink")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// The agent's side of each sketch. Figma 53:918.
+struct AgentSidebar: View {
+    var turns: [AgentTurn]
+    var isSending: Bool
+    var onStop: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            GeometryReader { proxy in
+                ScrollViewReader { reader in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 28) {
+                            if turns.isEmpty {
+                                Text("Sketch on the screen, then send it to the agent.")
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+                            ForEach(turns) { turn in
+                                AgentTurnView(turn: turn)
+                                    .id(turn.id)
+                            }
+                        }
+                        .font(.callout)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, ChromeMetrics.edgeInset)
+                        .padding(.vertical, ChromeMetrics.edgeInset)
+                        .frame(minHeight: proxy.size.height, alignment: .center)
+                    }
+                    .onChange(of: turns) { _, latest in
+                        guard let last = latest.last else { return }
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            reader.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+            if isSending {
+                Button(action: onStop) {
+                    Text("Stop agent")
+                        .font(.callout)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(
+                            Color.chromeButton,
+                            in: RoundedRectangle(cornerRadius: ChromeMetrics.buttonCornerRadius, style: .continuous)
+                        )
+                }
+                .padding([.horizontal, .bottom], ChromeMetrics.edgeInset)
+            }
+        }
+        .frame(width: ChromeMetrics.sidebarWidth)
+    }
+}
+
+/// The prompt is half white. Tool calls are half yellow with the tool name in bold, and
+/// canvas renders are blue. Replies are yellow at 80%. While the agent works, "Reading the
+/// canvas..." (blue, Figma 55:1033) shows until it first acts, then "Thinking...". Figma 53:929.
+private struct AgentTurnView: View {
+    var turn: AgentTurn
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if !turn.prompt.isEmpty {
+                Text(turn.prompt)
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            ForEach(Array(turn.steps.enumerated()), id: \.offset) { _, step in
+                stepView(step)
+            }
+            switch turn.state {
+            case .working:
+                ThinkingRow(reading: turn.steps.isEmpty)
+            case .stopped:
+                Text("Stopped")
+                    .foregroundStyle(.white.opacity(0.5))
+            case .finished:
+                EmptyView()
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private func stepView(_ step: AgentStep) -> some View {
+        switch step {
+        case .status(let lead, let name, let onCanvas):
+            statusText(lead: lead, name: name)
+                .foregroundStyle(onCanvas ? Color.agentBlue : Color.agentYellow)
+                .opacity(onCanvas ? 0.8 : 0.5)
+        case .text(let text):
+            Text(text)
+                .foregroundStyle(Color.agentYellow)
+                .opacity(0.8)
+        case .error(let message):
+            Text(message)
+                .foregroundStyle(.white.opacity(0.8))
+        }
+    }
+
+    private func statusText(lead: String, name: String?) -> Text {
+        guard let name, !name.isEmpty else { return Text(lead) }
+        return Text(lead) + Text(name).bold() + Text("...")
+    }
+}
+
+private struct ThinkingRow: View {
+    /// The agent is still looking at the sketch, before its first step.
+    var reading: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var wobble = false
+
+    var body: some View {
+        HStack(spacing: reading ? 6 : 10) {
+            Text(reading ? "Reading the canvas..." : "Thinking...")
+                .foregroundStyle(reading ? Color.agentBlue : Color.agentYellow)
+            Image(reading ? "ReadingBlob" : "ThinkingBlob")
+                .resizable()
+                .aspectRatio(34 / 45, contentMode: .fit)
+                .frame(height: 19)
+                .rotationEffect(.degrees(wobble ? 12 : -12))
+                .accessibilityHidden(true)
+        }
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                wobble = true
+            }
         }
     }
 }
 
-private final class ToolSegmentControl: UIButton {
-    var onActivate: (() -> Void)?
-
-    override func accessibilityActivate() -> Bool {
-        onActivate?()
-        return true
-    }
-}
-
-/// Full-screen host that only accepts touches on its controls.
-private final class PassthroughHost: UIView {
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        let hit = super.hitTest(point, with: event)
-        return hit === self ? nil : hit
+/// The black drawing page: a 1pt rim and a 24pt dot grid. Figma 55:948.
+struct DotCanvas: View {
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: ChromeMetrics.canvasCornerRadius, style: .continuous)
+        Canvas { context, size in
+            let dot = ChromeMetrics.dotDiameter
+            var y = ChromeMetrics.dotInset
+            while y + dot <= size.height {
+                var x = ChromeMetrics.dotInset
+                while x + dot <= size.width {
+                    context.fill(Path(ellipseIn: CGRect(x: x, y: y, width: dot, height: dot)), with: .color(.canvasLine))
+                    x += ChromeMetrics.dotSpacing
+                }
+                y += ChromeMetrics.dotSpacing
+            }
+        }
+        .background(Color.black)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color.canvasLine, lineWidth: 1))
+        .accessibilityHidden(true)
     }
 }

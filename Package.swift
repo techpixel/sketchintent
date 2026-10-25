@@ -20,7 +20,10 @@ let package = Package(
         ),
         .target(
             name: "SketchIntentServerCore",
-            dependencies: ["StreamProtocol", "HIDAcceleration"]
+            dependencies: ["StreamProtocol", "HIDAcceleration"],
+            linkerSettings: [
+                .linkedFramework("AppKit")
+            ]
         ),
         .executableTarget(
             name: "SketchIntentServer",

@@ -48,6 +48,26 @@ enum DesktopSwitcher {
         }
     }
 
+    /// Opens the desktop at `index` in Mission Control order on the streamed display.
+    static func switchDesktop(toIndex index: Int) {
+        queue.async {
+            guard let layout = currentLayout() else {
+                print("[sketchintent] Could not read the Mac desktops.")
+                return
+            }
+            guard layout.spaceIDs.indices.contains(index) else {
+                print("[sketchintent] There is no desktop \(index + 1).")
+                return
+            }
+            guard index != layout.currentIndex else { return }
+            guard activate(layout.spaceIDs[index], on: layout.display) else {
+                print("[sketchintent] Could not switch desktops.")
+                return
+            }
+            print("[sketchintent] Applied switch to desktop \(index + 1).")
+        }
+    }
+
     /// The space immediately to the left or right of the current one, if it exists.
     static func neighbor(of direction: DesktopDirection, in layout: DesktopLayout) -> UInt64? {
         guard layout.spaceIDs.indices.contains(layout.currentIndex) else { return nil }
