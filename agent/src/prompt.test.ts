@@ -48,6 +48,13 @@ test("a follow-up lists the earlier summaries before the new sketch", () => {
   assert.ok(prompt.indexOf("node 12:34") < prompt.indexOf("now make it bigger"));
 });
 
+test("words said through the dictation button are the main request", () => {
+  const prompt = buildPrompt(800, 600, [], undefined, undefined, [], "open the settings page");
+  assert.match(prompt, /said this to you directly/);
+  assert.match(prompt, /"open the settings page"/);
+  assert.doesNotMatch(buildPrompt(800, 600, []), /said this to you directly/);
+});
+
 test("a first sketch has no history", () => {
   assert.doesNotMatch(buildPrompt(800, 600, []), /earlier/);
 });

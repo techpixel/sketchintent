@@ -239,6 +239,8 @@ public struct IntentRequest: Equatable {
     public var screenPng: Data
     /// Absolute path on the Mac. Empty until a folder is chosen in Settings.
     public var folder: String
+    /// What the person said to the agent while holding the dictation button. Empty for a sketch alone.
+    public var spoken: String
 
     public init(
         id: UInt32,
@@ -249,7 +251,8 @@ public struct IntentRequest: Equatable {
         screenWidth: Int = 0,
         screenHeight: Int = 0,
         screenPng: Data = Data(),
-        folder: String = ""
+        folder: String = "",
+        spoken: String = ""
     ) {
         self.id = id
         self.width = width
@@ -260,6 +263,7 @@ public struct IntentRequest: Equatable {
         self.screenHeight = screenHeight
         self.screenPng = screenPng
         self.folder = folder
+        self.spoken = spoken
     }
 }
 
@@ -587,11 +591,17 @@ private extension IntentRequest {
         let folder = WorkingFolder.encode(self.folder)
         payload.appendBE(UInt16(folder.count))
         payload.append(folder)
-        if !screenPng.isEmpty {
-            payload.appendBE(UInt32(clamping: max(0, screenWidth)))
-            payload.appendBE(UInt32(clamping: max(0, screenHeight)))
+        let spoken = Data(self.spoken.utf8.prefix(Self.spokenByteLimit))
+        // The screen block is written empty when only the spoken words follow it.
+        if !screenPng.isEmpty || !spoken.isEmpty {
+            payload.appendBE(UInt32(clamping: screenPng.isEmpty ? 0 : max(0, screenWidth)))
+            payload.appendBE(UInt32(clamping: screenPng.isEmpty ? 0 : max(0, screenHeight)))
             payload.appendBE(UInt32(screenPng.count))
             payload.append(screenPng)
+        }
+        if !spoken.isEmpty {
+            payload.appendBE(UInt32(spoken.count))
+            payload.append(spoken)
         }
         return payload
     }
@@ -617,9 +627,19 @@ private extension IntentRequest {
         guard let screenWidth = cursor.u32(),
               let screenHeight = cursor.u32(),
               let screenCount = cursor.u32(),
-              let screenPng = cursor.bytes(Int(screenCount)),
-              cursor.isAtEnd,
-              screenWidth > 0, screenHeight > 0, screenPng.starts(with: InkSnapshot.pngSignature) else { return nil }
+              let screenPng = cursor.bytes(Int(screenCount)) else { return nil }
+        if !screenPng.isEmpty {
+            guard screenWidth > 0, screenHeight > 0, screenPng.starts(with: InkSnapshot.pngSignature) else { return nil }
+        }
+        var spoken = ""
+        if !cursor.isAtEnd {
+            guard let spokenCount = cursor.u32(),
+                  spokenCount <= UInt32(Self.spokenByteLimit),
+                  let spokenBytes = cursor.bytes(Int(spokenCount)),
+                  let text = String(data: spokenBytes, encoding: .utf8) else { return nil }
+            spoken = text
+        }
+        guard cursor.isAtEnd else { return nil }
         self.init(
             id: id,
             width: Int(width),
@@ -629,9 +649,12 @@ private extension IntentRequest {
             screenWidth: Int(screenWidth),
             screenHeight: Int(screenHeight),
             screenPng: screenPng,
-            folder: folder
+            folder: folder,
+            spoken: spoken
         )
     }
+
+    static let spokenByteLimit = 8_000
 }
 
 enum WorkingFolder {

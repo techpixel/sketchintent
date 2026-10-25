@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Speech
 import UIKit
 
@@ -395,6 +396,73 @@ final class VoiceTranscriber {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
+/// Talks to the agent while the dictation button is held. The words go out when it is let go.
+/// Start and end from the main queue.
+final class AgentDictation: ObservableObject {
+    /// The words heard so far, or nil when not listening.
+    @Published private(set) var heard: String?
+
+    private let permissions = VoicePermissionGate()
+    private let transcriber = VoiceTranscriber()
+    private var generation = 0
+    private var recording = false
+
+    /// Starts listening. `onFailure` gets the reason when the microphone or Cartesia can't be used.
+    func begin(onFailure: @escaping (String) -> Void) {
+        generation += 1
+        let current = generation
+        heard = ""
+        permissions.authorize { [weak self] result in
+            guard let self, self.generation == current else { return }
+            switch result {
+            case .failure(let reason):
+                self.fail(reason.message, onFailure)
+            case .success:
+                self.startRecording(generation: current, onFailure: onFailure)
+            }
+        }
+    }
+
+    /// Stops listening and returns what was said. Empty when nothing was heard.
+    func end() -> String {
+        generation += 1
+        heard = nil
+        transcriber.onPartial = nil
+        transcriber.onFailure = nil
+        guard recording else { return "" }
+        recording = false
+        return transcriber.stop().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func startRecording(generation current: Int, onFailure: @escaping (String) -> Void) {
+        transcriber.onPartial = { [weak self] text in
+            guard let self, self.generation == current else { return }
+            self.heard = text
+        }
+        transcriber.onFailure = { [weak self] message in
+            guard let self, self.generation == current else { return }
+            self.recording = false
+            self.fail(message, onFailure)
+        }
+        do {
+            try transcriber.start()
+            recording = true
+        } catch let reason as VoiceCaptureBlock {
+            fail(reason.message, onFailure)
+        } catch {
+            fail(VoiceCaptureBlock.unavailable.message, onFailure)
+        }
+    }
+
+    private func fail(_ message: String, _ onFailure: (String) -> Void) {
+        generation += 1
+        heard = nil
+        transcriber.onPartial = nil
+        transcriber.onFailure = nil
+        onFailure(message)
     }
 }
 

@@ -57,9 +57,10 @@ function rememberTurn(folder: string, turn: Memory) {
   memory.at = Date.now();
 }
 
-function fallbackSummary(notes: SketchNote[]): string {
-  if (notes.length === 0) return "A sketch with no voice notes.";
-  return `A sketch with the notes: ${notes.map((note) => `"${note.text}"`).join(", ")}.`;
+function fallbackSummary(notes: SketchNote[], spoken: string): string {
+  const said = spoken ? ` The person said: "${spoken}".` : "";
+  if (notes.length === 0) return `A sketch with no voice notes.${said}`;
+  return `A sketch with the notes: ${notes.map((note) => `"${note.text}"`).join(", ")}.${said}`;
 }
 
 interface IntentBody {
@@ -69,6 +70,8 @@ interface IntentBody {
   notes: SketchNote[];
   screen: ScreenImage | null;
   folder: string;
+  /// Said to the agent while holding the dictation button. Empty for a sketch alone.
+  spoken: string;
 }
 
 type ClientEvent =
@@ -154,7 +157,16 @@ function parseIntent(raw: Buffer): IntentBody {
     if (!text) continue;
     notes.push({ text, x: item.x, y: item.y });
   }
-  return { imagePng: body.imagePng, width, height, notes, screen: parseScreen(body), folder: parseFolder(body.folder) };
+  const spoken = typeof body.spoken === "string" ? body.spoken.trim().slice(0, 4000) : "";
+  return {
+    imagePng: body.imagePng,
+    width,
+    height,
+    notes,
+    screen: parseScreen(body),
+    folder: parseFolder(body.folder),
+    spoken,
+  };
 }
 
 function parseFolder(value: unknown): string {
@@ -210,6 +222,7 @@ function logInput(turn: number, body: IntentBody, prompt: string) {
   for (const note of body.notes) {
     logTurn(turn, `← (${Math.round(note.x)}, ${Math.round(note.y)}) ${note.text}`);
   }
+  if (body.spoken) logTurn(turn, `← said ${body.spoken}`);
   if (body.folder) logTurn(turn, `← folder ${body.folder}`);
   if (body.screen) {
     const padding = body.screen.png.endsWith("==") ? 2 : body.screen.png.endsWith("=") ? 1 : 0;
@@ -424,7 +437,7 @@ async function runIntent(turn: number, body: IntentBody, prompt: string, respons
               loggedText = true;
             }
             rememberTurn(body.folder, {
-              summary: summary || fallbackSummary(body.notes),
+              summary: summary || fallbackSummary(body.notes, body.spoken),
               reply: (event.result || blockText).trim().slice(0, 500),
             });
             if (!summary) logTurn(turn, "→ no summary saved, keeping the notes instead");
@@ -588,7 +601,15 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
 
   const turn = ++nextTurn;
   const earlier = earlierTurns(body.folder);
-  const prompt = buildPrompt(body.width, body.height, body.notes, body.screen ?? undefined, body.folder || undefined, earlier);
+  const prompt = buildPrompt(
+    body.width,
+    body.height,
+    body.notes,
+    body.screen ?? undefined,
+    body.folder || undefined,
+    earlier,
+    body.spoken,
+  );
   await rememberSketch(turn, body, prompt);
   logInput(turn, body, prompt);
   if (earlier.length > 0) logTurn(turn, `← follow-up to ${earlier.length} earlier ${earlier.length === 1 ? "sketch" : "sketches"}`);

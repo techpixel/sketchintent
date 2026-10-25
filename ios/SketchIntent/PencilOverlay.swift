@@ -124,8 +124,9 @@ final class SketchCanvas: ObservableObject {
     }
 
     /// The screen under the ink, plus each voice note in that image's pixel space.
-    func intentSketch(screen: UIImage?) -> IntentSketch? {
-        overlay?.intentSketch(screen: screen)
+    /// With `wholePage`, an empty page still gives the whole picture, or the canvas on screen.
+    func intentSketch(screen: UIImage?, wholePage: Bool = false) -> IntentSketch? {
+        overlay?.intentSketch(screen: screen, wholePage: wholePage)
     }
 
     /// Removes this desktop's pen ink and shapes, and tells the Mac to clear that overlay.
@@ -195,6 +196,8 @@ struct PencilOverlay: UIViewRepresentable {
     var acceptsTap: Bool
     /// PencilKit takes a three-finger swipe only while a frozen sketch is on screen.
     var acceptsCanvasSwipe: Bool
+    /// A finger drag moves the page. Only the Canvas page pans; a desktop keeps the finger for the Mac.
+    var pansPage = false
     var sendsFingerPointer: Bool
     var frameWidth: Int
     var frameHeight: Int
@@ -241,6 +244,7 @@ struct PencilOverlay: UIViewRepresentable {
         )
         view.apply(tool: tool, strokeWidth: strokeWidth, color: inkColor)
         view.setOutlinesInk(outlinesInk)
+        view.setPansPage(pansPage)
         return view
     }
 
@@ -267,6 +271,7 @@ struct PencilOverlay: UIViewRepresentable {
         uiView.onFingerPinch = onFingerPinch
         uiView.apply(tool: tool, strokeWidth: strokeWidth, color: inkColor)
         uiView.setOutlinesInk(outlinesInk)
+        uiView.setPansPage(pansPage)
         if let spaceID {
             uiView.showSpace(spaceID)
         }
@@ -438,6 +443,22 @@ private final class ThreeFingerDesktopPan: UIPanGestureRecognizer {
     }
 }
 
+/// Holds the page pan back while a Pencil gesture is open, and lets it share two fingers with the pinch.
+private final class PagePanGate: NSObject, UIGestureRecognizerDelegate {
+    var canBegin: () -> Bool = { true }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        canBegin()
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        otherGestureRecognizer is UIPinchGestureRecognizer
+    }
+}
+
 private final class HaloFrameLink: NSObject {
     weak var owner: PencilOverlayView?
 
@@ -453,6 +474,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// The open pinch began while the finger drove the Mac, so its end is sent too.
     private var pinchSendsToMac = false
     private let fingerPinch = UIPinchGestureRecognizer()
+    private let pagePan = UIPanGestureRecognizer()
+    private let pagePanGate = PagePanGate()
+    private var pagePanOpen = false
+    /// How far the page has moved since undo was last cleared. Each undo snapshot keeps
+    /// the shift it was taken at, so restoring one lands where the page sits now.
+    private var pageShift = CGPoint.zero
     var onFingerPinch: (CGFloat, TrackpadScrollPhase) -> Void = { _, _ in }
     private var drawings: [String: PKDrawing] = [:]
     private var currentSpaceID: String?
@@ -541,6 +568,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var marks: [ShapeMark]
         var selectedShapeID: UUID?
         var images: [AgentImage] = []
+        var shift = CGPoint.zero
     }
     /// UndoManager retains its target. This proxy keeps that retain from cycling back to the overlay.
     /// The selector form is required. The closure form of `registerUndo` shares a callback with
@@ -693,6 +721,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// How far the freehand rotate handle sits above the selection box.
     private static let rotateHandleGap: CGFloat = 28
 
+    /// Space kept between a centered agent image and the page edge.
+    private static let agentImageMargin: CGFloat = 32
+
     /// Half of the old 32-point bitmap tip. Touching ink deletes that whole stroke.
     private static let eraserRadius: CGFloat = 16
     /// Distance between path samples, in stroke space. Shorter than the tip, so a graze between samples still hits.
@@ -833,8 +864,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     /// The Mac screen with the ink on top, cropped to the strokes and the voice notes.
-    /// Note points are pixels in that image, origin at the top left.
-    func intentSketch(screen: UIImage?) -> IntentSketch? {
+    /// Note points are pixels in that image, origin at the top left. With `wholePage`, an
+    /// empty page is sent whole: the Mac picture, or the part of the canvas on screen.
+    func intentSketch(screen: UIImage?, wholePage: Bool = false) -> IntentSketch? {
         let placed = notes.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         let anchors = placed.map { drawingPoint($0.anchor) }
         var rect = canvas.drawing.bounds
@@ -848,8 +880,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         for image in agentImages {
             rect = rect.isNull ? image.frame : rect.union(image.frame)
         }
-        guard !rect.isNull, !rect.isInfinite else { return nil }
-        rect = rect.insetBy(dx: -16, dy: -16)
+        // The crop is already the whole page, so the whole-screen image would only repeat it.
+        let sendsPage = rect.isNull && wholePage
+        if sendsPage {
+            rect = pictureDrawingRect() ?? visibleDrawingRect()
+        } else {
+            guard !rect.isNull, !rect.isInfinite else { return nil }
+            rect = rect.insetBy(dx: -16, dy: -16)
+        }
         guard rect.width > 1, rect.height > 1 else { return nil }
         let scale = max(window?.screen.scale ?? traitCollection.displayScale, 1)
         // PencilKit draws into the current graphics context. Building the ink image
@@ -876,7 +914,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 y: Double((anchor.y - rect.minY) * scale)
             )
         }
-        let whole = fullScreenImage(screen, room: max(500_000, Self.intentByteBudget - png.count))
+        let whole = sendsPage ? nil : fullScreenImage(screen, room: max(500_000, Self.intentByteBudget - png.count))
         let picture = whole == nil ? nil : pictureDrawingRect()
         return IntentSketch(
             png: png,
@@ -1070,8 +1108,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         readingPulse.layer.add(pulse, forKey: "pulse")
     }
 
-    /// Renders the agent's code at its frame and places the image under the ink, on the
-    /// desktop the sketch came from even when another one is showing. One undo removes it.
+    /// Renders the agent's code at its frame size and places the image under the ink, centered
+    /// on the page it targets even when another one is showing. One undo removes it.
     func showAgentRender(_ render: AgentRender, placement: AgentPlacement, onPlaced: @escaping () -> Void) {
         let useScreen = render.space == "screen"
         let origin = (useScreen ? placement.screenOrigin : nil) ?? placement.sketchOrigin
@@ -1083,6 +1121,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             height: CGFloat(render.height) / perPoint
         )
         guard frame.width >= 1, frame.height >= 1, frame.width <= 4096, frame.height <= 4096 else { return }
+        let shown = centeredFrame(for: frame.size)
         let target = placement.spaceID ?? currentSpaceID
         let renderer = AgentHTMLRenderer()
         agentRenderers.insert(renderer)
@@ -1090,9 +1129,19 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             guard let self else { return }
             self.agentRenderers.remove(renderer)
             guard let image else { return }
-            self.placeAgentImage(AgentImage(id: UUID(), frame: frame, image: image), spaceID: target)
+            self.placeAgentImage(AgentImage(id: UUID(), frame: shown, image: image), spaceID: target)
             onPlaced()
         }
+    }
+
+    /// The middle of the page, scaled down to fit inside its margin. It renders at full size first.
+    private func centeredFrame(for size: CGSize) -> CGRect {
+        let room = bounds.insetBy(dx: Self.agentImageMargin, dy: Self.agentImageMargin)
+        guard room.width > 1, room.height > 1 else { return CGRect(origin: .zero, size: size) }
+        let fit = min(1, room.width / size.width, room.height / size.height)
+        let width = size.width * fit
+        let height = size.height * fit
+        return CGRect(x: room.midX - width / 2, y: room.midY - height / 2, width: width, height: height)
     }
 
     private func placeAgentImage(_ image: AgentImage, spaceID target: String?) {
@@ -1212,6 +1261,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         noteLayer.isUserInteractionEnabled = false
         addSubview(noteLayer)
         installPinchGesture()
+        installPagePan()
         canvas.onFingerPointer = { [weak self] phase, point in
             guard let self else { return }
             self.handleFinger(phase: phase, at: point)
@@ -1371,7 +1421,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// the Mac checks in is not dropped.
     func showSpace(_ id: String) {
         guard id != currentSpaceID else { return }
+        if pagePanOpen {
+            finishPagePan()
+        }
         sketchUndo.removeAllActions()
+        pageShift = .zero
         gestureUndoSnapshot = nil
         pendingUndoSnapshot = nil
         shapeDragUndo = nil
@@ -1499,6 +1553,107 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         default:
             break
         }
+    }
+
+    private func installPagePan() {
+        pagePan.addTarget(self, action: #selector(handlePagePan(_:)))
+        pagePan.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.indirect.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        ]
+        pagePan.minimumNumberOfTouches = 1
+        pagePan.maximumNumberOfTouches = 2
+        pagePan.cancelsTouchesInView = false
+        pagePan.delaysTouchesBegan = false
+        pagePan.delaysTouchesEnded = false
+        pagePan.isEnabled = false
+        pagePanGate.canBegin = { [weak self] in
+            guard let self else { return false }
+            return !self.inkGestureOpen && self.strokeAdjust == nil && self.voiceHold == nil
+        }
+        pagePan.delegate = pagePanGate
+        addGestureRecognizer(pagePan)
+    }
+
+    /// Turning it off mid-drag cancels the drag, which settles the page where it is.
+    func setPansPage(_ pans: Bool) {
+        guard pagePan.isEnabled != pans else { return }
+        pagePan.isEnabled = pans
+    }
+
+    /// A finger drag on the Canvas page moves everything on it: ink, shapes, voice notes,
+    /// and the agent's images. They keep page coordinates, so they move by the drag.
+    @objc private func handlePagePan(_ pan: UIPanGestureRecognizer) {
+        switch pan.state {
+        case .began:
+            endLassoInteraction(commitLoop: false)
+            clearLassoSelection()
+            selectedStroke = nil
+            pendingStrokeTap = nil
+            tapDotCleanup = nil
+            holdLockedStrokes = nil
+            pagePanOpen = true
+            pan.setTranslation(.zero, in: self)
+        case .changed:
+            guard pagePanOpen else { return }
+            shiftPage(by: pan.translation(in: self))
+            pan.setTranslation(.zero, in: self)
+        case .ended, .cancelled, .failed:
+            if pagePanOpen {
+                finishPagePan()
+            }
+        default:
+            break
+        }
+    }
+
+    private func shiftPage(by delta: CGPoint) {
+        guard delta.x != 0 || delta.y != 0 else { return }
+        let move = CGAffineTransform(translationX: delta.x, y: delta.y)
+        pageShift.x += delta.x
+        pageShift.y += delta.y
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        isApplyingSmoothedStroke = true
+        canvas.drawing = canvas.drawing.transformed(using: move)
+        isApplyingSmoothedStroke = false
+        shapeMarks = shapeMarks.map { mark in
+            var mark = mark
+            mark.shape = mark.shape.applying(move)
+            return mark
+        }
+        notes = notes.map { note in
+            var note = note
+            note.anchor = note.anchor.applying(move)
+            return note
+        }
+        agentImages = agentImages.map { image in
+            var image = image
+            image.frame = image.frame.applying(move)
+            return image
+        }
+        if var sentSketch = sent, sentSketch.spaceID == currentSpaceID {
+            sentSketch.strokes = PKDrawing(strokes: sentSketch.strokes).transformed(using: move).strokes
+            sent = sentSketch
+            readingPulse.frame = readingPulse.frame.offsetBy(dx: delta.x, dy: delta.y)
+        }
+        if let currentSpaceID {
+            drawings[currentSpaceID] = canvas.drawing
+            shapesBySpace[currentSpaceID] = shapeMarks
+            notesBySpace[currentSpaceID] = notes
+            agentImagesBySpace[currentSpaceID] = agentImages
+        }
+        agentImageLayer.show(agentImages)
+        noteLayer.setSaved(notes: notes, openID: openNoteID)
+        refreshShapeHandles()
+        CATransaction.commit()
+    }
+
+    private func finishPagePan() {
+        pagePanOpen = false
+        reportInk()
+        publishInk(immediate: true)
     }
 
     override func layoutSubviews() {
@@ -2116,7 +2271,35 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     /// Keeps the hold correction when PencilKit writes the raw stroke as the sketch finishes.
     private func sketchSnapshot() -> SketchUndoSnapshot {
-        SketchUndoSnapshot(drawing: canvas.drawing, marks: shapeMarks, selectedShapeID: selectedShapeID, images: agentImages)
+        SketchUndoSnapshot(
+            drawing: canvas.drawing,
+            marks: shapeMarks,
+            selectedShapeID: selectedShapeID,
+            images: agentImages,
+            shift: pageShift
+        )
+    }
+
+    /// The snapshot moved by however far the page has panned since it was taken.
+    private func shifted(_ snapshot: SketchUndoSnapshot, to shift: CGPoint) -> SketchUndoSnapshot {
+        let dx = shift.x - snapshot.shift.x
+        let dy = shift.y - snapshot.shift.y
+        guard dx != 0 || dy != 0 else { return snapshot }
+        let move = CGAffineTransform(translationX: dx, y: dy)
+        var moved = snapshot
+        moved.drawing = snapshot.drawing.transformed(using: move)
+        moved.marks = snapshot.marks.map { mark in
+            var mark = mark
+            mark.shape = mark.shape.applying(move)
+            return mark
+        }
+        moved.images = snapshot.images.map { image in
+            var image = image
+            image.frame = image.frame.applying(move)
+            return image
+        }
+        moved.shift = shift
+        return moved
     }
 
     private func sketchContentDiffers(_ lhs: SketchUndoSnapshot, _ rhs: SketchUndoSnapshot) -> Bool {
@@ -2169,8 +2352,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         sketchUndo.registerUndo(withTarget: proxy, selector: #selector(SketchUndoProxy.apply(_:)), object: nil)
     }
 
-    private func applySketchSnapshot(_ snapshot: SketchUndoSnapshot) {
+    private func applySketchSnapshot(_ saved: SketchUndoSnapshot) {
         let redo = sketchSnapshot()
+        let snapshot = shifted(saved, to: pageShift)
         applyingSketchUndo = true
         gestureUndoSnapshot = nil
         pendingUndoSnapshot = nil
@@ -3397,6 +3581,13 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             lassoBox = boxEnclosing(indexes: lassoSelection)
             refreshLassoChrome()
         }
+    }
+
+    /// The part of the drawing on screen, in PencilKit drawing coordinates.
+    private func visibleDrawingRect() -> CGRect {
+        let origin = drawingPoint(.zero)
+        let end = drawingPoint(CGPoint(x: bounds.maxX, y: bounds.maxY))
+        return CGRect(x: origin.x, y: origin.y, width: end.x - origin.x, height: end.y - origin.y)
     }
 
     private func drawingPoint(_ viewPoint: CGPoint) -> CGPoint {

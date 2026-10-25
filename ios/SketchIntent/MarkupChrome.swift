@@ -201,6 +201,7 @@ private struct ChromePill<Content: View>: View {
 }
 
 /// Tools on the left, ink colors on the right. Figma 48:732.
+/// Holding the dictation button talks to the agent until the finger lifts.
 struct BottomBar: View {
     var tool: SketchTool
     var inkColor: InkColor
@@ -208,7 +209,14 @@ struct BottomBar: View {
     var onTool: (SketchTool) -> Void
     var onColor: (InkColor) -> Void
     var onClear: () -> Void
+    var onDictationBegan: () -> Void = {}
+    var onDictationEnded: () -> Void = {}
     @Namespace private var toolHighlight
+    @State private var pressingDictation = false
+    @State private var heldDictation = false
+    @State private var dictationHoldItem: DispatchWorkItem?
+
+    private static let dictationHoldDelay = 0.35
 
     var body: some View {
         HStack(spacing: ChromeMetrics.toolGap) {
@@ -247,6 +255,8 @@ struct BottomBar: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 6)
                 .onChanged { drag in
+                    // Talking to the agent keeps the tool where it is.
+                    guard !(pressingDictation && heldDictation) else { return }
                     let order = SketchTool.edgeOrder
                     let slot = ChromeMetrics.toolWidth + ChromeMetrics.toolGap
                     let index = Int((drag.location.x / slot).rounded(.down))
@@ -262,6 +272,8 @@ struct BottomBar: View {
     private func toolButton(_ candidate: SketchTool) -> some View {
         let selected = candidate == tool
         return Button {
+            // A hold on dictation talked to the agent, so letting go does not pick the tool.
+            guard !(candidate == .voice && heldDictation) else { return }
             onTool(candidate)
         } label: {
             Image(systemName: candidate.symbolName)
@@ -277,8 +289,39 @@ struct BottomBar: View {
                     }
                 }
         }
+        .simultaneousGesture(dictationHold, including: candidate == .voice ? .all : .subviews)
         .accessibilityLabel(candidate.accessibilityName)
+        .accessibilityHint(candidate == .voice ? "Hold to talk to the agent" : "")
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    /// A still hold on the dictation button starts listening, and lifting the finger ends it.
+    /// A tap still picks the tool, and a finger that moves before the hold is a swipe along the row.
+    private var dictationHold: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { drag in
+                if !pressingDictation {
+                    pressingDictation = true
+                    heldDictation = false
+                    let item = DispatchWorkItem {
+                        heldDictation = true
+                        onDictationBegan()
+                    }
+                    dictationHoldItem = item
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.dictationHoldDelay, execute: item)
+                } else if !heldDictation, hypot(drag.translation.width, drag.translation.height) > 10 {
+                    dictationHoldItem?.cancel()
+                    dictationHoldItem = nil
+                }
+            }
+            .onEnded { _ in
+                pressingDictation = false
+                dictationHoldItem?.cancel()
+                dictationHoldItem = nil
+                if heldDictation {
+                    onDictationEnded()
+                }
+            }
     }
 
     /// A 28pt dot. The chosen color also gets a 2pt ring. Black has a grey rim
@@ -316,7 +359,11 @@ struct BottomBar: View {
 struct AgentSidebar: View {
     var turns: [AgentTurn]
     var isSending: Bool
+    /// What the dictation button has heard so far, or nil when it is not held.
+    var heard: String?
     var onStop: () -> Void
+
+    private static let listeningID = "listening"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -324,13 +371,17 @@ struct AgentSidebar: View {
                 ScrollViewReader { reader in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 28) {
-                            if turns.isEmpty {
-                                Text("Sketch on the screen, then send it to the agent.")
+                            if turns.isEmpty && heard == nil {
+                                Text("Sketch on the screen, then send it to the agent. Or hold the dictation button and talk to it.")
                                     .foregroundStyle(.white.opacity(0.5))
                             }
                             ForEach(turns) { turn in
                                 AgentTurnView(turn: turn)
                                     .id(turn.id)
+                            }
+                            if let heard {
+                                ListeningRow(heard: heard)
+                                    .id(Self.listeningID)
                             }
                         }
                         .font(.callout)
@@ -344,6 +395,10 @@ struct AgentSidebar: View {
                         withAnimation(.easeOut(duration: 0.2)) {
                             reader.scrollTo(last.id, anchor: .bottom)
                         }
+                    }
+                    .onChange(of: heard) { _, heard in
+                        guard heard != nil else { return }
+                        reader.scrollTo(Self.listeningID, anchor: .bottom)
                     }
                 }
             }
@@ -414,6 +469,22 @@ private struct AgentTurnView: View {
     private func statusText(lead: String, name: String?) -> Text {
         guard let name, !name.isEmpty else { return Text(lead) }
         return Text(lead) + Text(name).bold() + Text("...")
+    }
+}
+
+/// The words heard while the dictation button is held, in the prompt's half white.
+private struct ListeningRow: View {
+    var heard: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "mic.fill")
+                .foregroundStyle(Color.agentYellow)
+                .accessibilityHidden(true)
+            Text(heard.isEmpty ? "Listening..." : heard)
+                .foregroundStyle(.white.opacity(heard.isEmpty ? 0.5 : 0.8))
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

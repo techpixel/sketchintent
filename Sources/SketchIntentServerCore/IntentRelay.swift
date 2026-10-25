@@ -63,6 +63,9 @@ final class IntentRelay {
             if request.folder.hasPrefix("/") {
                 object["folder"] = request.folder
             }
+            if !request.spoken.isEmpty {
+                object["spoken"] = request.spoken
+            }
             urlRequest.httpBody = try JSONSerialization.data(withJSONObject: object)
             let (bytes, response) = try await URLSession.shared.bytes(for: urlRequest)
             guard let http = response as? HTTPURLResponse else {

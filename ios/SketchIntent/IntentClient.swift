@@ -18,7 +18,7 @@ struct AgentTurn: Identifiable, Equatable {
     }
 
     var id: UInt32
-    /// The voice notes on the sketch, or empty when the sketch had none.
+    /// The voice notes on the sketch and anything said through the dictation button. Empty when there were none.
     var prompt: String
     var steps: [AgentStep] = []
     var state: State = .working
@@ -71,13 +71,14 @@ final class IntentClient: ObservableObject {
     private var activeID: UInt32 = 0
 
     /// Starts a turn and returns the packet to send on the open Mac socket.
-    func begin(_ sketch: IntentSketch, folder: String) -> IntentRequest {
+    /// `spoken` is what was said while holding the dictation button.
+    func begin(_ sketch: IntentSketch, folder: String, spoken: String = "") -> IntentRequest {
         let id = nextID
         nextID &+= 1
         activeID = id
         isSending = true
-        let prompt = sketch.notes
-            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let prompt = (sketch.notes.map(\.text) + [spoken])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         turns.append(AgentTurn(id: id, prompt: prompt))
@@ -90,7 +91,8 @@ final class IntentClient: ObservableObject {
             screenWidth: sketch.screenWidth,
             screenHeight: sketch.screenHeight,
             screenPng: sketch.screenPng,
-            folder: folder
+            folder: folder,
+            spoken: spoken
         )
     }
 

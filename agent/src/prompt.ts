@@ -38,6 +38,7 @@ export function buildPrompt(
   screen?: { width: number; height: number },
   folder?: string,
   earlier: Memory[] = [],
+  spoken = "",
 ): string {
   const listed =
     notes.length === 0
@@ -55,6 +56,11 @@ export function buildPrompt(
         "Voice notes were recorded at these pixels. A note refers to the screen content nearest its point:",
       ];
   const lines = [...intro, listed];
+  if (spoken) {
+    lines.push(
+      `The person also held the dictation button and said this to you directly. It is their main request, about the page as a whole: "${spoken}"`,
+    );
+  }
   if (folder) lines.push(`The working folder on the Mac is ${folder}.`);
   if (earlier.length === 0) return lines.join("\n");
   const history = earlier.map((memory, index) => `${index + 1}. ${memory.summary}\n   You replied: ${memory.reply}`);
@@ -74,6 +80,7 @@ export const systemPrompt = [
   "When two images are attached, the first is the whole screen and the second is the cropped sketch. Voice-note points refer to the second image. Read both.",
   "When one image is attached, it is the cropped sketch, and the notes refer to that image.",
   "When a working folder is named, that folder is the project you are acting on.",
+  "The person can also speak to you directly, without a sketch. Then the image is the whole page they were looking at, and there may be no ink.",
   "Carry out what the sketch and the notes ask. Use a configured MCP tool when it can do that, and load the matching skill before you use it.",
   "The canvas is where you ask for feedback. Put anything you want the person to check there with show_image, rendered from HTML, CSS, SVG, or a canvas script: your reading of a sketch you are not sure you understood, a layout or design you are proposing, or a result you want approved before you act on it. The image goes on the iPad's Canvas page, a blank page apart from the Mac screen, and the iPad switches to that page so the person can annotate it.",
   "Read the sketch honestly. If any part of it is ambiguous (a rough shape, an unclear arrow, a scribble that could be several things, a size or position you are estimating), render your best reading instead of guessing silently, and do not make changes elsewhere that depend on that reading until the person has seen it.",

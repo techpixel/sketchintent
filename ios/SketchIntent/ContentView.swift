@@ -39,6 +39,8 @@ struct ContentView: View {
     @StateObject private var client = StreamClient()
     @StateObject private var sketch = SketchCanvas()
     @StateObject private var intent = IntentClient()
+    @StateObject private var dictation = AgentDictation()
+    @State private var dictationHaptic = UIImpactFeedbackGenerator(style: .medium)
     @State private var tool = SketchTool.pen
     @State private var showsSidebar = false
     @State private var showsSettings = false
@@ -129,13 +131,19 @@ struct ContentView: View {
                     onChooseFolder: { client.requestWorkingFolder() },
                     onClearFolder: { client.clearWorkingFolder() },
                     onSurface: selectSurface,
-                    onSend: sendSketch,
+                    onSend: { sendSketch() },
                     onStop: stopAgent,
                     onSettings: { showsSettings = true }
                 )
                 HStack(spacing: 0) {
                     if showsSidebar {
-                        AgentSidebar(turns: intent.turns, isSending: intent.isSending, onStop: stopAgent)
+                        AgentSidebar(
+                            turns: intent.turns,
+                            isSending: intent.isSending,
+                            heard: dictation.heard,
+                            onStop: stopAgent
+                        )
+                            .transition(.move(edge: .leading))
                     }
                     VStack(spacing: 0) {
                         stage
@@ -145,10 +153,13 @@ struct ContentView: View {
                             canClear: sketch.hasInk || shownFrozen != nil,
                             onTool: chooseTool,
                             onColor: { inkColorName = $0.rawValue },
-                            onClear: clearSketch
+                            onClear: clearSketch,
+                            onDictationBegan: beginDictation,
+                            onDictationEnded: endDictation
                         )
                     }
                 }
+                .animation(.easeInOut(duration: 0.25), value: showsSidebar)
             }
             .ignoresSafeArea()
 
@@ -179,14 +190,15 @@ struct ContentView: View {
                     }
                 )
                 .ignoresSafeArea()
-                .transition(.opacity)
+                // A ZStack child needs a fixed zIndex, or its removal skips the fade.
+                .zIndex(1)
+                .transition(.opacity.animation(.easeInOut(duration: 0.2)))
             }
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(true)
         .persistentSystemOverlays(canvasReady ? .hidden : .automatic)
         .animation(.easeOut(duration: 0.18), value: desktopHint)
-        .animation(.easeOut(duration: 0.16), value: showsTrackpad)
         .sheet(isPresented: $showsSettings) {
             SettingsSheet(client: client)
         }
@@ -212,6 +224,7 @@ struct ContentView: View {
                 }
             }
             toolSelection.prepare()
+            dictationHaptic.prepare()
             updateIdleTimer()
         }
         .onChange(of: client.hasFrame) { _, _ in
@@ -269,6 +282,7 @@ struct ContentView: View {
                 outlinesInk: blankCanvas,
                 acceptsTap: canvasReady,
                 acceptsCanvasSwipe: shownFrozen != nil && sketch.hasInk,
+                pansPage: blankCanvas,
                 sendsFingerPointer: sendsFingerPointer,
                 frameWidth: blankCanvas ? 0 : sketchFrameWidth,
                 frameHeight: blankCanvas ? 0 : sketchFrameHeight,
@@ -326,14 +340,26 @@ struct ContentView: View {
         UIApplication.shared.isIdleTimerDisabled = client.hasFrame || blankCanvas
     }
 
-    private func sendSketch() {
-        guard !intent.isSending, let sketch = sketch.intentSketch(screen: screenForIntent()) else { return }
+    /// Sends the sketch. `spoken` is what was said through the dictation button. Words go
+    /// out even on an empty page, which is then sent whole so the agent sees what was on screen.
+    private func sendSketch(spoken: String = "") {
+        guard !intent.isSending else { return }
+        let wholePage = !spoken.isEmpty
+        // An empty desktop is only looked at, so its live picture keeps playing.
+        let screen = screenForIntent(freezes: !wholePage || self.sketch.hasInk)
+        guard let sketch = self.sketch.intentSketch(screen: screen, wholePage: wholePage) else {
+            if wholePage {
+                showsSidebar = true
+                intent.fail("The page couldn't be read")
+            }
+            return
+        }
         showsSidebar = true
         guard client.isConnected else {
             intent.fail("The Mac isn't connected")
             return
         }
-        let request = intent.begin(sketch, folder: client.workingFolder)
+        let request = intent.begin(sketch, folder: client.workingFolder, spoken: spoken)
         agentPlacements = [request.id: sketch.placement]
         if client.sendIntent(request) {
             self.sketch.markSent()
@@ -342,8 +368,26 @@ struct ContentView: View {
         }
     }
 
+    /// Holding the dictation button talks to the agent. The sidebar shows the words as they come.
+    private func beginDictation() {
+        guard !intent.isSending else { return }
+        showsSidebar = true
+        dictationHaptic.impactOccurred()
+        dictationHaptic.prepare()
+        dictation.begin { message in
+            intent.fail(message)
+        }
+    }
+
+    /// Letting go sends what was said, with the sketch when there is one.
+    private func endDictation() {
+        let spoken = dictation.end()
+        guard !spoken.isEmpty else { return }
+        sendSketch(spoken: spoken)
+    }
+
     /// An image from the agent's show_image tool, for a sketch it is still working on.
-    /// It always goes on the Canvas page, at the spot the sketch sat on screen, so the person
+    /// It always goes on the Canvas page, centered and fit inside it, so the person
     /// can mark it up there. Once it is on the page, the view moves to the Canvas.
     private func showAgentRender(_ reply: IntentReply) {
         guard intent.isWorking(on: reply.id),
@@ -398,16 +442,18 @@ struct ContentView: View {
         frozenBySpace[""] = nil
     }
     /// The Mac picture under the ink. A sketch freezes that picture when the first stroke starts.
-    /// Sending again captures it if that freeze missed.
-    private func screenForIntent() -> UIImage? {
+    /// Sending again captures it if that freeze missed, and keeps it frozen when `freezes` is set.
+    private func screenForIntent(freezes: Bool = true) -> UIImage? {
         guard !blankCanvas else { return nil }
         if let image = shownFrozen?.image { return image }
         guard let captured = client.captureDisplayedFrame() else { return nil }
-        frozenBySpace[client.spaceID ?? ""] = FrozenPicture(
-            image: captured.image,
-            width: captured.width,
-            height: captured.height
-        )
+        if freezes {
+            frozenBySpace[client.spaceID ?? ""] = FrozenPicture(
+                image: captured.image,
+                width: captured.width,
+                height: captured.height
+            )
+        }
         return captured.image
     }
 

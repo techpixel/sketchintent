@@ -339,6 +339,16 @@ final class StreamProtocolTests: XCTestCase {
         var inFolder = request
         inFolder.folder = "/Users/me/Notes"
         XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(inFolder))), [.intent(inFolder)])
+
+        var spoken = inFolder
+        spoken.spoken = "open the settings page"
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(spoken))), [.intent(spoken)])
+        var spokenWithScreen = withScreen
+        spokenWithScreen.spoken = "make the header smaller"
+        XCTAssertEqual(
+            try parser.append(StreamFraming.encode(.intent(spokenWithScreen))),
+            [.intent(spokenWithScreen)]
+        )
         XCTAssertEqual(
             try parser.append(StreamFraming.encode(.chooseFolder("/Users/me/Notes")) + StreamFraming.encode(.workingFolder(""))),
             [.chooseFolder("/Users/me/Notes"), .workingFolder("")]
