@@ -200,7 +200,7 @@ private struct ChromePill<Content: View>: View {
     }
 }
 
-/// Tools on the left, ink colors on the right. Figma 48:732.
+/// Tools on the left, ink colors on the right. Figma 48:732, selected tool from 66:1273.
 /// Holding the dictation button talks to the agent until the finger lifts.
 struct BottomBar: View {
     var tool: SketchTool
@@ -278,7 +278,7 @@ struct BottomBar: View {
         } label: {
             Image(systemName: candidate.symbolName)
                 .font(.title2)
-                .foregroundStyle(.white)
+                .foregroundStyle(selected ? .black : .white)
                 .padding(.vertical, 8)
                 .frame(width: ChromeMetrics.toolWidth)
                 .background {
