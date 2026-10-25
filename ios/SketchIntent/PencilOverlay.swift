@@ -157,6 +157,18 @@ final class SketchCanvas: ObservableObject {
         overlay?.cancelSent()
     }
 
+    /// Runs after each change the person makes: a stroke, an erase, a moved shape or
+    /// selection, or a voice note. Undo, clearing and the agent's own changes do not count.
+    var onEdit: (() -> Void)?
+
+    /// True while the voice-note tool has the microphone.
+    var onVoiceNoteMic: ((Bool) -> Void)?
+
+    /// A stroke, erase, drag or voice note is in progress, so the page is not ready to read.
+    var isMarking: Bool {
+        overlay?.isMarking ?? false
+    }
+
     fileprivate func attach(_ overlay: PencilOverlayView) {
         self.overlay = overlay
     }
@@ -231,6 +243,12 @@ struct PencilOverlay: UIViewRepresentable {
         view.onFingerPinch = onFingerPinch
         view.onInkChange = { [weak canvas] hasInk in
             canvas?.noteInk(hasInk)
+        }
+        view.onEdit = { [weak canvas] in
+            canvas?.onEdit?()
+        }
+        view.onVoiceNoteMic = { [weak canvas] claimed in
+            canvas?.onVoiceNoteMic?(claimed)
         }
         view.onInk = onInk
         view.onSketchBegan = onSketchBegan
@@ -493,6 +511,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// Color for new pen strokes and snapped shapes. Ink already on the page keeps its color.
     private var inkColor: UIColor = InkColor.red.color
     var onInkChange: ((Bool) -> Void)?
+    /// The person changed the page. See `SketchCanvas.onEdit`.
+    var onEdit: (() -> Void)?
+    /// The voice-note tool took the microphone, or gave it back.
+    var onVoiceNoteMic: ((Bool) -> Void)?
+    private var voiceNoteMicClaimed = false
     /// PNG of this space's pen ink in captured-frame pixels. Empty data clears the Mac.
     var onInk: (Data, Int, Int, String) -> Void = { _, _, _, _ in }
     /// The current desktop had no ink, and a pen stroke just started.
@@ -746,6 +769,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// A pen stroke, erase, shape drag, or lasso transform is in progress.
     private var inkGestureOpen: Bool {
         penStrokeOpen || eraserOpen || shapeAdjust != nil || lassoTransforming
+    }
+
+    /// Ink is being drawn or moved, or a voice note is being recorded.
+    var isMarking: Bool {
+        inkGestureOpen || strokeAdjust != nil || voiceHold != nil
     }
 
     /// The canvas mode is black, so black ink gets a light edge there. Over the Mac
@@ -1797,6 +1825,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             self.endVoiceHold(commit: false)
             self.showVoiceNotice(message, at: point)
         }
+        // Live mode lets go of the microphone first, so the two never share it.
+        setVoiceNoteMic(true)
         do {
             try voiceTranscriber.start()
         } catch let reason as VoiceCaptureBlock {
@@ -1810,6 +1840,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
         guard var hold = voiceHold, hold.token == token else {
             _ = voiceTranscriber.stop()
+            setVoiceNoteMic(false)
             return
         }
         hold.recording = true
@@ -1828,6 +1859,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let text = hold.recording
             ? voiceTranscriber.stop().trimmingCharacters(in: .whitespacesAndNewlines)
             : ""
+        setVoiceNoteMic(false)
         noteLayer.setLive(anchor: nil, text: "")
         let baseline = dictationInkBaseline
         let anchor = stationaryCanvasAnchor ?? .zero
@@ -1864,6 +1896,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         } else {
             addVoiceNote(VoiceNote(id: UUID(), anchor: hold.anchor, text: text))
         }
+    }
+
+    private func setVoiceNoteMic(_ claimed: Bool) {
+        guard voiceNoteMicClaimed != claimed else { return }
+        voiceNoteMicClaimed = claimed
+        onVoiceNoteMic?(claimed)
     }
 
     /// Saved note under a canvas point, using the dot's 44pt target.
@@ -1939,6 +1977,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
         openNoteID = nil
         noteLayer.setSaved(notes: notes, openID: nil)
+        onEdit?()
     }
 
     /// Replaces the transcript on an existing dot. An empty recording leaves the saved text alone.
@@ -1953,6 +1992,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
         openNoteID = nil
         noteLayer.setSaved(notes: notes, openID: nil)
+        onEdit?()
     }
 
     private func showVoiceNotice(_ text: String, at anchor: CGPoint) {
@@ -2066,6 +2106,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         halo.isHidden = true
         canvasViewDrawingDidChange(canvasView)
         closeOpenStrokeUndo()
+        onEdit?()
         guard canvasView.drawing.strokes.isEmpty else { return }
         let space = currentSpaceID ?? ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -2721,6 +2762,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         isApplyingSmoothedStroke = false
         canvasViewDrawingDidChange(canvas)
         refreshShapeHandles()
+        onEdit?()
     }
 
     private func rewriteShape(at index: Int) {
@@ -3074,6 +3116,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         isApplyingSmoothedStroke = false
         canvasViewDrawingDidChange(canvas)
         refreshShapeHandles()
+        onEdit?()
     }
 
     private func selectFreehandStroke(_ pending: PendingStrokeTap) {
@@ -3551,6 +3594,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         applyHaloNow()
         publishInk(immediate: true)
         reportInk()
+        onEdit?()
     }
 
     /// A voice note goes away when the eraser meets its dot or the open transcript.
@@ -4083,6 +4127,7 @@ private extension PencilOverlayView {
         }
         commitLiftedStrokes(lifted, transform: transform)
         dropStrayBoxInk()
+        onEdit?()
         if !lassoArmed, lassoSelection.count == 1,
            let index = lassoSelection.first,
            let mark = shapeMarks.first(where: { $0.strokeIndex == index }) {

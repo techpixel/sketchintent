@@ -78,6 +78,9 @@ final class IntentRelay {
             case nil:
                 break
             }
+            if request.live {
+                object["live"] = true
+            }
             urlRequest.httpBody = try JSONSerialization.data(withJSONObject: object)
             let (bytes, response) = try await URLSession.shared.bytes(for: urlRequest)
             guard let http = response as? HTTPURLResponse else {

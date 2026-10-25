@@ -73,3 +73,9 @@ test("the page the sketch was drawn on is named", () => {
   assert.match(fullscreen, /fullscreen app/);
   assert.doesNotMatch(buildPrompt(800, 600, []), /sketch was drawn/);
 });
+
+test("commands and file edits get plain status lines", () => {
+  assert.deepEqual(toolStatus("Bash"), { lead: "Running ", name: "a command" });
+  assert.deepEqual(toolStatus("Edit"), { lead: "Editing ", name: "files" });
+  assert.deepEqual(toolStatus("Write"), { lead: "Editing ", name: "files" });
+});

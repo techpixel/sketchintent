@@ -5,7 +5,7 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createSdkMcpServer, query, tool, type McpServerConfig, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, tool, type McpServerConfig, type PermissionMode, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { makeImage, type CanvasImage } from "./canvas.ts";
 import { openOnMac } from "./mac.ts";
@@ -17,10 +17,14 @@ const debugPngPath = join(root, "debug", "latest.png");
 const debugScreenPath = join(root, "debug", "screen.png");
 const bodyLimit = 12_000_000;
 const imageLimit = 8_000_000;
-// Skills often point at reference files, so the agent can read but not change files or run commands.
 const memoryLimit = 12;
 const memoryIdleMs = 30 * 60_000;
-const agentTools = ["Skill", "ToolSearch", "Read", "Glob", "Grep", "ListMcpResourcesTool", "ReadMcpResourceTool"];
+/// Where the agent works when the iPad has not chosen a folder.
+const defaultFolder = process.env.SKETCHINTENT_WORKSPACE || join(homedir(), "SketchIntent");
+/// Nobody is at the Mac to answer a permission prompt, so by default a classifier approves each tool call.
+const permissionMode = (process.env.SKETCHINTENT_PERMISSION_MODE ?? "auto") as PermissionMode;
+/// A long build or install sends no bytes, and the Mac relay gives up after a quiet stretch.
+const heartbeatMs = 20_000;
 
 interface ScreenImage {
   png: string;
@@ -88,6 +92,8 @@ type ClientEvent =
   /// The iPad shows the Mac screen instead of the Canvas page.
   | { type: "screen" }
   | { type: "done" }
+  /// Keeps the connection alive during a long tool call. The Mac ignores it.
+  | { type: "ping" }
   | { type: "error"; message: string };
 
 let active: AbortController | null = null;
@@ -278,15 +284,17 @@ async function rememberSketch(turn: number, body: IntentBody, prompt: string) {
 }
 
 async function workingDirectory(turn: number, folder: string): Promise<string> {
-  if (!folder) return root;
-  try {
-    const info = await stat(folder);
-    if (!info.isDirectory()) throw new Error("not a directory");
-    return folder;
-  } catch {
-    logTurn(turn, `← folder unavailable, using ${root}`);
-    return root;
+  if (folder) {
+    try {
+      const info = await stat(folder);
+      if (!info.isDirectory()) throw new Error("not a directory");
+      return folder;
+    } catch {
+      logTurn(turn, `← folder unavailable, using ${defaultFolder}`);
+    }
   }
+  await mkdir(defaultFolder, { recursive: true });
+  return defaultFolder;
 }
 
 const spaceField = z
@@ -294,7 +302,7 @@ const spaceField = z
   .optional()
   .describe("sketch: pixels of the cropped sketch image, where the voice notes are. screen: pixels of the whole-screen image. Defaults to sketch.");
 
-async function runIntent(turn: number, body: IntentBody, prompt: string, response: ServerResponse, abort: AbortController) {
+async function runIntent(turn: number, body: IntentBody, cwd: string, prompt: string, response: ServerResponse, abort: AbortController) {
   const inputClosed = new AbortController();
   let sawText = false;
   let loggedText = false;
@@ -415,31 +423,34 @@ async function runIntent(turn: number, body: IntentBody, prompt: string, respons
   const mcpServers = await loadMcpServers();
   const mcpNames = Object.keys(mcpServers);
   logTurn(turn, mcpNames.length === 0 ? "← mcp.json none" : `← mcp.json ${mcpNames.join(", ")}`);
+  const heartbeat = setInterval(() => writeEvent(response, turn, { type: "ping" }), heartbeatMs);
   try {
     const stream = query({
       prompt: oneTurn(message, inputClosed.signal),
       options: {
-        cwd: await workingDirectory(turn, body.folder),
+        cwd,
         abortController: abort,
         persistSession: false,
         // Load the same settings, plugins, MCP servers and skills as the claude CLI on this Mac.
         settingSources: ["user", "project", "local"],
         skills: "all",
         includePartialMessages: true,
-        maxTurns: 24,
-        tools: agentTools,
-        systemPrompt,
+        maxTurns: 200,
+        // The same tools and system prompt as the claude CLI, so the agent can write code, run builds, and test.
+        tools: { type: "preset", preset: "claude_code" },
+        systemPrompt: { type: "preset", preset: "claude_code", append: systemPrompt },
         mcpServers: { ...mcpServers, sketchintent: memoryServer },
-        permissionMode: "default",
+        permissionMode,
         ...(process.env.SKETCHINTENT_MODEL ? { model: process.env.SKETCHINTENT_MODEL } : {}),
+        // Only calls the permission mode could not decide reach here, and nobody is at the Mac to ask.
         canUseTool: async (toolName, input) => {
-          if (toolName.startsWith("mcp__") || agentTools.includes(toolName)) {
+          if (toolName.startsWith("mcp__")) {
             return { behavior: "allow", updatedInput: input };
           }
-          logTurn(turn, `→ deny ${toolName}`);
+          logTurn(turn, `→ deny ${toolName} ${preview(input)}`);
           return {
             behavior: "deny",
-            message: "This agent can only use MCP tools, skills, and read-only file tools.",
+            message: "Nobody is at the Mac to approve this. Find another way, or say in your reply what you wanted to run so the person can do it.",
           };
         },
         stderr: (line) => {
@@ -515,6 +526,7 @@ async function runIntent(turn: number, body: IntentBody, prompt: string, respons
       }
     }
   } finally {
+    clearInterval(heartbeat);
     if (!loggedText && blockText) logTurn(turn, `→ ${blockText}`);
     if (abort.signal.aborted) logTurn(turn, "→ cancelled");
     inputClosed.abort();
@@ -664,12 +676,19 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
 
   const turn = ++nextTurn;
   const earlier = earlierTurns(body.folder);
+  let cwd: string;
+  try {
+    cwd = await workingDirectory(turn, body.folder);
+  } catch (error) {
+    sendJSON(response, 500, { error: `Could not open the working folder: ${errorMessage(error)}` });
+    return;
+  }
   const prompt = buildPrompt(
     body.width,
     body.height,
     body.notes,
     body.screen ?? undefined,
-    body.folder || undefined,
+    cwd,
     earlier,
     body.spoken,
     body.drawnOn ?? undefined,
@@ -690,7 +709,7 @@ async function handle(request: IncomingMessage, response: ServerResponse) {
   });
 
   try {
-    await runIntent(turn, body, prompt, response, abort);
+    await runIntent(turn, body, cwd, prompt, response, abort);
   } catch (error) {
     if (!abort.signal.aborted) {
       writeEvent(response, turn, { type: "error", message: errorMessage(error) });
@@ -749,7 +768,8 @@ server.listen(port, "127.0.0.1", () => {
   console.log(`[sketchintent-ai] Open http://127.0.0.1:${port}/debug/latest to see the sketch the agent received.`);
   console.log("[sketchintent-ai] The iPad reaches this through the SketchIntent USB connection.");
   console.log("[sketchintent-ai] Follow-up sketches remember earlier ones. POST /v1/intent/reset starts over.");
-  console.log("[sketchintent-ai] Uses the MCP servers, plugins and skills of your Claude Code setup. Extra MCP servers go in agent/mcp.json.");
+  console.log("[sketchintent-ai] Uses the tools, MCP servers, plugins and skills of your Claude Code setup. Extra MCP servers go in agent/mcp.json.");
+  console.log(`[sketchintent-ai] Works in the folder the iPad chose, or ${defaultFolder}. Permission mode ${permissionMode}.`);
 });
 
 function shutdown() {

@@ -359,6 +359,13 @@ final class StreamProtocolTests: XCTestCase {
             try parser.append(StreamFraming.encode(.intent(spokenWithScreen))),
             [.intent(spokenWithScreen)]
         )
+        var live = request
+        live.live = true
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(live))), [.intent(live)])
+        var liveOnCanvas = spokenWithScreen
+        liveOnCanvas.drawnOn = .canvas
+        liveOnCanvas.live = true
+        XCTAssertEqual(try parser.append(StreamFraming.encode(.intent(liveOnCanvas))), [.intent(liveOnCanvas)])
         XCTAssertEqual(
             try parser.append(StreamFraming.encode(.chooseFolder("/Users/me/Notes")) + StreamFraming.encode(.workingFolder(""))),
             [.chooseFolder("/Users/me/Notes"), .workingFolder("")]

@@ -243,6 +243,9 @@ public struct IntentRequest: Equatable {
     public var spoken: String
     /// The iPad page the sketch was drawn on. Nil when the iPad did not say.
     public var drawnOn: DrawnOn?
+    /// A moment from live mode: what was said and drawn since the last one. The AI server
+    /// keeps one agent session open for these instead of starting one per sketch.
+    public var live: Bool
 
     public enum DrawnOn: Equatable {
         /// The blank Canvas page, apart from the Mac screen.
@@ -262,7 +265,8 @@ public struct IntentRequest: Equatable {
         screenPng: Data = Data(),
         folder: String = "",
         spoken: String = "",
-        drawnOn: DrawnOn? = nil
+        drawnOn: DrawnOn? = nil,
+        live: Bool = false
     ) {
         self.id = id
         self.width = width
@@ -275,6 +279,7 @@ public struct IntentRequest: Equatable {
         self.folder = folder
         self.spoken = spoken
         self.drawnOn = drawnOn
+        self.live = live
     }
 }
 
@@ -605,14 +610,14 @@ private extension IntentRequest {
         payload.appendBE(UInt16(folder.count))
         payload.append(folder)
         let spoken = Data(self.spoken.utf8.prefix(Self.spokenByteLimit))
-        // The screen and spoken blocks are written empty when a later block follows them.
-        if !screenPng.isEmpty || !spoken.isEmpty || drawnOn != nil {
+        // The screen, spoken and page blocks are written empty when a later block follows them.
+        if !screenPng.isEmpty || !spoken.isEmpty || drawnOn != nil || live {
             payload.appendBE(UInt32(clamping: screenPng.isEmpty ? 0 : max(0, screenWidth)))
             payload.appendBE(UInt32(clamping: screenPng.isEmpty ? 0 : max(0, screenHeight)))
             payload.appendBE(UInt32(screenPng.count))
             payload.append(screenPng)
         }
-        if !spoken.isEmpty || drawnOn != nil {
+        if !spoken.isEmpty || drawnOn != nil || live {
             payload.appendBE(UInt32(spoken.count))
             payload.append(spoken)
         }
@@ -624,7 +629,13 @@ private extension IntentRequest {
             payload.append(2)
             payload.appendBE(UInt16(bitPattern: Int16(clamping: index)))
         case nil:
-            break
+            if live {
+                payload.append(0)
+                payload.appendBE(UInt16(0))
+            }
+        }
+        if live {
+            payload.append(1)
         }
         return payload
     }
@@ -666,10 +677,16 @@ private extension IntentRequest {
         if !cursor.isAtEnd {
             guard let tag = cursor.u8(), let raw = cursor.u16() else { return nil }
             switch tag {
+            case 0: drawnOn = nil
             case 1: drawnOn = .canvas
             case 2: drawnOn = .desktop(Int(Int16(bitPattern: raw)))
             default: return nil
             }
+        }
+        var live = false
+        if !cursor.isAtEnd {
+            guard let flag = cursor.u8(), flag <= 1 else { return nil }
+            live = flag == 1
         }
         guard cursor.isAtEnd else { return nil }
         self.init(
@@ -683,7 +700,8 @@ private extension IntentRequest {
             screenPng: screenPng,
             folder: folder,
             spoken: spoken,
-            drawnOn: drawnOn
+            drawnOn: drawnOn,
+            live: live
         )
     }
 

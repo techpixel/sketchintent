@@ -17,11 +17,20 @@ struct AgentTurn: Identifiable, Equatable {
         case stopped
     }
 
+    /// One step and when it arrived. Live turns show the time beside each line.
+    struct Entry: Equatable {
+        var step: AgentStep
+        var at: Date
+    }
+
     var id: UInt32
     /// The voice notes on the sketch and anything said through the dictation button. Empty when there were none.
     var prompt: String
-    var steps: [AgentStep] = []
+    var steps: [Entry] = []
     var state: State = .working
+    /// A moment from live mode rather than a sketch sent by hand.
+    var live = false
+    var startedAt = Date()
 }
 
 /// The cropped sketch, the voice notes on it, and the whole Mac screen for context.
@@ -77,7 +86,8 @@ final class IntentClient: ObservableObject {
         _ sketch: IntentSketch,
         folder: String,
         spoken: String = "",
-        drawnOn: IntentRequest.DrawnOn? = nil
+        drawnOn: IntentRequest.DrawnOn? = nil,
+        live: Bool = false
     ) -> IntentRequest {
         let id = nextID
         nextID &+= 1
@@ -87,7 +97,7 @@ final class IntentClient: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        turns.append(AgentTurn(id: id, prompt: prompt))
+        turns.append(AgentTurn(id: id, prompt: prompt, live: live))
         return IntentRequest(
             id: id,
             width: sketch.width,
@@ -99,20 +109,21 @@ final class IntentClient: ObservableObject {
             screenPng: sketch.screenPng,
             folder: folder,
             spoken: spoken,
-            drawnOn: drawnOn
+            drawnOn: drawnOn,
+            live: live
         )
     }
 
     /// The sketch never reached the agent, or the open turn could not go on.
     func fail(_ message: String) {
         if isSending, let index = activeIndex {
-            turns[index].steps.append(.error(message))
+            add(.error(message), at: index)
             finish(as: .finished)
             return
         }
         let id = nextID
         nextID &+= 1
-        turns.append(AgentTurn(id: id, prompt: "", steps: [.error(message)], state: .finished))
+        turns.append(AgentTurn(id: id, prompt: "", steps: [.init(step: .error(message), at: Date())], state: .finished))
     }
 
     /// Ends the open turn on the iPad. Returns its id so the Mac can stop the agent too.
@@ -135,29 +146,30 @@ final class IntentClient: ObservableObject {
                 name: reply.name.isEmpty ? nil : reply.name,
                 onCanvas: reply.text == "canvas"
             )
-            if turns[index].steps.last != step {
-                turns[index].steps.append(step)
+            if turns[index].steps.last?.step != step {
+                add(step, at: index)
             }
         case .text:
-            if case .text = turns[index].steps.last {
-                turns[index].steps[turns[index].steps.count - 1] = .text(reply.text)
+            if case .text = turns[index].steps.last?.step {
+                turns[index].steps[turns[index].steps.count - 1].step = .text(reply.text)
             } else {
-                turns[index].steps.append(.text(reply.text))
+                add(.text(reply.text), at: index)
             }
         case .error:
-            turns[index].steps.append(.error(reply.text.isEmpty ? "The agent stopped" : reply.text))
+            add(.error(reply.text.isEmpty ? "The agent stopped" : reply.text), at: index)
             finish(as: .finished)
         case .canvas, .screen:
             // The image goes to the canvas, and a screen reply changes the page. Both already have a status line.
             break
         case .done:
-            let answered = turns[index].steps.contains { step in
-                if case .text = step { return true }
-                if case .status = step { return true }
+            let answered = turns[index].steps.contains { entry in
+                if case .text = entry.step { return true }
+                if case .status = entry.step { return true }
                 return false
             }
-            if !answered {
-                turns[index].steps.append(.error("The agent didn't answer"))
+            // A live moment that needs nothing yet gets no answer on purpose.
+            if !answered && !turns[index].live {
+                add(.error("The agent didn't answer"), at: index)
             }
             finish(as: .finished)
             return true
@@ -168,6 +180,10 @@ final class IntentClient: ObservableObject {
     /// True while the agent is still working on `id`. A stopped turn's late drawing is dropped.
     func isWorking(on id: UInt32) -> Bool {
         isSending && id == activeID
+    }
+
+    private func add(_ step: AgentStep, at index: Int) {
+        turns[index].steps.append(.init(step: step, at: Date()))
     }
 
     private var activeIndex: Int? {

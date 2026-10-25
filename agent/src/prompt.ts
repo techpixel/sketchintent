@@ -43,6 +43,8 @@ export function toolStatus(name: string): { lead: string; name: string; tone?: "
   if (name === imageToolName) return { lead: "Rendering on ", name: "the canvas", tone: "canvas" };
   if (name === openToolName) return { lead: "Opening on ", name: "the Mac" };
   if (name === desktopToolName) return { lead: "Switching ", name: "Mac desktop" };
+  if (name === "Bash") return { lead: "Running ", name: "a command" };
+  if (name === "Write" || name === "Edit" || name === "NotebookEdit") return { lead: "Editing ", name: "files" };
   return { lead: "Calling ", name: toolLabel(name) };
 }
 
@@ -55,6 +57,7 @@ export function buildPrompt(
   earlier: Memory[] = [],
   spoken = "",
   drawnOn?: DrawnOn,
+  live?: { moment: number },
 ): string {
   const listed =
     notes.length === 0
@@ -72,13 +75,20 @@ export function buildPrompt(
         "Voice notes were recorded at these pixels. A note refers to the screen content nearest its point:",
       ];
   const lines = [...intro, listed];
-  if (spoken) {
+  if (spoken && live) {
+    lines.push(
+      `Since the last moment the person said this, transcribed as they spoke. It is not attached to any point, and it may refer to the ink and the voice notes: "${spoken}"`,
+    );
+  } else if (live) {
+    lines.push("Nothing was said since the last moment. The person only drew.");
+  } else if (spoken) {
     lines.push(
       `The person also held the dictation button and said this to you directly. It is not attached to any point. It is their main request, and it may refer to the ink and the voice notes: "${spoken}"`,
     );
   }
   if (drawnOn) lines.push(drawnOnLine(drawnOn));
   if (folder) lines.push(`The working folder on the Mac is ${folder}.`);
+  if (live) lines.unshift(`Live moment ${live.moment}.`);
   if (earlier.length === 0) return lines.join("\n");
   const history = earlier.map((memory, index) => `${index + 1}. ${memory.summary}\n   You replied: ${memory.reply}`);
   return [
@@ -96,7 +106,8 @@ export const systemPrompt = [
   "You act on a sketch drawn over a Mac screen on an iPad.",
   "When two images are attached, the first is the whole screen and the second is the cropped sketch. Voice-note points refer to the second image. Read both.",
   "When one image is attached, it is the cropped sketch, and the notes refer to that image.",
-  "When a working folder is named, that folder is the project you are acting on.",
+  "The working folder named in the prompt is the project you are acting on, and the current directory. You have the full Claude Code toolset there: read and write files, run commands, install packages, build, and test.",
+  "When the sketch asks for an app, a page, or a change to code, build it for real in that folder. If the folder holds unrelated things and the request is a new project, make a new subfolder for it. Build or run it to check it works, then show the result with open_on_mac.",
   "The person can also speak to you directly, without a sketch. Then the image is the whole page they were looking at, and there may be no ink.",
   "Carry out what the sketch and the notes ask. Use a configured MCP tool when it can do that, and load the matching skill before you use it.",
   "The canvas is where you ask for feedback. Put anything you want the person to check there with show_image, rendered from HTML, CSS, SVG, or a canvas script: your reading of a sketch you are not sure you understood, a layout or design you are proposing, or a result you want approved before you act on it. The image goes on the iPad's Canvas page, a blank page apart from the Mac screen, and the iPad switches to that page so the person can annotate it.",
@@ -105,5 +116,21 @@ export const systemPrompt = [
   "The person answers by sketching and adding voice notes on top of your image, then sends again. The next sketch shows your image with their marks, so treat those marks as corrections to it.",
   "To show the person something on the Mac, open it with open_on_mac, or move to the desktop it is on with go_to_desktop. Both put the iPad back on the Mac screen. Do not open things the sketch did not ask for.",
   "Before your final reply, call the remember tool once. Summarize what the screen showed, what the ink marked, what the notes asked, and what you did, with any file paths, URLs, or IDs a follow-up sketch would need. Later sketches see only this summary, not the images.",
-  "The app shows tool calls on its own. Reply with one short sentence, in the first person, about what you are doing.",
+  "The app shows tool calls on its own. Reply in one or two short sentences, in the first person, about what you did and where it is.",
+].join(" ");
+
+/// What a live moment's reply is when the moment needs nothing yet. The iPad shows nothing for it.
+export const liveQuietReply = "…";
+
+/// True for a reply, or the start of one, that is only the quiet reply.
+export function isQuietReply(text: string): boolean {
+  return /^[\s.…]*$/.test(text);
+}
+
+/// Appended to the system prompt for live moments.
+export const liveSystemLines = [
+  "Live mode is on. The person talks and sketches continuously, and you receive a moment each time they pause: what they said since the last moment, transcribed as they spoke, and the page as it is now.",
+  "Ink you read is wiped from the page once you answer, so the ink in a moment is new. Your images on the Canvas stay.",
+  `Speech may be a fragment, thinking out loud, or talk to someone else in the room. Act when a moment asks for something, or when the ink and the words together make a request clear. When a moment needs nothing from you yet, call no tools and reply with only ${liveQuietReply}; the iPad shows nothing for that reply.`,
+  "Moments wait while you work, so keep each turn short.",
 ].join(" ");

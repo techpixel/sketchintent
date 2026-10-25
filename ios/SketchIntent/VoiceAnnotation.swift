@@ -87,66 +87,45 @@ final class VoicePermissionGate {
     }
 }
 
-/// Streams the microphone to Cartesia Ink-2 and reports the live transcript.
-/// Partial transcripts are delivered on the main queue. Start and stop from the main queue.
-final class VoiceTranscriber {
-    var onPartial: ((String) -> Void)?
-    var onFailure: ((String) -> Void)?
+/// The microphone as 16 kHz mono 16-bit PCM, the format Cartesia takes.
+/// Start and stop from the main queue. `onPCM` runs on the audio tap's thread.
+final class MicrophoneTap {
+    static let sampleRate = 16_000
 
     /// Replaced after the audio session is active. An engine created earlier keeps
     /// a stale hardware rate, and `installTap` terminates the app when they differ.
     private var engine = AVAudioEngine()
-    private let sampleRate = 16_000
-    private let chunkBytes = 3_200
-    private var socket: URLSessionWebSocketTask?
     private var converter: AVAudioConverter?
     private var targetFormat: AVAudioFormat?
     private var tapInstalled = false
-    private var listening = false
-    private var generation = 0
-    private let lock = NSLock()
-    private var pending = Data()
-    private var finishedTurns: [String] = []
-    private var activeTurn = ""
-    private var latest = ""
 
-    func start() throws {
-        guard !CartesiaSettings.apiKey.isEmpty else {
-            throw VoiceCaptureBlock.missingKey
-        }
-        generation += 1
-        finishedTurns = []
-        activeTurn = ""
-        pending.removeAll()
-        store("")
-        tearDownEngine()
-        listening = true
+    func start(onPCM: @escaping (Data) -> Void) throws {
+        stop()
         do {
-            try beginEngine()
-            try openSocket()
+            try beginEngine(onPCM: onPCM)
         } catch let block as VoiceCaptureBlock {
-            listening = false
-            tearDownEngine()
+            stop()
             throw block
         } catch {
-            listening = false
-            tearDownEngine()
+            stop()
             throw VoiceCaptureBlock.unavailable
         }
     }
 
-    func stop() -> String {
-        let text = currentText()
-        guard listening else { return text }
-        listening = false
-        generation += 1
-        flushPending()
-        socket?.send(.string("{\"type\":\"close\"}")) { _ in }
-        tearDownEngine()
-        return text
+    func stop() {
+        if engine.isRunning {
+            engine.stop()
+        }
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        converter = nil
+        targetFormat = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    private func beginEngine() throws {
+    private func beginEngine(onPCM: @escaping (Data) -> Void) throws {
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(
             .playAndRecord,
@@ -169,7 +148,7 @@ final class VoiceTranscriber {
         let format = try tapFormat(for: input)
         guard let target = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
-            sampleRate: Double(sampleRate),
+            sampleRate: Double(Self.sampleRate),
             channels: 1,
             interleaved: true
         ) else {
@@ -178,7 +157,8 @@ final class VoiceTranscriber {
         targetFormat = target
         converter = AVAudioConverter(from: format, to: target)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.consume(buffer)
+            guard let pcm = self?.convert(buffer) else { return }
+            onPCM(pcm)
         }
         tapInstalled = true
         try engine.start()
@@ -207,96 +187,6 @@ final class VoiceTranscriber {
         return format
     }
 
-    private func openSocket() throws {
-        var components = URLComponents()
-        components.scheme = "wss"
-        components.host = "api.cartesia.ai"
-        components.path = "/stt/turns/websocket"
-        components.queryItems = [
-            URLQueryItem(name: "model", value: "ink-2"),
-            URLQueryItem(name: "encoding", value: "pcm_s16le"),
-            URLQueryItem(name: "sample_rate", value: String(sampleRate)),
-            URLQueryItem(name: "cartesia_version", value: "2026-08-14")
-        ]
-        guard let url = components.url else {
-            throw VoiceCaptureBlock.unavailable
-        }
-        var request = URLRequest(url: url)
-        request.setValue(CartesiaSettings.apiKey, forHTTPHeaderField: "X-API-Key")
-        let socket = URLSession.shared.webSocketTask(with: request)
-        self.socket = socket
-        socket.resume()
-        receive(generation: generation)
-    }
-
-    private func receive(generation: Int) {
-        socket?.receive { [weak self] result in
-            guard let self, self.generation == generation, self.listening else { return }
-            switch result {
-            case .success(let message):
-                self.handle(message)
-                self.receive(generation: generation)
-            case .failure:
-                DispatchQueue.main.async {
-                    guard self.generation == generation, self.listening else { return }
-                    if self.currentText().isEmpty {
-                        self.fail(VoiceCaptureBlock.unavailable.message)
-                    }
-                }
-            }
-        }
-    }
-
-    private func handle(_ message: URLSessionWebSocketTask.Message) {
-        let text: String?
-        switch message {
-        case .string(let value):
-            text = value
-        case .data(let value):
-            text = String(data: value, encoding: .utf8)
-        @unknown default:
-            text = nil
-        }
-        guard let text, let data = text.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = json["type"] as? String else { return }
-        switch type {
-        case "turn.update", "turn.eager_end", "turn.resume":
-            if let transcript = json["transcript"] as? String {
-                activeTurn = transcript
-                publish()
-            }
-        case "turn.end":
-            if let transcript = json["transcript"] as? String {
-                commitTurn(transcript)
-            }
-            publish()
-        case "error":
-            let message = (json["message"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                ?? VoiceCaptureBlock.unavailable.message
-            DispatchQueue.main.async { [weak self] in
-                self?.fail(message)
-            }
-        default:
-            break
-        }
-    }
-
-    private func consume(_ buffer: AVAudioPCMBuffer) {
-        guard listening, let pcm = convert(buffer) else { return }
-        lock.lock()
-        pending.append(pcm)
-        var chunks: [Data] = []
-        while pending.count >= chunkBytes {
-            chunks.append(pending.prefix(chunkBytes))
-            pending.removeFirst(chunkBytes)
-        }
-        lock.unlock()
-        for chunk in chunks {
-            send(chunk)
-        }
-    }
-
     private func convert(_ buffer: AVAudioPCMBuffer) -> Data? {
         guard let targetFormat else { return nil }
         if converter == nil || converter?.inputFormat.sampleRate != buffer.format.sampleRate {
@@ -322,18 +212,167 @@ final class VoiceTranscriber {
         guard count > 0 else { return nil }
         return Data(bytes: samples[0], count: count)
     }
+}
 
-    private func send(_ data: Data) {
-        socket?.send(.data(data)) { _ in }
+/// One Cartesia Ink-2 turns socket. Audio goes out in 100 ms chunks. Set the callbacks,
+/// then `open`. They run on URLSession's queue.
+final class CartesiaTurns {
+    /// Every finished turn and the one still being spoken, joined. Called only with words.
+    var onTranscript: ((String) -> Void)?
+    /// Cartesia sent an error, or the socket dropped before any words came back.
+    var onFailure: ((String) -> Void)?
+    /// The socket is closed after `finish`, so the transcript is final. `cancel` skips this.
+    var onClosed: (() -> Void)?
+
+    private static let chunkBytes = 3_200
+    private let socket: URLSessionWebSocketTask
+    private let lock = NSLock()
+    private var pending = Data()
+    private var finishedTurns: [String] = []
+    private var activeTurn = ""
+    private var finishing = false
+    private var ended = false
+
+    init(apiKey: String) throws {
+        var components = URLComponents()
+        components.scheme = "wss"
+        components.host = "api.cartesia.ai"
+        components.path = "/stt/turns/websocket"
+        components.queryItems = [
+            URLQueryItem(name: "model", value: "ink-2"),
+            URLQueryItem(name: "encoding", value: "pcm_s16le"),
+            URLQueryItem(name: "sample_rate", value: String(MicrophoneTap.sampleRate)),
+            URLQueryItem(name: "cartesia_version", value: "2026-08-14")
+        ]
+        guard let url = components.url else {
+            throw VoiceCaptureBlock.unavailable
+        }
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        socket = URLSession.shared.webSocketTask(with: request)
     }
 
-    private func flushPending() {
+    func open() {
+        socket.resume()
+        receive()
+    }
+
+    var text: String {
         lock.lock()
+        defer { lock.unlock() }
+        return displayedText()
+    }
+
+    /// Queues audio. Sends wait for the socket to connect, so audio from before it opened is kept.
+    func append(_ pcm: Data) {
+        lock.lock()
+        guard !finishing, !ended else {
+            lock.unlock()
+            return
+        }
+        pending.append(pcm)
+        var chunks: [Data] = []
+        while pending.count >= Self.chunkBytes {
+            chunks.append(pending.prefix(Self.chunkBytes))
+            pending.removeFirst(Self.chunkBytes)
+        }
+        lock.unlock()
+        for chunk in chunks {
+            socket.send(.data(chunk)) { _ in }
+        }
+    }
+
+    /// Sends the rest of the audio and asks Cartesia to close. The socket stays open for its
+    /// last words, up to `timeout`. No audio is sent after this, so the wait costs nothing.
+    func finish(timeout: TimeInterval = 2) {
+        lock.lock()
+        guard !finishing, !ended else {
+            lock.unlock()
+            return
+        }
+        finishing = true
         let rest = pending
         pending.removeAll()
         lock.unlock()
         if !rest.isEmpty {
-            send(rest)
+            socket.send(.data(rest)) { _ in }
+        }
+        socket.send(.string("{\"type\":\"close\"}")) { _ in }
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+            self.end(notify: true)
+        }
+    }
+
+    func cancel() {
+        end(notify: false)
+    }
+
+    private func end(notify: Bool) {
+        lock.lock()
+        guard !ended else {
+            lock.unlock()
+            return
+        }
+        ended = true
+        lock.unlock()
+        socket.cancel(with: .goingAway, reason: nil)
+        if notify {
+            onClosed?()
+        }
+    }
+
+    private func receive() {
+        socket.receive { result in
+            switch result {
+            case .success(let message):
+                self.handle(message)
+                self.receive()
+            case .failure:
+                self.lock.lock()
+                let quiet = !self.finishing && !self.ended && self.displayedText().isEmpty
+                self.lock.unlock()
+                if quiet {
+                    self.onFailure?(VoiceCaptureBlock.unavailable.message)
+                }
+                self.end(notify: !quiet)
+            }
+        }
+    }
+
+    private func handle(_ message: URLSessionWebSocketTask.Message) {
+        let text: String?
+        switch message {
+        case .string(let value):
+            text = value
+        case .data(let value):
+            text = String(data: value, encoding: .utf8)
+        @unknown default:
+            text = nil
+        }
+        guard let text, let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else { return }
+        switch type {
+        case "turn.update", "turn.eager_end", "turn.resume":
+            if let transcript = json["transcript"] as? String {
+                lock.lock()
+                activeTurn = transcript
+                lock.unlock()
+                publish()
+            }
+        case "turn.end":
+            if let transcript = json["transcript"] as? String {
+                lock.lock()
+                commitTurn(transcript)
+                lock.unlock()
+            }
+            publish()
+        case "error":
+            let message = (json["message"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? VoiceCaptureBlock.unavailable.message
+            onFailure?(message)
+        default:
+            break
         }
     }
 
@@ -346,13 +385,9 @@ final class VoiceTranscriber {
     }
 
     private func publish() {
-        let text = displayedText()
-        store(text)
+        let text = self.text
         guard !text.isEmpty else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.listening else { return }
-            self.onPartial?(text)
-        }
+        onTranscript?(text)
     }
 
     private func displayedText() -> String {
@@ -363,39 +398,79 @@ final class VoiceTranscriber {
         }
         return parts.joined(separator: " ")
     }
+}
+
+/// Streams the microphone to Cartesia Ink-2 and reports the live transcript.
+/// Partial transcripts are delivered on the main queue. Start and stop from the main queue.
+final class VoiceTranscriber {
+    var onPartial: ((String) -> Void)?
+    var onFailure: ((String) -> Void)?
+
+    private let microphone = MicrophoneTap()
+    private var turns: CartesiaTurns?
+    private var listening = false
+    private var generation = 0
+
+    func start() throws {
+        guard !CartesiaSettings.apiKey.isEmpty else {
+            throw VoiceCaptureBlock.missingKey
+        }
+        tearDown()
+        generation += 1
+        let current = generation
+        listening = true
+        do {
+            let turns = try CartesiaTurns(apiKey: CartesiaSettings.apiKey)
+            turns.onTranscript = { [weak self] text in
+                DispatchQueue.main.async {
+                    guard let self, self.generation == current, self.listening else { return }
+                    self.onPartial?(text)
+                }
+            }
+            turns.onFailure = { [weak self] message in
+                DispatchQueue.main.async {
+                    guard let self, self.generation == current, self.listening else { return }
+                    self.fail(message)
+                }
+            }
+            self.turns = turns
+            turns.open()
+            try microphone.start { pcm in
+                turns.append(pcm)
+            }
+        } catch let block as VoiceCaptureBlock {
+            listening = false
+            tearDown()
+            throw block
+        } catch {
+            listening = false
+            tearDown()
+            throw VoiceCaptureBlock.unavailable
+        }
+    }
+
+    func stop() -> String {
+        let text = turns?.text ?? ""
+        guard listening else { return text }
+        listening = false
+        generation += 1
+        microphone.stop()
+        turns?.finish()
+        turns = nil
+        return text
+    }
 
     private func fail(_ message: String) {
         listening = false
         generation += 1
-        tearDownEngine()
+        tearDown()
         onFailure?(message)
     }
 
-    private func store(_ text: String) {
-        lock.lock()
-        latest = text
-        lock.unlock()
-    }
-
-    private func currentText() -> String {
-        lock.lock()
-        defer { lock.unlock() }
-        return latest
-    }
-
-    private func tearDownEngine() {
-        if engine.isRunning {
-            engine.stop()
-        }
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
-        converter = nil
-        targetFormat = nil
-        socket?.cancel(with: .goingAway, reason: nil)
-        socket = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    private func tearDown() {
+        microphone.stop()
+        turns?.cancel()
+        turns = nil
     }
 }
 

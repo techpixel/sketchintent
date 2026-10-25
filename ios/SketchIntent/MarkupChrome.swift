@@ -11,6 +11,9 @@ enum ChromeMetrics {
     static let pillCornerRadius: CGFloat = 8
     static let buttonCornerRadius: CGFloat = 16
     static let sendWidth: CGFloat = 200
+    /// The record button beside Send, and the gap between them. Figma 56:1122.
+    static let recordWidth: CGFloat = 44
+    static let sendGap: CGFloat = 8
     static let toolWidth: CGFloat = 50
     static let toolCornerRadius: CGFloat = 8
     static let toolGap: CGFloat = 8
@@ -32,6 +35,8 @@ private extension Color {
     static let chromeButton = Color("ChromeButton")
     static let toolSelected = Color("ToolSelected")
     static let canvasLine = Color("CanvasLine")
+    static let liveRed = Color("LiveRed")
+    static let liveRedDim = Color("LiveRedDim")
 }
 
 /// What the middle of the screen shows: the dotted canvas, or one Mac desktop.
@@ -41,7 +46,8 @@ enum CanvasSurface: Hashable {
     case desktop(Int)
 }
 
-/// Sidebar toggle, working folder, desktop picker, send, and settings. Figma 51:823.
+/// Sidebar toggle, working folder, desktop picker, send, live, and settings. Figma 51:823,
+/// with the record button from 56:1087 and the live state from 56:1125.
 struct TopBar: View {
     @Binding var showsSidebar: Bool
     var workingFolder: String
@@ -51,11 +57,13 @@ struct TopBar: View {
     var desktopCount: Int
     var canSend: Bool
     var isSending: Bool
+    var isLive: Bool
     var onChooseFolder: () -> Void
     var onClearFolder: () -> Void
     var onSurface: (CanvasSurface) -> Void
     var onSend: () -> Void
     var onStop: () -> Void
+    var onLive: () -> Void
     var onSettings: () -> Void
 
     var body: some View {
@@ -66,7 +74,7 @@ struct TopBar: View {
                     folderMenu
                     surfaceMenu
                 }
-                Spacer(minLength: ChromeMetrics.sendWidth + 32)
+                Spacer(minLength: ChromeMetrics.sendWidth + ChromeMetrics.sendGap + ChromeMetrics.recordWidth + 32)
                 Button(action: onSettings) {
                     Image(systemName: "gear")
                         .font(.title2)
@@ -75,7 +83,14 @@ struct TopBar: View {
                 }
                 .accessibilityLabel("Settings")
             }
-            sendButton
+            if isLive {
+                liveButton
+            } else {
+                HStack(spacing: ChromeMetrics.sendGap) {
+                    sendButton
+                    recordButton
+                }
+            }
         }
         .padding(.horizontal, ChromeMetrics.edgeInset)
         .frame(height: ChromeMetrics.topBarHeight)
@@ -179,6 +194,37 @@ struct TopBar: View {
         .disabled(!isSending && !canSend)
         .opacity(isSending || canSend ? 1 : 0.4)
         .accessibilityLabel(isSending ? "Stop agent" : "Send to AI")
+    }
+
+    /// Red record button. Starts live mode, where the agent hears and sees the page without Send.
+    private var recordButton: some View {
+        Button(action: onLive) {
+            Image(systemName: "record.circle")
+                .font(.title2)
+                .foregroundStyle(.black)
+                .padding(8)
+                .background(Color.liveRed, in: RoundedRectangle(cornerRadius: ChromeMetrics.toolCornerRadius, style: .continuous))
+        }
+        .accessibilityLabel("Go live")
+        .accessibilityHint("The agent listens and watches the page, and answers when you pause")
+    }
+
+    /// Dark red while live. Tapping it ends live mode.
+    private var liveButton: some View {
+        Button(action: onLive) {
+            Image(systemName: "record.circle.fill")
+                .font(.title2)
+                .foregroundStyle(Color.liveRed)
+                .symbolEffect(.pulse, options: .repeating)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .frame(width: ChromeMetrics.sendWidth)
+                .background(
+                    Color.liveRedDim,
+                    in: RoundedRectangle(cornerRadius: ChromeMetrics.buttonCornerRadius, style: .continuous)
+                )
+        }
+        .accessibilityLabel("End live mode")
     }
 }
 
@@ -359,24 +405,32 @@ struct BottomBar: View {
 struct AgentSidebar: View {
     var turns: [AgentTurn]
     var isSending: Bool
-    /// What the dictation button has heard so far, or nil when it is not held.
+    var isLive: Bool
+    /// What the dictation button, or live mode, has heard so far. Nil while nobody is talking.
     var heard: String?
     var onStop: () -> Void
 
     private static let listeningID = "listening"
+
+    /// How many lines sit below the turn at `index`, so each line knows how far back it is.
+    private func newerLines(than index: Int) -> Int {
+        turns[(index + 1)...].reduce(heard == nil ? 0 : 1) { $0 + AgentTurnView.lineCount(of: $1) }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             GeometryReader { proxy in
                 ScrollViewReader { reader in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 28) {
+                        VStack(alignment: .leading, spacing: isLive ? 20 : 28) {
                             if turns.isEmpty && heard == nil {
-                                Text("Sketch on the screen, then send it to the agent. Or hold the dictation button and talk to it.")
+                                Text(isLive
+                                    ? "Live. Talk and sketch. The agent picks it up each time you pause."
+                                    : "Sketch on the screen, then send it to the agent. Or hold the dictation button and talk to it.")
                                     .foregroundStyle(.white.opacity(0.5))
                             }
-                            ForEach(turns) { turn in
-                                AgentTurnView(turn: turn)
+                            ForEach(Array(turns.enumerated()), id: \.element.id) { index, turn in
+                                AgentTurnView(turn: turn, newerLines: newerLines(than: index))
                                     .id(turn.id)
                             }
                             if let heard {
@@ -421,32 +475,94 @@ struct AgentSidebar: View {
     }
 }
 
-/// The prompt is half white. Tool calls are half yellow with the tool name in bold, and
-/// canvas renders are blue. Replies are yellow at 80%, read as Markdown. While the agent works, "Reading the
+/// The prompt is white. Tool calls are yellow with the tool name in bold, and canvas renders
+/// are blue. Replies are yellow, read as Markdown. While the agent works, "Reading the
 /// canvas..." (blue, Figma 55:1033) shows until it first acts, then "Thinking...". Figma 53:929.
+/// A live turn puts the time before each line. Figma 56:1215.
+/// Across the whole log, the newest line is full, the one before it 80%, and older lines 60%.
 private struct AgentTurnView: View {
     var turn: AgentTurn
+    /// Lines in later turns, and the listening row.
+    var newerLines: Int
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if !turn.prompt.isEmpty {
-                Text(turn.prompt)
-                    .foregroundStyle(.white.opacity(0.5))
+        VStack(alignment: .leading, spacing: turn.live ? 20 : 14) {
+            if Self.showsPrompt(turn) {
+                line(0, at: turn.startedAt) {
+                    Text(turn.prompt.isEmpty ? "Sketched" : turn.prompt)
+                        .foregroundStyle(.white)
+                }
             }
-            ForEach(Array(turn.steps.enumerated()), id: \.offset) { _, step in
-                stepView(step)
+            ForEach(Array(turn.steps.enumerated()), id: \.offset) { index, entry in
+                line(stepsStart + index, at: entry.at, tint: Color.agentYellow) {
+                    stepView(entry.step)
+                }
             }
             switch turn.state {
             case .working:
-                ThinkingRow(reading: turn.steps.isEmpty)
+                line(lineCount - 1, at: turn.steps.last?.at ?? turn.startedAt, tint: Color.agentYellow) {
+                    ThinkingRow(reading: turn.steps.isEmpty)
+                }
             case .stopped:
                 Text("Stopped")
-                    .foregroundStyle(.white.opacity(0.5))
+                    .foregroundStyle(.white)
+                    .opacity(opacity(lineCount - 1))
+                    .padding(.leading, turn.live ? Self.timeWidth + 10 : 0)
             case .finished:
                 EmptyView()
             }
         }
         .fixedSize(horizontal: false, vertical: true)
+    }
+
+    static func showsPrompt(_ turn: AgentTurn) -> Bool {
+        !turn.prompt.isEmpty || turn.live
+    }
+
+    /// The prompt, each step, and the working or stopped row.
+    static func lineCount(of turn: AgentTurn) -> Int {
+        (showsPrompt(turn) ? 1 : 0) + turn.steps.count + (turn.state == .finished ? 0 : 1)
+    }
+
+    private var lineCount: Int { Self.lineCount(of: turn) }
+    private var stepsStart: Int { Self.showsPrompt(turn) ? 1 : 0 }
+
+    private func opacity(_ position: Int) -> Double {
+        switch newerLines + lineCount - 1 - position {
+        case 0: 1
+        case 1: 0.8
+        default: 0.6
+        }
+    }
+
+    private static let timeWidth: CGFloat = 33
+    private static let timeFormat = Date.FormatStyle()
+        .hour(.defaultDigits(amPM: .omitted))
+        .minute(.twoDigits)
+
+    /// The line alone, or for a live turn, the time it happened and then the line.
+    @ViewBuilder
+    private func line<Content: View>(
+        _ position: Int,
+        at date: Date,
+        tint: Color = .white,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Group {
+            if turn.live {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(date, format: Self.timeFormat)
+                        .monospacedDigit()
+                        .foregroundStyle(tint)
+                        .frame(minWidth: Self.timeWidth, alignment: .leading)
+                    content()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                content()
+            }
+        }
+        .opacity(opacity(position))
     }
 
     @ViewBuilder
@@ -455,14 +571,12 @@ private struct AgentTurnView: View {
         case .status(let lead, let name, let onCanvas):
             statusText(lead: lead, name: name)
                 .foregroundStyle(onCanvas ? Color.agentBlue : Color.agentYellow)
-                .opacity(onCanvas ? 0.8 : 0.5)
         case .text(let text):
             MarkdownText(source: text)
                 .foregroundStyle(Color.agentYellow)
-                .opacity(0.8)
         case .error(let message):
             Text(message)
-                .foregroundStyle(.white.opacity(0.8))
+                .foregroundStyle(.white)
         }
     }
 
@@ -472,7 +586,7 @@ private struct AgentTurnView: View {
     }
 }
 
-/// The words heard while the dictation button is held, in the prompt's half white.
+/// The words heard while the dictation button is held, in the prompt's white. Always the newest line.
 private struct ListeningRow: View {
     var heard: String
 
@@ -482,7 +596,7 @@ private struct ListeningRow: View {
                 .foregroundStyle(Color.agentYellow)
                 .accessibilityHidden(true)
             Text(heard.isEmpty ? "Listening..." : heard)
-                .foregroundStyle(.white.opacity(heard.isEmpty ? 0.5 : 0.8))
+                .foregroundStyle(.white)
         }
         .fixedSize(horizontal: false, vertical: true)
     }

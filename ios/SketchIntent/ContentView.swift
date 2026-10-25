@@ -40,6 +40,8 @@ struct ContentView: View {
     @StateObject private var sketch = SketchCanvas()
     @StateObject private var intent = IntentClient()
     @StateObject private var dictation = AgentDictation()
+    @StateObject private var live = LiveSession()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var dictationHaptic = UIImpactFeedbackGenerator(style: .medium)
     @State private var tool = SketchTool.pen
     @State private var showsSidebar = false
@@ -128,11 +130,13 @@ struct ContentView: View {
                     desktopCount: client.desktopCount,
                     canSend: sketch.hasInk && !intent.isSending,
                     isSending: intent.isSending,
+                    isLive: live.isOn,
                     onChooseFolder: { client.requestWorkingFolder() },
                     onClearFolder: { client.clearWorkingFolder() },
                     onSurface: selectSurface,
                     onSend: { sendSketch() },
                     onStop: stopAgent,
+                    onLive: toggleLive,
                     onSettings: { showsSettings = true }
                 )
                 HStack(spacing: 0) {
@@ -140,7 +144,8 @@ struct ContentView: View {
                         AgentSidebar(
                             turns: intent.turns,
                             isSending: intent.isSending,
-                            heard: dictation.heard,
+                            isLive: live.isOn,
+                            heard: live.isOn ? live.heard : dictation.heard,
                             onStop: stopAgent
                         )
                             .transition(.move(edge: .leading))
@@ -228,9 +233,27 @@ struct ContentView: View {
                     sketch.cancelSent()
                 }
             }
+            live.canSend = {
+                !intent.isSending && client.isConnected && !sketch.isMarking
+            }
+            live.send = { spoken in
+                sendSketch(spoken: spoken, live: true)
+            }
+            live.onFailure = { message in
+                showsSidebar = true
+                intent.fail(message)
+            }
+            sketch.onEdit = { live.pageEdited() }
+            sketch.onVoiceNoteMic = { claimed in
+                live.hold(.voiceNote, claimed)
+            }
             toolSelection.prepare()
             dictationHaptic.prepare()
             updateIdleTimer()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // The microphone is never kept in the background.
+            live.hold(.background, phase == .background)
         }
         .onChange(of: client.hasFrame) { _, _ in
             updateIdleTimer()
@@ -345,9 +368,10 @@ struct ContentView: View {
         UIApplication.shared.isIdleTimerDisabled = client.hasFrame || blankCanvas
     }
 
-    /// Sends the sketch. `spoken` is what was said through the dictation button. Words go
-    /// out even on an empty page, which is then sent whole so the agent sees what was on screen.
-    private func sendSketch(spoken: String = "") {
+    /// Sends the sketch. `spoken` is what was said through the dictation button, or in live mode.
+    /// Words go out even on an empty page, which is then sent whole so the agent sees what was on screen.
+    /// `live` marks a moment from live mode.
+    private func sendSketch(spoken: String = "", live: Bool = false) {
         guard !intent.isSending else { return }
         let wholePage = !spoken.isEmpty
         // An empty desktop is only looked at, so its live picture keeps playing.
@@ -364,7 +388,7 @@ struct ContentView: View {
             intent.fail("The Mac isn't connected")
             return
         }
-        let request = intent.begin(sketch, folder: client.workingFolder, spoken: spoken, drawnOn: drawnOn)
+        let request = intent.begin(sketch, folder: client.workingFolder, spoken: spoken, drawnOn: drawnOn, live: live)
         agentPlacements = [request.id: sketch.placement]
         if client.sendIntent(request) {
             self.sketch.markSent()
@@ -373,9 +397,21 @@ struct ContentView: View {
         }
     }
 
+    /// Live mode sends what is said and drawn on its own, a moment at a time. The sidebar opens
+    /// to show it.
+    private func toggleLive() {
+        if live.isOn {
+            live.stop()
+        } else {
+            showsSidebar = true
+            live.start()
+        }
+    }
+
     /// Holding the dictation button talks to the agent. The sidebar shows the words as they come.
+    /// Live mode is already listening, so the hold does nothing then.
     private func beginDictation() {
-        guard !intent.isSending else { return }
+        guard !intent.isSending, !live.isOn else { return }
         showsSidebar = true
         dictationHaptic.impactOccurred()
         dictationHaptic.prepare()
