@@ -477,9 +477,13 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private let pagePan = UIPanGestureRecognizer()
     private let pagePanGate = PagePanGate()
     private var pagePanOpen = false
-    /// How far the page has moved since undo was last cleared. Each undo snapshot keeps
-    /// the shift it was taken at, so restoring one lands where the page sits now.
-    private var pageShift = CGPoint.zero
+    /// How far the page has moved, and how much it was scaled to follow the picture, since
+    /// undo was last cleared. Each undo snapshot keeps the transform it was taken at, so
+    /// restoring one lands where the page sits now.
+    private var pageTransform = CGAffineTransform.identity
+    /// The picture each desktop's sketch was laid out on. When the picture moves or resizes,
+    /// that sketch is fitted to it again.
+    private var picturesBySpace: [String: CGRect] = [:]
     var onFingerPinch: (CGFloat, TrackpadScrollPhase) -> Void = { _, _ in }
     private var drawings: [String: PKDrawing] = [:]
     private var currentSpaceID: String?
@@ -568,7 +572,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var marks: [ShapeMark]
         var selectedShapeID: UUID?
         var images: [AgentImage] = []
-        var shift = CGPoint.zero
+        var pageTransform = CGAffineTransform.identity
     }
     /// UndoManager retains its target. This proxy keeps that retain from cycling back to the overlay.
     /// The selector form is required. The closure form of `registerUndo` shares a callback with
@@ -754,6 +758,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let sizeChanged = frameWidth != width || frameHeight != height
         frameWidth = width
         frameHeight = height
+        if sizeChanged {
+            fitPageToPicture()
+        }
         if sizeChanged, !inkGestureOpen {
             publishInk(immediate: true)
         }
@@ -1425,7 +1432,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             finishPagePan()
         }
         sketchUndo.removeAllActions()
-        pageShift = .zero
+        pageTransform = .identity
         gestureUndoSnapshot = nil
         pendingUndoSnapshot = nil
         shapeDragUndo = nil
@@ -1462,6 +1469,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let adoptingExistingInk = currentSpaceID == nil && !canvas.drawing.strokes.isEmpty
         let adoptingNotes = currentSpaceID == nil && !notes.isEmpty
         let adoptingShapes = currentSpaceID == nil && !shapeMarks.isEmpty
+        if currentSpaceID == nil, let picture = picturesBySpace.removeValue(forKey: "") {
+            picturesBySpace[id] = picture
+        }
         currentSpaceID = id
         if adoptingExistingInk {
             drawings[id] = canvas.drawing
@@ -1500,6 +1510,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         noteLayer.setLive(anchor: nil, text: "")
         noteLayer.setNotice(anchor: nil, text: "")
         noteLayer.setSaved(notes: notes, openID: nil)
+        // This desktop's sketch may have been laid out on a different picture.
+        fitPageToPicture()
         publishInk(immediate: true)
         refreshReadingPulse()
     }
@@ -1610,9 +1622,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     private func shiftPage(by delta: CGPoint) {
         guard delta.x != 0 || delta.y != 0 else { return }
-        let move = CGAffineTransform(translationX: delta.x, y: delta.y)
-        pageShift.x += delta.x
-        pageShift.y += delta.y
+        transformPage(by: CGAffineTransform(translationX: delta.x, y: delta.y))
+    }
+
+    /// Moves or scales everything on this desktop's page: ink, shapes, notes, the agent's
+    /// images, and what was sent to the agent.
+    private func transformPage(by move: CGAffineTransform) {
+        let scale = sqrt(abs(move.a * move.d - move.b * move.c))
+        pageTransform = pageTransform.concatenating(move)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         isApplyingSmoothedStroke = true
@@ -1621,6 +1638,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         shapeMarks = shapeMarks.map { mark in
             var mark = mark
             mark.shape = mark.shape.applying(move)
+            mark.width *= scale
             return mark
         }
         notes = notes.map { note in
@@ -1636,7 +1654,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         if var sentSketch = sent, sentSketch.spaceID == currentSpaceID {
             sentSketch.strokes = PKDrawing(strokes: sentSketch.strokes).transformed(using: move).strokes
             sent = sentSketch
-            readingPulse.frame = readingPulse.frame.offsetBy(dx: delta.x, dy: delta.y)
+            if scale == 1 {
+                readingPulse.frame = readingPulse.frame.applying(move)
+            } else {
+                refreshReadingPulse()
+            }
         }
         if let currentSpaceID {
             drawings[currentSpaceID] = canvas.drawing
@@ -1647,7 +1669,37 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         agentImageLayer.show(agentImages)
         noteLayer.setSaved(notes: notes, openID: openNoteID)
         refreshShapeHandles()
+        if !lassoSelection.isEmpty {
+            lassoBox = boxEnclosing(indexes: lassoSelection)
+            refreshLassoChrome()
+        }
         CATransaction.commit()
+    }
+
+    /// Keeps this desktop's sketch on the screen content it marks. Opening the sidebar, or a
+    /// new picture size, moves and resizes the letterboxed picture, and the page follows it.
+    /// The blank canvas has no picture, so its page stays put.
+    private func fitPageToPicture() {
+        let key = currentSpaceID ?? ""
+        guard let picture = pictureDrawingRect(), picture.width > 1, picture.height > 1 else { return }
+        guard let old = picturesBySpace[key], old != picture else {
+            picturesBySpace[key] = picture
+            return
+        }
+        // A stroke or drag in progress finishes first, so the page never moves under it.
+        if penStrokeOpen || eraserOpen || pagePanOpen || shapeAdjust != nil || strokeAdjust != nil || lassoTransforming {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.fitPageToPicture()
+                self?.publishInk(immediate: true)
+            }
+            return
+        }
+        picturesBySpace[key] = picture
+        let fit = CGAffineTransform(translationX: -old.minX, y: -old.minY)
+            .concatenating(CGAffineTransform(scaleX: picture.width / old.width, y: picture.height / old.height))
+            .concatenating(CGAffineTransform(translationX: picture.minX, y: picture.minY))
+        transformPage(by: fit)
+        reportInk()
     }
 
     private func finishPagePan() {
@@ -1661,6 +1713,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         placeLayers()
         if bounds.width > 1, bounds.height > 1, bounds.size != inkLayoutSize {
             inkLayoutSize = bounds.size
+            fitPageToPicture()
             if !inkGestureOpen {
                 publishInk(immediate: true)
             }
@@ -2276,16 +2329,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             marks: shapeMarks,
             selectedShapeID: selectedShapeID,
             images: agentImages,
-            shift: pageShift
+            pageTransform: pageTransform
         )
     }
 
-    /// The snapshot moved by however far the page has panned since it was taken.
-    private func shifted(_ snapshot: SketchUndoSnapshot, to shift: CGPoint) -> SketchUndoSnapshot {
-        let dx = shift.x - snapshot.shift.x
-        let dy = shift.y - snapshot.shift.y
-        guard dx != 0 || dy != 0 else { return snapshot }
-        let move = CGAffineTransform(translationX: dx, y: dy)
+    /// The snapshot moved and scaled by however the page has changed since it was taken.
+    private func shifted(_ snapshot: SketchUndoSnapshot, to current: CGAffineTransform) -> SketchUndoSnapshot {
+        let move = snapshot.pageTransform.inverted().concatenating(current)
+        guard !move.isIdentity else { return snapshot }
         var moved = snapshot
         moved.drawing = snapshot.drawing.transformed(using: move)
         moved.marks = snapshot.marks.map { mark in
@@ -2298,7 +2349,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             image.frame = image.frame.applying(move)
             return image
         }
-        moved.shift = shift
+        moved.pageTransform = current
         return moved
     }
 
@@ -2354,7 +2405,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     private func applySketchSnapshot(_ saved: SketchUndoSnapshot) {
         let redo = sketchSnapshot()
-        let snapshot = shifted(saved, to: pageShift)
+        let snapshot = shifted(saved, to: pageTransform)
         applyingSketchUndo = true
         gestureUndoSnapshot = nil
         pendingUndoSnapshot = nil
