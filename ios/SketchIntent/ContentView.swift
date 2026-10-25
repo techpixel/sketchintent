@@ -16,6 +16,17 @@ private enum CanvasSettings {
     static let blankKey = "blankCanvas"
 }
 
+enum StrokeSettings {
+    static let widthKey = "strokeWidth"
+    static let defaultWidth = 4.0
+    static let minimumWidth = 1.0
+    static let maximumWidth = 20.0
+
+    static func clamped(_ width: Double) -> CGFloat {
+        CGFloat(min(maximumWidth, max(minimumWidth, width)))
+    }
+}
+
 private struct SharedSketch: Identifiable {
     let id = UUID()
     let image: UIImage
@@ -43,6 +54,7 @@ struct ContentView: View {
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
     @AppStorage(TrackpadSettings.speedKey) private var trackingSpeed = TrackpadSettings.defaultSpeed
+    @AppStorage(StrokeSettings.widthKey) private var strokeWidth = StrokeSettings.defaultWidth
     @State private var trackingResidualX = 0.0
     @State private var trackingResidualY = 0.0
 
@@ -113,6 +125,7 @@ struct ContentView: View {
                 spaceID: client.spaceID,
                 canvas: sketch,
                 tool: tool,
+                strokeWidth: StrokeSettings.clamped(strokeWidth),
                 acceptsTap: canvasReady,
                 acceptsCanvasSwipe: shownFrozen != nil && sketch.hasInk,
                 sendsFingerPointer: sendsFingerPointer,
@@ -438,11 +451,32 @@ private struct SettingsSheet: View {
     @AppStorage(SwipeSettings.naturalKey) private var naturalSwiping = true
     @AppStorage(TrackpadSettings.speedKey) private var trackingSpeed = TrackpadSettings.defaultSpeed
     @AppStorage(CanvasSettings.blankKey) private var blankCanvas = false
+    @AppStorage(StrokeSettings.widthKey) private var strokeWidth = StrokeSettings.defaultWidth
     @AppStorage(CartesiaSettings.key) private var cartesiaAPIKey = ""
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Slider(
+                        value: $strokeWidth,
+                        in: StrokeSettings.minimumWidth...StrokeSettings.maximumWidth,
+                        step: 0.5
+                    ) {
+                        Text("Stroke width")
+                    } minimumValueLabel: {
+                        Text("1")
+                            .font(.caption2)
+                            .accessibilityHidden(true)
+                    } maximumValueLabel: {
+                        Text("20")
+                            .font(.caption2)
+                            .accessibilityHidden(true)
+                    }
+                    .accessibilityValue(Text(strokeWidthLabel))
+                } footer: {
+                    Text("New pen strokes and snapped shapes use this width. Ink already on the page keeps its width.")
+                }
                 Section {
                     Toggle("Natural swiping", isOn: $naturalSwiping)
                 } footer: {
@@ -490,6 +524,13 @@ private struct SettingsSheet: View {
         .preferredColorScheme(.dark)
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+    }
+
+    private var strokeWidthLabel: String {
+        if strokeWidth.rounded() == strokeWidth {
+            return "\(Int(strokeWidth)) points"
+        }
+        return String(format: "%.1f points", strokeWidth)
     }
 
     private var trackingSpeedLabel: String {

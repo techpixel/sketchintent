@@ -116,6 +116,7 @@ struct PencilOverlay: UIViewRepresentable {
     var spaceID: String?
     var canvas: SketchCanvas
     var tool: SketchTool
+    var strokeWidth: CGFloat
     var acceptsTap: Bool
     /// PencilKit takes a three-finger swipe only while a frozen sketch is on screen.
     var acceptsCanvasSwipe: Bool
@@ -160,7 +161,7 @@ struct PencilOverlay: UIViewRepresentable {
             onFinger: onFingerPointer,
             onCancel: onFingerCancel
         )
-        view.apply(tool: tool)
+        view.apply(tool: tool, strokeWidth: strokeWidth)
         return view
     }
 
@@ -184,7 +185,7 @@ struct PencilOverlay: UIViewRepresentable {
             onCancel: onFingerCancel
         )
         uiView.setAcceptsCanvasSwipe(acceptsCanvasSwipe)
-        uiView.apply(tool: tool)
+        uiView.apply(tool: tool, strokeWidth: strokeWidth)
         if let spaceID {
             uiView.showSpace(spaceID)
         }
@@ -365,6 +366,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var drawings: [String: PKDrawing] = [:]
     private var currentSpaceID: String?
     private var appliedTool: SketchTool?
+    /// Tool width for new pen strokes and snapped shapes. Point size is this plus 2.
+    private var strokeWidth: CGFloat = StrokeSettings.defaultWidth
     var onInkChange: ((Bool) -> Void)?
     /// PNG of this space's pen ink in captured-frame pixels. Empty data clears the Mac.
     var onInk: (Data, Int, Int, String) -> Void = { _, _, _, _ in }
@@ -437,9 +440,48 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var time: TimeInterval
         var strokeCount: Int
     }
+    /// One settled sketch. Undo restores this instead of PencilKit's stroke stack,
+    /// because replacing `canvas.drawing` does not record an undo action.
+    private struct SketchUndoSnapshot {
+        var drawing: PKDrawing
+        var marks: [ShapeMark]
+        var selectedShapeID: UUID?
+    }
+    /// UndoManager retains its target. This proxy keeps that retain from cycling back to the overlay.
+    private final class SketchUndoProxy: NSObject {
+        weak var owner: PencilOverlayView?
+        let snapshot: SketchUndoSnapshot
+        init(owner: PencilOverlayView, snapshot: SketchUndoSnapshot) {
+            self.owner = owner
+            self.snapshot = snapshot
+        }
+        @objc func apply() {
+            owner?.applySketchSnapshot(snapshot)
+        }
+    }
     private var pendingStrokeTap: PendingStrokeTap?
     /// Set when a tap should drop the dot PencilKit started on the way down.
+    /// `strokeCount` is the count before that dot, and it still includes the geometry.
     private var tapDotCleanup: (point: CGPoint, strokeCount: Int)?
+    /// A shape touch lifts its stroke only after the Pencil actually drags.
+    private var shapeAdjustLifted = false
+    private var shapeAdjustAnchor = CGPoint.zero
+    /// Stroke count before a shape tap, kept until the Pencil lifts so a late dot can be dropped.
+    private var shapeTapBaseline: Int?
+    /// Drawing and shape marks from before the drag, so undo can put them back.
+    private var shapeDragUndo: SketchUndoSnapshot?
+    /// Drawing from before the open pen stroke. Registered once the stroke settles.
+    private var gestureUndoSnapshot: SketchUndoSnapshot?
+    /// Drawing from before the current erase or lasso drag.
+    private var pendingUndoSnapshot: SketchUndoSnapshot?
+    private let sketchUndo: UndoManager = {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        return manager
+    }()
+    private var applyingSketchUndo = false
+    private var sketchUndoTap: FingerTapRecognizer?
+    private var sketchRedoTap: FingerTapRecognizer?
     /// Ink for the stroke lifted out of PencilKit while a shape is being dragged.
     private var adjustingInk: PKInk?
     private var shapePreviewScheduled = false
@@ -479,6 +521,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var voiceHoldItem: DispatchWorkItem?
     /// Pencil went down on a saved dot with the pen. A still hold records onto that dot.
     private var dotDictation: DotDictation?
+    /// Canvas point where a still Pencil went down, and the stroke count then.
+    /// The count is used to drop the speck once dictation actually starts.
+    private var stationaryCanvasAnchor: CGPoint?
+    private var stationaryInkBaseline: Int?
+    /// While set, new PencilKit strokes from the resting Pencil are removed.
+    private var dictationInkBaseline: Int?
+    /// Identifies that speck watch so a later stroke is not removed with it.
+    private var dictationInkToken: UUID?
     /// A pen tap that can hide the open transcript when the Pencil lifts.
     private var pendingTranscriptDismiss: PendingTranscriptDismiss?
     private var voiceArmed = false
@@ -492,6 +542,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var targetNoteID: UUID? = nil
         /// Separate voice-tool hold on a saved dot. That path reveals the note and does not record.
         var readingNoteID: UUID? = nil
+        /// Pen hold that should record when the Pencil stays in one place.
+        var placesNote = false
         var armed = false
         var recording = false
     }
@@ -507,7 +559,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         var time: TimeInterval
     }
 
-    /// Time the Pencil must stay on a voice-note dot before dictation starts.
+    /// Time the Pencil must stay in one place before dictation starts.
     /// Moving farther than `voiceSlop` before then keeps the pen stroke.
     private static let voiceHoldDelay: TimeInterval = 0.5
     private static let voiceSlop: CGFloat = 12
@@ -575,14 +627,17 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     /// Pen, eraser, and lasso follow the Pencil. The Pencil never drives the Mac.
-    /// Dictation is a hold on a voice-note dot while the pen is selected.
+    /// Dictation is a Pencil held still in one place while the pen is selected.
     /// A finger on the picture drives the Mac with the pen or the eraser, until the page has ink.
     /// Lasso keeps the finger off the Mac.
-    func apply(tool: SketchTool) {
+    func apply(tool: SketchTool, strokeWidth: CGFloat = StrokeSettings.defaultWidth) {
+        let width = StrokeSettings.clamped(strokeWidth)
+        let widthChanged = self.strokeWidth != width
+        self.strokeWidth = width
         let erasing = tool == .eraser
         let annotating = tool == .voice
         let selecting = tool == .lasso
-        if tool != .pen, dotDictation != nil || voiceHold?.targetNoteID != nil {
+        if tool != .pen, dotDictation != nil || voiceHold?.placesNote == true || voiceHold?.targetNoteID != nil {
             let recording = voiceHold?.recording == true
             pendingTranscriptDismiss = nil
             endVoiceHold(commit: recording)
@@ -616,10 +671,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         // The stroke eraser, lasso, and voice hold handle Pencil touches themselves.
         // PencilKit's vector eraser waits until lift, and its bitmap eraser only
         // clears the pixels underneath. The voice tool must not lay down ink.
-        if appliedTool != tool {
+        if appliedTool != tool || (tool == .pen && widthChanged) {
             appliedTool = tool
             if tool == .pen {
-                canvas.tool = PKInkingTool(.monoline, color: .black, width: 4)
+                canvas.tool = PKInkingTool(.monoline, color: .black, width: width)
             }
         }
         // Assigning the pen tool resets the drawing gesture's touch types. Put
@@ -638,10 +693,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             tapDotCleanup = nil
             holdLockedStrokes = nil
             clearPenHoldTracking()
-        } else if tool == .pen, shapeAdjust == nil, strokeAdjust == nil {
-            selectedShapeID = nil
-            selectedStroke = nil
-            pendingStrokeTap = nil
         }
         let drawing = !erasing && !annotating && !selecting && !penHoldSuspended
         canvas.drawingGestureRecognizer.isEnabled = drawing
@@ -660,6 +711,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     /// Drops the pen ink and fitted shapes on the desktop that is showing.
     func clearCurrentSketch() {
+        let undoSnapshot = sketchSnapshot()
         shapeAdjust = nil
         penStrokeOpen = false
         eraserOpen = false
@@ -682,10 +734,20 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         adjustingStroke = nil
         pendingStrokeTap = nil
         tapDotCleanup = nil
+        dictationInkBaseline = nil
+        dictationInkToken = nil
+        stationaryInkBaseline = nil
+        stationaryCanvasAnchor = nil
         shapeMarks = []
         if let currentSpaceID {
             shapesBySpace[currentSpaceID] = []
             drawings[currentSpaceID] = PKDrawing()
+        }
+        gestureUndoSnapshot = nil
+        pendingUndoSnapshot = nil
+        shapeDragUndo = nil
+        if !undoSnapshot.drawing.strokes.isEmpty || !undoSnapshot.marks.isEmpty {
+            registerSketchUndo(undoSnapshot)
         }
         isApplyingSmoothedStroke = true
         canvas.drawing = PKDrawing()
@@ -769,6 +831,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     deinit {
+        sketchUndo.removeAllActions()
         haloLink?.invalidate()
         haloBox?.owner = nil
         penHoldItem?.cancel()
@@ -820,8 +883,53 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         canvas.addGestureRecognizer(desktopPan)
         self.desktopPan = desktopPan
 
+        // UIKit's undo taps live on UIUndoGestureInteraction, which
+        // `editingInteractionConfiguration == .none` removes so the three-finger
+        // desktop swipe is not also a system undo swipe. These two recognizers
+        // are that interaction's tap pair: two fingers undo, three fingers redo.
+        // One-finger double-tap stays the trackpad. The Pencil barrel is a
+        // UIPencilInteraction, not one of these.
+        let undoTap = FingerTapRecognizer(target: self, action: #selector(sketchUndoTapped(_:)))
+        undoTap.numberOfTapsRequired = 1
+        undoTap.numberOfTouchesRequired = 2
+        undoTap.allowedTouchTypes = finger
+        undoTap.cancelsTouchesInView = false
+        undoTap.delaysTouchesBegan = false
+        undoTap.delaysTouchesEnded = false
+        let redoTap = FingerTapRecognizer(target: self, action: #selector(sketchRedoTapped(_:)))
+        redoTap.numberOfTapsRequired = 1
+        redoTap.numberOfTouchesRequired = 3
+        redoTap.allowedTouchTypes = finger
+        redoTap.cancelsTouchesInView = false
+        redoTap.delaysTouchesBegan = false
+        redoTap.delaysTouchesEnded = false
+        canvas.panGestureRecognizer.require(toFail: undoTap)
+        desktopPan.require(toFail: redoTap)
+        canvas.addGestureRecognizer(undoTap)
+        canvas.addGestureRecognizer(redoTap)
+        sketchUndoTap = undoTap
+        sketchRedoTap = redoTap
+
         canvas.restrictDrawingToPencil()
         canvas.keepScrollPanOffDesktopSwipe()
+    }
+
+    /// Two-finger tap. This is the undo gesture UIUndoGestureInteraction would
+    /// have delivered. A one-finger double-tap never arrives here.
+    @objc private func sketchUndoTapped(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        performSketchUndo()
+    }
+
+    /// Three-finger tap. Redo follows the system finger-count convention.
+    @objc private func sketchRedoTapped(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended, sketchUndo.canRedo else { return }
+        sketchUndo.redo()
+    }
+
+    private func performSketchUndo() {
+        guard sketchUndo.canUndo else { return }
+        sketchUndo.undo()
     }
 
     /// Apple Pencil barrel double-tap. This is not a screen touch, so it does not
@@ -837,6 +945,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     /// the Mac checks in is not dropped.
     func showSpace(_ id: String) {
         guard id != currentSpaceID else { return }
+        sketchUndo.removeAllActions()
+        gestureUndoSnapshot = nil
+        pendingUndoSnapshot = nil
+        shapeDragUndo = nil
         if voiceHold?.recording == true {
             endVoiceHold(commit: true)
         } else if voiceHold != nil {
@@ -890,6 +1002,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         selectedStroke = nil
         pendingStrokeTap = nil
         tapDotCleanup = nil
+        dictationInkBaseline = nil
+        dictationInkToken = nil
+        stationaryInkBaseline = nil
+        stationaryCanvasAnchor = nil
         refreshShapeHandles()
         openNoteID = nil
         noticeToken += 1
@@ -964,7 +1080,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         guard var hold = voiceHold, hold.token == token, !hold.armed else { return }
         hold.armed = true
         voiceHold = hold
-        if hold.targetNoteID != nil {
+        if hold.placesNote || hold.targetNoteID != nil {
             suppressPenInkForDictation()
         } else if let readingNoteID = hold.readingNoteID {
             openSavedNote(readingNoteID)
@@ -1001,17 +1117,11 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         do {
             try voiceTranscriber.start()
         } catch let reason as VoiceCaptureBlock {
-            voiceTranscriber.onPartial = nil
-            voiceTranscriber.onFailure = nil
-            voiceHold = nil
-            noteLayer.setLive(anchor: nil, text: "")
+            endVoiceHold(commit: false)
             showVoiceNotice(reason.message, at: anchor)
             return
         } catch {
-            voiceTranscriber.onPartial = nil
-            voiceTranscriber.onFailure = nil
-            voiceHold = nil
-            noteLayer.setLive(anchor: nil, text: "")
+            endVoiceHold(commit: false)
             showVoiceNotice(VoiceCaptureBlock.unavailable.message, at: anchor)
             return
         }
@@ -1036,12 +1146,33 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             ? voiceTranscriber.stop().trimmingCharacters(in: .whitespacesAndNewlines)
             : ""
         noteLayer.setLive(anchor: nil, text: "")
-        if let dictation = dotDictation {
-            if tapDotCleanup == nil {
-                tapDotCleanup = (dictation.anchor, dictation.strokeCount)
-            }
-            dotDictation = nil
+        let baseline = dictationInkBaseline
+        let anchor = stationaryCanvasAnchor ?? .zero
+        let dot = dotDictation
+        dotDictation = nil
+        stationaryInkBaseline = nil
+        if let baseline {
+            // Keep the watch until PencilKit commits the speck on lift. Clearing it
+            // here lets that dot land after the finger is already up. Capture the
+            // token first: dropping the speck can end the tool and clear it.
+            let token = dictationInkToken
+            tapDotCleanup = (anchor, baseline)
             removeTapDotIfPresent()
+            dictationInkBaseline = baseline
+            dictationInkToken = token
+            stationaryCanvasAnchor = anchor
+            tapDotCleanup = (anchor, baseline)
+            if !pencilStillDown {
+                DispatchQueue.main.async { [weak self] in
+                    self?.finishDictationInkWatch(token: token)
+                }
+            }
+        } else if let dot {
+            tapDotCleanup = (dot.anchor, dot.strokeCount)
+            removeTapDotIfPresent()
+            if drawingGestureOpen {
+                tapDotCleanup = (dot.anchor, dot.strokeCount)
+            }
         }
         resumePenDrawing()
         guard commit, hold.recording, !text.isEmpty else { return }
@@ -1057,8 +1188,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         noteLayer.noteID(at: canvas.convert(canvasPoint, to: noteLayer))
     }
 
-    /// Starts the short wait that distinguishes a tap (show the transcript) from a hold (record).
-    private func beginDictationWatch(noteID: UUID, at point: CGPoint, touch: UITouch, touches: [UITouch]) {
+    /// Starts the short wait that distinguishes a tap from a hold. Staying inside
+    /// `voiceSlop` records at this spot. A saved dot keeps the new text. Moving
+    /// off starts a normal pen stroke, which can still snap when the Pencil rests at its end.
+    private func beginStationaryDictation(at point: CGPoint, touch: UITouch, touches: [UITouch]) {
         if voiceHold?.recording == true {
             endVoiceHold(commit: true)
         } else if voiceHold != nil {
@@ -1067,16 +1200,25 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             voiceHold = nil
             dotDictation = nil
         }
+        // The new stroke has to stay on the page until this hold actually arms.
+        dictationInkBaseline = nil
+        dictationInkToken = nil
+        tapDotCleanup = nil
         penHoldItem?.cancel()
         penHoldItem = nil
         pendingStrokeTap = nil
-        pendingTranscriptDismiss = nil
         selectedShapeID = nil
         selectedStroke = nil
         refreshShapeHandles()
         let count = canvas.drawing.strokes.count
-        dotDictation = DotDictation(noteID: noteID, anchor: point, strokeCount: count)
-        tapDotCleanup = (point, count)
+        let noteID = voiceNoteID(at: point)
+        if let noteID {
+            dotDictation = DotDictation(noteID: noteID, anchor: point, strokeCount: count)
+        } else {
+            dotDictation = nil
+        }
+        stationaryCanvasAnchor = point
+        stationaryInkBaseline = count
         penHoldSuspended = false
         penHoldTouch = touch
         penHoldStart = touch.timestamp
@@ -1087,7 +1229,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         recordHaptic.prepare()
         let token = UUID()
         let anchor = notes.first(where: { $0.id == noteID })?.anchor ?? canvas.convert(point, to: noteLayer)
-        voiceHold = VoiceHold(token: token, anchor: anchor, targetNoteID: noteID)
+        voiceHold = VoiceHold(token: token, anchor: anchor, targetNoteID: noteID, placesNote: true)
         let work = DispatchWorkItem { [weak self] in
             self?.armVoiceHold(token: token)
         }
@@ -1095,25 +1237,72 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.voiceHoldDelay, execute: work)
     }
 
-    /// The Pencil left the dot before dictation armed. The pen stroke stays.
+    /// The Pencil moved before dictation armed. The pen stroke stays.
     private func releaseDictationWatch() {
         guard voiceHold?.armed != true, voiceHold?.recording != true else { return }
         voiceHoldItem?.cancel()
         voiceHoldItem = nil
         voiceHold = nil
         dotDictation = nil
+        stationaryCanvasAnchor = nil
+        stationaryInkBaseline = nil
+        dictationInkBaseline = nil
+        dictationInkToken = nil
         tapDotCleanup = nil
     }
 
-    /// Stops the pen from committing ink once a dot hold has started recording.
+    /// Drops the speck from a Pencil that stayed still, without cancelling that touch.
+    /// Disabling PencilKit's drawing gesture here ends the touch, and the cancelled
+    /// hold never reaches `startVoiceRecording`.
     private func suppressPenInkForDictation() {
         penHoldItem?.cancel()
         penHoldItem = nil
         pendingStrokeTap = nil
         pendingTranscriptDismiss = nil
         penHoldSuspended = true
-        canvas.drawingGestureRecognizer.isEnabled = false
+        let baseline = stationaryInkBaseline ?? tapDotCleanup?.strokeCount ?? canvas.drawing.strokes.count
+        dictationInkToken = UUID()
+        dictationInkBaseline = baseline
+        tapDotCleanup = (stationaryCanvasAnchor ?? .zero, baseline)
         removeTapDotIfPresent()
+        if dictationInkBaseline != nil {
+            tapDotCleanup = (stationaryCanvasAnchor ?? .zero, baseline)
+        }
+    }
+
+    /// True while the Pencil contact that started this hold is still down.
+    private var pencilStillDown: Bool {
+        switch penHoldTouch?.phase {
+        case .began, .moved, .stationary:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// True while PencilKit may still commit the stroke for the open touch.
+    private var drawingGestureOpen: Bool {
+        switch canvas.drawingGestureRecognizer.state {
+        case .began, .changed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Removes a speck PencilKit commits after the finger is up, then stops watching.
+    private func finishDictationInkWatch(token: UUID?) {
+        guard let token, dictationInkToken == token, voiceHold == nil, !pencilStillDown else { return }
+        let anchor = stationaryCanvasAnchor ?? .zero
+        let baseline = dictationInkBaseline
+        dictationInkBaseline = nil
+        dictationInkToken = nil
+        stationaryCanvasAnchor = nil
+        stationaryInkBaseline = nil
+        if let baseline {
+            tapDotCleanup = (anchor, baseline)
+            removeTapDotIfPresent()
+        }
     }
 
     /// Opens a saved note in the same bubble a finger tap uses. The note stays up after lift.
@@ -1224,6 +1413,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         holdLockedStrokes = nil
         penStrokeOpen = true
         liveGlowBaseline = canvasView.drawing.strokes.count
+        if gestureUndoSnapshot == nil, !applyingSketchUndo {
+            gestureUndoSnapshot = sketchSnapshot()
+        }
         if startingSketch {
             onSketchBegan()
         }
@@ -1231,14 +1423,29 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
 
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         guard !isApplyingSmoothedStroke else { return }
+        let holdActive = voiceHold?.armed == true || voiceHold?.recording == true
+        if !holdActive, let baseline = dictationInkBaseline {
+            tapDotCleanup = (stationaryCanvasAnchor ?? .zero, baseline)
+            dictationInkBaseline = nil
+            dictationInkToken = nil
+            stationaryCanvasAnchor = nil
+            stationaryInkBaseline = nil
+        }
         removeTapDotIfPresent()
+        if holdActive, let baseline = dictationInkBaseline {
+            tapDotCleanup = (stationaryCanvasAnchor ?? .zero, baseline)
+        }
         if shapeAdjust != nil || lassoTransforming || strokeAdjust != nil {
+            if shapeAdjust != nil || strokeAdjust != nil {
+                gestureUndoSnapshot = nil
+            }
             penStrokeOpen = false
             return
         }
         penStrokeOpen = false
         halo.isHidden = true
         canvasViewDrawingDidChange(canvasView)
+        closeOpenStrokeUndo()
         guard canvasView.drawing.strokes.isEmpty else { return }
         let space = currentSpaceID ?? ""
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -1248,18 +1455,27 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
     }
 
-    /// Records the pen stroke under the Pencil. Resting at the end corrects it before the stroke finishes.
-    /// A tap on a voice-note dot shows its transcript. Holding still on the dot records onto that dot.
-    /// A tap off an open transcript hides it. A tap on existing ink still draws. Selection and transforms belong to the lasso.
+    /// Records the pen stroke under the Pencil. Resting at the end of a moving stroke corrects it.
+    /// Resting in one place starts dictation. A tap on a voice-note dot shows its transcript.
+    /// A tap off an open transcript hides it. A short tap on a snapped shape selects it.
+    /// A drag that starts on empty canvas still draws a new stroke.
     private func trackPenHold(phase: UITouch.Phase, touches: [UITouch]) {
         guard penToolIsDrawing, let touch = touches.last else { return }
         switch phase {
         case .began:
             tapDotCleanup = nil
             pendingTranscriptDismiss = nil
+            if voiceHold == nil {
+                dictationInkBaseline = nil
+                dictationInkToken = nil
+            }
             let point = touch.preciseLocation(in: canvas)
-            if let noteID = voiceNoteID(at: point) {
-                beginDictationWatch(noteID: noteID, at: point, touch: touch, touches: touches)
+            if let adjust = shapeAdjustHit(at: point) {
+                penHoldItem?.cancel()
+                penHoldSamples = []
+                pendingStrokeTap = nil
+                pendingTranscriptDismiss = nil
+                beginShapeAdjust(adjust, touch: touch)
                 return
             }
             pendingStrokeTap = nil
@@ -1267,25 +1483,19 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             selectedStroke = nil
             refreshShapeHandles()
             clearPenHoldTracking()
-            penHoldTouch = touch
-            penHoldStart = touch.timestamp
-            penHoldSamples = touches.map { penPoint(from: $0) }
-            penHoldAnchor = point
-            penHoldAnchorIndex = max(penHoldSamples.count - 1, 0)
             if openNoteID != nil {
                 pendingTranscriptDismiss = PendingTranscriptDismiss(point: point, time: touch.timestamp)
-                tapDotCleanup = (point, canvas.drawing.strokes.count)
             }
-            schedulePenHold()
+            beginStationaryDictation(at: point, touch: touch, touches: touches)
         case .moved:
-            if dotDictation != nil {
+            if voiceHold?.placesNote == true || dotDictation != nil {
                 if voiceHold?.armed == true || voiceHold?.recording == true {
                     return
                 }
                 let point = touch.preciseLocation(in: canvas)
                 penHoldTouch = touch
                 penHoldSamples.append(contentsOf: touches.map { penPoint(from: $0) })
-                let anchor = dotDictation?.anchor ?? point
+                let anchor = stationaryCanvasAnchor ?? point
                 if hypot(point.x - anchor.x, point.y - anchor.y) > Self.voiceSlop {
                     releaseDictationWatch()
                     penHoldAnchor = point
@@ -1325,19 +1535,41 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 schedulePenHold()
             }
         case .ended:
-            if dotDictation != nil || voiceHold?.targetNoteID != nil {
+            if voiceHold?.placesNote == true || dotDictation != nil || voiceHold?.targetNoteID != nil {
                 let noteID = dotDictation?.noteID ?? voiceHold?.targetNoteID
                 let recording = voiceHold?.recording == true
+                let dismiss = pendingTranscriptDismiss
+                let tapBaseline = stationaryInkBaseline
+                let point = touch.preciseLocation(in: canvas)
                 endVoiceHold(commit: recording)
+                pendingTranscriptDismiss = nil
                 if !recording, let noteID {
                     openSavedNote(noteID)
+                } else if !recording,
+                          let dismiss,
+                          openNoteID != nil,
+                          hypot(point.x - dismiss.point.x, point.y - dismiss.point.y) <= Self.strokeTapSlop {
+                    openNoteID = nil
+                    noteLayer.setSaved(notes: notes, openID: nil)
+                    if dictationInkBaseline == nil, let tapBaseline {
+                        tapDotCleanup = (point, tapBaseline)
+                        removeTapDotIfPresent()
+                        if drawingGestureOpen {
+                            tapDotCleanup = (point, tapBaseline)
+                        }
+                    }
                 }
                 clearPenHoldTracking()
                 return
             }
             if shapeAdjust != nil {
+                let baseline = shapeTapBaseline
                 finishShapeAdjust()
                 clearPenHoldTracking()
+                if let baseline {
+                    dropStrokesAdded(after: baseline)
+                }
+                shapeTapBaseline = nil
                 return
             }
             if strokeAdjust != nil {
@@ -1374,13 +1606,18 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             clearPenHoldTracking()
         case .cancelled:
             if committingPenHold { return }
-            if dotDictation != nil || voiceHold?.targetNoteID != nil {
+            if voiceHold?.placesNote == true || dotDictation != nil || voiceHold?.targetNoteID != nil {
                 endVoiceHold(commit: false)
             }
             pendingTranscriptDismiss = nil
             if shapeAdjust != nil {
+                let baseline = shapeTapBaseline
                 finishShapeAdjust()
                 clearPenHoldTracking()
+                if let baseline {
+                    dropStrokesAdded(after: baseline)
+                }
+                shapeTapBaseline = nil
                 return
             }
             if strokeAdjust != nil {
@@ -1418,25 +1655,18 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         penHoldSuspended = true
         canvas.drawingGestureRecognizer.isEnabled = false
         committingPenHold = false
+        let preSnap = sketchSnapshot()
 
         var strokes = canvas.drawing.strokes
         let source: [CGPoint]
-        let ink: PKInk
-        let width: CGFloat
-        let opacity: CGFloat
-        let force: CGFloat
         if strokes.count > countBefore {
             let stroke = strokes[strokes.count - 1]
             source = (0..<stroke.path.count).map { stroke.path[$0].location }
-            ink = stroke.ink
-            (width, opacity, force) = inkStats(of: stroke)
         } else {
             source = samples.map(\.location)
-            ink = currentPenInk()
-            (width, opacity, force) = inkStats(of: samples)
         }
         if let shape = ShapeFit.fit(source) {
-            let corrected = stroke(for: shape, ink: ink, width: width, opacity: opacity, force: force)
+            let corrected = stroke(for: shape, pointSize: StrokeSmoothing.pointSize(forToolWidth: strokeWidth))
             if strokes.count > countBefore {
                 strokes[strokes.count - 1] = corrected
             } else {
@@ -1448,20 +1678,21 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 id: UUID(),
                 shape: shape,
                 strokeIndex: index,
-                width: width,
-                opacity: opacity,
-                force: force
+                width: StrokeSmoothing.pointSize(forToolWidth: strokeWidth),
+                opacity: 1,
+                force: 1
             )
             shapeMarks.append(mark)
             selectedShapeID = nil
-        } else if strokes.count > countBefore, let smoothed = StrokeSmoothing.smoothedPenStroke(from: strokes[strokes.count - 1]) {
+        } else if strokes.count > countBefore, let smoothed = StrokeSmoothing.smoothedPenStroke(from: strokes[strokes.count - 1], toolWidth: strokeWidth) {
             strokes[strokes.count - 1] = smoothed
-        } else if let smoothed = StrokeSmoothing.smoothedStroke(from: samples, ink: ink) {
+        } else if let smoothed = StrokeSmoothing.smoothedStroke(from: samples, toolWidth: strokeWidth) {
             strokes.append(smoothed)
         } else {
             resumePenDrawing()
             return
         }
+        noteSnapUndo(preSnap)
         holdLockedStrokes = strokes
         penStrokeOpen = false
         isApplyingSmoothedStroke = true
@@ -1488,12 +1719,132 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         guard penHoldSuspended else { return }
         penHoldSuspended = false
         let drawing = !canvas.erasesWholeStrokes && !canvas.capturesVoiceHold && !lassoArmed
-        canvas.drawingGestureRecognizer.isEnabled = drawing
+        // Setting the same value again can still reset PencilKit's recognizer and
+        // cancel the Pencil touch that a still hold is waiting on.
+        if canvas.drawingGestureRecognizer.isEnabled != drawing {
+            canvas.drawingGestureRecognizer.isEnabled = drawing
+        }
         canvas.restrictDrawingToPencil()
     }
 
     /// Keeps the hold correction when PencilKit writes the raw stroke as the sketch finishes.
+    private func sketchSnapshot() -> SketchUndoSnapshot {
+        SketchUndoSnapshot(drawing: canvas.drawing, marks: shapeMarks, selectedShapeID: selectedShapeID)
+    }
+
+    private func sketchContentDiffers(_ lhs: SketchUndoSnapshot, _ rhs: SketchUndoSnapshot) -> Bool {
+        if lhs.marks.count != rhs.marks.count { return true }
+        for (old, new) in zip(lhs.marks, rhs.marks) {
+            if old.id != new.id || old.shape != new.shape || old.strokeIndex != new.strokeIndex {
+                return true
+            }
+        }
+        let before = lhs.drawing.strokes
+        let after = rhs.drawing.strokes
+        if before.count != after.count { return true }
+        return !sameStrokeGeometry(before, after)
+    }
+
+    /// Records `snapshot` as the state undo should restore. Each call is its own step.
+    /// `registerUndo` throws unless a group is already open. Automatic grouping only
+    /// stays open for the current event, and this stack turns that off, so a group is
+    /// opened here when none is open. Nothing is registered while undo or redo is
+    /// applying a snapshot, and a group is never opened from inside undo or redo.
+    private func registerSketchUndo(_ snapshot: SketchUndoSnapshot) {
+        guard !applyingSketchUndo, !sketchUndo.isUndoing, !sketchUndo.isRedoing else { return }
+        let openedGroup = beginSketchUndoGroupIfNeeded()
+        guard sketchUndo.groupingLevel > 0 else { return }
+        let proxy = SketchUndoProxy(owner: self, snapshot: snapshot)
+        sketchUndo.registerUndo(withTarget: proxy) { proxy in
+            proxy.apply()
+        }
+        sketchUndo.setActionName("Sketch")
+        if openedGroup, sketchUndo.groupingLevel > 0 {
+            sketchUndo.endUndoGrouping()
+        }
+    }
+
+    /// Opens a group only when none is open and this call is outside undo/redo.
+    /// Returns whether the caller must close it. With `groupsByEvent` on, a level of
+    /// zero means the event is already over; the explicit pair keeps that registration
+    /// from throwing. If a group still cannot be opened, the caller skips registration.
+    private func beginSketchUndoGroupIfNeeded() -> Bool {
+        if sketchUndo.groupingLevel > 0 { return false }
+        if sketchUndo.isUndoing || sketchUndo.isRedoing { return false }
+        sketchUndo.beginUndoGrouping()
+        return sketchUndo.groupingLevel > 0
+    }
+
+    /// Inverse action recorded while undo or redo applies a snapshot.
+    /// That pass already has a group open. Starting another one unbalances it.
+    /// When no group is open, skip so `registerUndo` cannot throw.
+    private func registerSketchInverse(_ snapshot: SketchUndoSnapshot) {
+        guard sketchUndo.groupingLevel > 0 else { return }
+        let proxy = SketchUndoProxy(owner: self, snapshot: snapshot)
+        sketchUndo.registerUndo(withTarget: proxy) { proxy in
+            proxy.apply()
+        }
+    }
+
+    private func applySketchSnapshot(_ snapshot: SketchUndoSnapshot) {
+        let redo = sketchSnapshot()
+        applyingSketchUndo = true
+        gestureUndoSnapshot = nil
+        pendingUndoSnapshot = nil
+        shapeDragUndo = nil
+        shapeTapBaseline = nil
+        shapeAdjust = nil
+        shapeAdjustLifted = false
+        strokeAdjust = nil
+        adjustingStroke = nil
+        adjustingInk = nil
+        tapDotCleanup = nil
+        shapeMarks = snapshot.marks
+        selectedShapeID = snapshot.selectedShapeID
+        selectedStroke = nil
+        holdLockedStrokes = snapshot.drawing.strokes
+        isApplyingSmoothedStroke = true
+        canvas.drawing = snapshot.drawing
+        isApplyingSmoothedStroke = false
+        applyingSketchUndo = false
+        if let currentSpaceID {
+            drawings[currentSpaceID] = snapshot.drawing
+            shapesBySpace[currentSpaceID] = snapshot.marks
+        }
+        registerSketchInverse(redo)
+        refreshShapeHandles()
+        refreshLassoChrome()
+        reportInk()
+        applyHaloNow()
+        publishInk(immediate: true)
+    }
+
+    /// A new pen stroke, once PencilKit has committed it and this overlay has not replaced it.
+    private func closeOpenStrokeUndo() {
+        guard let snapshot = gestureUndoSnapshot else { return }
+        gestureUndoSnapshot = nil
+        guard !applyingSketchUndo else { return }
+        if sketchContentDiffers(snapshot, sketchSnapshot()) {
+            registerSketchUndo(snapshot)
+        }
+    }
+
+    /// Undo for a hold correction. The open-stroke snapshot, when it differs, is the step before this one.
+    private func noteSnapUndo(_ preSnap: SketchUndoSnapshot) {
+        if let gesture = gestureUndoSnapshot {
+            gestureUndoSnapshot = nil
+            if sketchContentDiffers(gesture, preSnap) {
+                registerSketchUndo(gesture)
+            }
+        }
+        registerSketchUndo(preSnap)
+    }
+
     private func restoreHoldLockIfNeeded(on canvasView: PKCanvasView) {
+        if applyingSketchUndo || sketchUndo.isUndoing || sketchUndo.isRedoing {
+            holdLockedStrokes = canvasView.drawing.strokes
+            return
+        }
         guard let locked = holdLockedStrokes, !isApplyingSmoothedStroke else { return }
         let current = canvasView.drawing.strokes
         if current.count < locked.count {
@@ -1521,28 +1872,17 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         return true
     }
 
-    private func currentPenInk() -> PKInk {
-        if let tool = canvas.tool as? PKInkingTool {
-            return tool.ink
-        }
-        return PKInkingTool(.monoline, color: .black, width: 4).ink
-    }
-
     private func penPoint(from touch: UITouch) -> PKStrokePoint {
-        let width = currentPenWidth
+        let size = StrokeSmoothing.pointSize(forToolWidth: strokeWidth)
         return StrokeSmoothing.point(
             location: touch.preciseLocation(in: canvas),
             timeOffset: max(0, touch.timestamp - penHoldStart),
-            size: CGSize(width: width, height: width),
+            size: CGSize(width: size, height: size),
             opacity: 1,
             force: 1,
             azimuth: 0,
             altitude: .pi / 2
         )
-    }
-
-    private var currentPenWidth: CGFloat {
-        (canvas.tool as? PKInkingTool)?.width ?? 4
     }
 
     private var penToolIsDrawing: Bool {
@@ -1624,13 +1964,18 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private func beginShapeAdjust(_ adjust: ShapeAdjust, touch: UITouch) {
         selectedStroke = nil
         pendingStrokeTap = nil
+        pendingTranscriptDismiss = nil
         penStrokeOpen = false
         inkWork?.cancel()
         inkWork = nil
         let point = touch.preciseLocation(in: canvas)
         let count = canvas.drawing.strokes.count
+        // The baseline still includes this shape. A tap dot is the only stroke past it.
         tapDotCleanup = (point, count)
-        canvas.drawingGestureRecognizer.isEnabled = false
+        shapeTapBaseline = count
+        shapeAdjustAnchor = point
+        shapeAdjustLifted = false
+        shapeDragUndo = nil
         switch adjust {
         case let .rotate(index, _, _, original):
             let center = original.center
@@ -1639,26 +1984,18 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         default:
             shapeAdjust = adjust
         }
-        penHoldTouch = touch
-        committingPenHold = true
-        penHoldSuspended = true
-        committingPenHold = false
-        if canvas.drawing.strokes.count > count {
-            let strokes = Array(canvas.drawing.strokes.prefix(count))
-            holdLockedStrokes = strokes
-            isApplyingSmoothedStroke = true
-            canvas.drawing = PKDrawing(strokes: strokes)
-            isApplyingSmoothedStroke = false
-        }
         let index = shapeMarkIndex(for: shapeAdjust) ?? 0
         if shapeMarks.indices.contains(index) {
             selectedShapeID = shapeMarks[index].id
-            liftShapeStroke(at: index)
         }
-        showShapePreview(at: index)
-        shapeHandles.renderPendingStroke()
-        tapDotCleanup = (point, canvas.drawing.strokes.count)
-        removeTapDotIfPresent()
+        refreshShapeHandles()
+        penHoldTouch = touch
+        committingPenHold = true
+        penHoldSuspended = true
+        canvas.drawingGestureRecognizer.isEnabled = false
+        committingPenHold = false
+        guard shapeAdjust != nil else { return }
+        dropStrokesAdded(after: count)
     }
 
     /// Takes the shape's stroke out of PencilKit for the drag. The preview follows the Pencil
@@ -1685,15 +2022,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private func showShapePreview(at index: Int) {
         guard shapeMarks.indices.contains(index) else { return }
         let mark = shapeMarks[index]
-        let ink = adjustingInk ?? currentPenInk()
         shapeHandles.pendingStrokes = []
-        shapeHandles.pendingStroke = stroke(
-            for: mark.shape,
-            ink: ink,
-            width: mark.width,
-            opacity: mark.opacity,
-            force: mark.force
-        )
+        shapeHandles.pendingStroke = stroke(for: mark.shape, pointSize: mark.width)
         refreshShapeHandles()
         guard !shapePreviewScheduled else { return }
         shapePreviewScheduled = true
@@ -1706,6 +2036,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     private func updateShapeAdjust(to point: CGPoint) {
+        if !shapeAdjustLifted {
+            guard hypot(point.x - shapeAdjustAnchor.x, point.y - shapeAdjustAnchor.y) > Self.strokeTapSlop else { return }
+            let index = shapeMarkIndex(for: shapeAdjust) ?? -1
+            guard shapeMarks.indices.contains(index), shapeMarks[index].strokeIndex >= 0 else { return }
+            shapeDragUndo = sketchSnapshot()
+            liftShapeStroke(at: index)
+            shapeAdjustLifted = true
+        }
         switch shapeAdjust {
         case let .move(index, last):
             guard shapeMarks.indices.contains(index) else { return }
@@ -1734,24 +2072,36 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
     }
 
-    /// Writes the dragged shape back once. PencilKit is not touched while the Pencil is moving.
+    /// Writes the dragged shape back once. A short tap never lifts the stroke, so the
+    /// geometry stays on the canvas and the dashed box comes up around it.
     private func finishShapeAdjust() {
+        let lifted = shapeAdjustLifted
+        let dragUndo = shapeDragUndo
         tapDotCleanup = nil
+        shapeAdjustLifted = false
+        shapeDragUndo = nil
         guard let adjust = shapeAdjust else { return }
         let index = shapeMarkIndex(for: adjust) ?? -1
         shapeAdjust = nil
         shapePreviewScheduled = false
         shapeHandles.clearInkPreview()
+        guard lifted else {
+            adjustingInk = nil
+            refreshShapeHandles()
+            return
+        }
         guard shapeMarks.indices.contains(index) else {
             adjustingInk = nil
             refreshShapeHandles()
             return
         }
+        if let dragUndo {
+            registerSketchUndo(dragUndo)
+        }
         let mark = shapeMarks[index]
         var strokes = canvas.drawing.strokes
-        let ink = adjustingInk ?? currentPenInk()
         adjustingInk = nil
-        strokes.append(stroke(for: mark.shape, ink: ink, width: mark.width, opacity: mark.opacity, force: mark.force))
+        strokes.append(stroke(for: mark.shape, pointSize: mark.width))
         shapeMarks[index].strokeIndex = strokes.count - 1
         holdLockedStrokes = strokes
         isApplyingSmoothedStroke = true
@@ -1766,13 +2116,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         let mark = shapeMarks[index]
         var strokes = canvas.drawing.strokes
         guard strokes.indices.contains(mark.strokeIndex) else { return }
-        strokes[mark.strokeIndex] = stroke(
-            for: mark.shape,
-            ink: strokes[mark.strokeIndex].ink,
-            width: mark.width,
-            opacity: mark.opacity,
-            force: mark.force
-        )
+        strokes[mark.strokeIndex] = stroke(for: mark.shape, pointSize: mark.width)
         holdLockedStrokes = strokes
         isApplyingSmoothedStroke = true
         canvas.drawing = PKDrawing(strokes: strokes)
@@ -1781,97 +2125,28 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         refreshShapeHandles()
     }
 
-    private func stroke(
-        for shape: FittedShape,
-        ink: PKInk,
-        width: CGFloat,
-        opacity: CGFloat,
-        force: CGFloat
-    ) -> PKStroke {
-        let width = currentPenWidth
+    /// Fitted line, circle, square, rectangle, and curve. Same monoline the pen draws.
+    /// PencilKit stores tool width `W` as point size `W + 2` and paints `2 * (size - 2)`,
+    /// so a point size of 4 is half as thick as the freehand stroke.
+    private func stroke(for shape: FittedShape, pointSize: CGFloat) -> PKStroke {
+        let size = pointSize
         let points = shape.outline().enumerated().map { index, location in
             StrokeSmoothing.point(
                 location: location,
                 timeOffset: Double(index) * 0.008,
-                size: CGSize(width: width, height: width),
+                size: CGSize(width: size, height: size),
                 opacity: 1,
                 force: 1,
                 azimuth: 0,
                 altitude: .pi / 2
             )
         }
-        let penInk = (canvas.tool as? PKInkingTool)?.ink ?? PKInkingTool(.monoline, color: .black, width: width).ink
         return PKStroke(
-            ink: penInk,
+            ink: StrokeSmoothing.ink(pointSize: size),
             path: PKStrokePath(controlPoints: points, creationDate: Date()),
             transform: .identity,
             mask: nil
         )
-    }
-
-    private func inkStats(of stroke: PKStroke) -> (CGFloat, CGFloat, CGFloat) {
-        guard stroke.path.count > 0 else { return (currentPenWidth, 1, 0.5) }
-        var samples: [PKStrokePoint] = []
-        samples.reserveCapacity(stroke.path.count)
-        for index in 0..<stroke.path.count {
-            samples.append(stroke.path[index])
-        }
-        return inkWeight(of: samples)
-    }
-
-    private func inkStats(of samples: [PKStrokePoint]) -> (CGFloat, CGFloat, CGFloat) {
-        guard !samples.isEmpty else { return (currentPenWidth, 1, 0.5) }
-        return inkWeight(of: samples)
-    }
-
-    /// Body weight of the source ink. Caps taper toward nothing, so the average
-    /// size — and a sample taken from a cap — is thinner than the stroke that
-    /// was drawn. The fitted point keeps the 75th percentile of
-    /// `max(width, height)` and the force on that same sample.
-    ///
-    /// The pen brush renders a core of about `2 * (size - 2)`. The source stroke
-    /// already went through that curve, so this size is copied as measured.
-    /// Scaling it, or pinning it to the tool width of 4, would move a light
-    /// stroke or a heavy one off the ink the user saw.
-    private func inkWeight(of samples: [PKStrokePoint]) -> (CGFloat, CGFloat, CGFloat) {
-        let body = samplesWithoutEndTapers(samples)
-        let ranked = body.map { point in
-            (
-                size: max(point.size.width, point.size.height),
-                opacity: point.opacity,
-                force: point.force
-            )
-        }.sorted { $0.size < $1.size }
-        let index = Int((Double(ranked.count - 1) * 0.75).rounded())
-        let chosen = ranked[min(ranked.count - 1, max(0, index))]
-        return (chosen.size, chosen.opacity, chosen.force)
-    }
-
-    /// Drops cap samples that are thin only at the ends. A stroke that is thin
-    /// all the way along is left intact, so its own weight still wins.
-    private func samplesWithoutEndTapers(_ samples: [PKStrokePoint]) -> [PKStrokePoint] {
-        guard samples.count >= 8 else { return samples }
-        func size(_ point: PKStrokePoint) -> CGFloat {
-            max(point.size.width, point.size.height)
-        }
-        let midStart = samples.count / 4
-        let midEnd = samples.count - midStart
-        let middle = samples[midStart..<midEnd].map(size).sorted()
-        guard !middle.isEmpty else { return samples }
-        let body = middle[Int((Double(middle.count - 1) * 0.75).rounded())]
-        guard body > 0 else { return samples }
-        let capLimit = body * 0.45
-        let trimLimit = samples.count / 5
-        var lower = 0
-        while lower < trimLimit, size(samples[lower]) < capLimit {
-            lower += 1
-        }
-        var upper = samples.count - 1
-        while upper > samples.count - 1 - trimLimit, size(samples[upper]) < capLimit {
-            upper -= 1
-        }
-        guard upper - lower >= 4 else { return samples }
-        return Array(samples[lower...upper])
     }
 
     private func rebindShapes() {
@@ -2211,16 +2486,40 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         refreshShapeHandles()
     }
 
-    /// Drops every stroke PencilKit added after a selection tap or the start of a
-    /// move, resize, or rotate. A tap that stays on existing ink is not a new sketch,
-    /// even when the committed dot is larger than its rendered bounds suggested.
+    /// Drops strokes PencilKit appended after a selection tap. A snapped shape that
+    /// was already on the canvas is kept, including when its mark still points at it.
     private func removeTapDotIfPresent() {
         guard let cleanup = tapDotCleanup else { return }
-        let strokes = canvas.drawing.strokes
-        guard strokes.count > cleanup.strokeCount else { return }
+        let point = cleanup.point
         tapDotCleanup = nil
-        let kept = Array(strokes[..<cleanup.strokeCount])
-        shapeMarks.removeAll { $0.strokeIndex >= cleanup.strokeCount }
+        dropStrokesAdded(after: cleanup.strokeCount)
+        // PencilKit can append another dot after recording has already started.
+        if let baseline = dictationInkBaseline {
+            tapDotCleanup = (stationaryCanvasAnchor ?? point, baseline)
+        }
+    }
+
+    /// Removes strokes appended after `baseline` without removing a shape's own stroke.
+    private func dropStrokesAdded(after baseline: Int) {
+        let strokes = canvas.drawing.strokes
+        guard strokes.count > baseline else { return }
+        let protected = Set(shapeMarks.map(\.strokeIndex).filter { $0 >= 0 })
+        var kept: [PKStroke] = []
+        var indexMap: [Int: Int] = [:]
+        kept.reserveCapacity(strokes.count)
+        for index in strokes.indices {
+            if index < baseline || protected.contains(index) {
+                indexMap[index] = kept.count
+                kept.append(strokes[index])
+            }
+        }
+        guard kept.count < strokes.count else { return }
+        for mark in shapeMarks.indices {
+            let old = shapeMarks[mark].strokeIndex
+            if let mapped = indexMap[old] {
+                shapeMarks[mark].strokeIndex = mapped
+            }
+        }
         holdLockedStrokes = kept
         penStrokeOpen = false
         isApplyingSmoothedStroke = true
@@ -2334,6 +2633,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
         if isApplyingSmoothedStroke {
             return
+        }
+        if let baseline = dictationInkBaseline {
+            tapDotCleanup = (stationaryCanvasAnchor ?? .zero, baseline)
         }
         if tapDotCleanup != nil {
             removeTapDotIfPresent()
@@ -2562,6 +2864,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         case .began:
             guard !points.isEmpty else { return }
             eraserOpen = true
+            if pendingUndoSnapshot == nil {
+                pendingUndoSnapshot = sketchSnapshot()
+            }
             removeTouchedStrokes(along: points)
             eraseAnnotations(at: samples)
             lastEraserPoint = points.last
@@ -2571,6 +2876,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 return
             }
             eraserOpen = true
+            if pendingUndoSnapshot == nil {
+                pendingUndoSnapshot = sketchSnapshot()
+            }
             var polyline = points
             if let lastEraserPoint {
                 polyline.insert(lastEraserPoint, at: 0)
@@ -2598,6 +2906,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private func finishEraser() {
         eraserOpen = false
         lastEraserPoint = nil
+        if let snapshot = pendingUndoSnapshot {
+            pendingUndoSnapshot = nil
+            if sketchContentDiffers(snapshot, sketchSnapshot()) {
+                registerSketchUndo(snapshot)
+            }
+        }
         haloLink?.isPaused = true
         if let currentSpaceID {
             drawings[currentSpaceID] = canvas.drawing
@@ -2948,11 +3262,13 @@ private extension PencilOverlayView {
     }
 
     func beginLassoTransform(_ hit: LassoBoxHit, at point: CGPoint, box: LassoBox) {
+        let snapshot = sketchSnapshot()
         let lifted = liftStrokes(at: lassoSelection)
         guard !lifted.isEmpty else {
             lassoDrag = nil
             return
         }
+        pendingUndoSnapshot = snapshot
         lassoLifted = lifted
         lassoBaseBox = box
         lassoLiveTransform = .identity
@@ -3111,6 +3427,10 @@ private extension PencilOverlayView {
     }
 
     func commitLiftedStrokes(_ lifted: [LiftedInk], transform: CGAffineTransform) {
+        if let snapshot = pendingUndoSnapshot {
+            pendingUndoSnapshot = nil
+            registerSketchUndo(snapshot)
+        }
         var strokes = canvas.drawing.strokes
         var selection: [Int] = []
         let scale = max(hypot(transform.a, transform.c), 0.001)
@@ -3221,24 +3541,25 @@ private extension PencilOverlayView {
         return points
     }
 
-    /// `extra` is in canvas space and is applied after the stroke's own transform,
-    /// so a scale or turn stays around the object's center instead of the canvas origin.
+    /// `extra` is in canvas space. `concatenating` applies the receiver first, so the
+    /// stroke's own transform runs before the move, scale, or turn.
     func strokeByTransforming(_ stroke: PKStroke, _ extra: CGAffineTransform) -> PKStroke {
         PKStroke(
             ink: stroke.ink,
             path: stroke.path,
-            transform: extra.concatenating(stroke.transform),
+            transform: stroke.transform.concatenating(extra),
             mask: stroke.mask,
             randomSeed: stroke.randomSeed
         )
     }
 
-    /// Moves the object's center to the canvas origin, applies `change`, then moves it back.
-    /// `translatedBy` and `concatenating` apply their argument first, so the center translation is last.
+    /// Scales or turns around `center` in canvas space. `concatenating` applies the
+    /// receiver first, so the center is moved to the origin, changed, then moved back.
+    /// `translatedBy` applies its offset first and would cancel this back to the canvas origin.
     func transform(around center: CGPoint, _ change: CGAffineTransform) -> CGAffineTransform {
-        CGAffineTransform(translationX: center.x, y: center.y)
+        CGAffineTransform(translationX: -center.x, y: -center.y)
             .concatenating(change)
-            .translatedBy(x: -center.x, y: -center.y)
+            .concatenating(CGAffineTransform(translationX: center.x, y: center.y))
     }
 
     func polygonBounds(_ polygon: [CGPoint]) -> CGRect {
@@ -3355,7 +3676,7 @@ final class InkCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
         canCancelContentTouches = false
         clipsToBounds = false
         drawingPolicy = .pencilOnly
-        tool = PKInkingTool(.monoline, color: .black, width: 4)
+        tool = PKInkingTool(.monoline, color: .black, width: StrokeSettings.defaultWidth)
         isAccessibilityElement = false
         accessibilityElementsHidden = true
         keepScrollPanOffDesktopSwipe()
@@ -3768,8 +4089,18 @@ private final class ShapeHandleView: UIView {
 
 /// Pen strokes of at least three samples. Endpoints stay put. The blend radius is `StrokeCenterline.windowRadius`.
 private enum StrokeSmoothing {
+    /// Live monoline ink of tool width `W` is stored as point size `W + 2`.
+    static func pointSize(forToolWidth width: CGFloat) -> CGFloat {
+        width + 2
+    }
+
+    /// Ink whose painted weight matches a stored monoline point size.
+    static func ink(pointSize: CGFloat) -> PKInk {
+        PKInkingTool(.monoline, color: .black, width: max(pointSize - 2, 1)).ink
+    }
+
     /// Nil when the stroke should be kept as PencilKit produced it.
-    static func smoothedPenStroke(from stroke: PKStroke) -> PKStroke? {
+    static func smoothedPenStroke(from stroke: PKStroke, toolWidth: CGFloat) -> PKStroke? {
         let path = stroke.path
         guard path.count >= 3, stroke.ink.inkType == .pen || stroke.ink.inkType == .monoline else { return nil }
         let controls = (0..<path.count).map { path[$0] }
@@ -3781,15 +4112,17 @@ private enum StrokeSmoothing {
                 force: point.force
             )
         })
-        let uniformWidth = controls.map { max($0.size.width, $0.size.height) }.max() ?? 4
-        let uniform = CGSize(width: uniformWidth, height: uniformWidth)
+        let size = pointSize(forToolWidth: toolWidth)
+        let uniform = CGSize(width: size, height: size)
         let points = zip(controls, smoothed).map { original, sample in
-            copy(
-                original,
+            point(
                 location: sample.location,
+                timeOffset: original.timeOffset,
                 size: uniform,
                 opacity: 1,
-                force: 1
+                force: 1,
+                azimuth: 0,
+                altitude: .pi / 2
             )
         }
         let smoothedPath = PKStrokePath(
@@ -3797,7 +4130,7 @@ private enum StrokeSmoothing {
             creationDate: path.creationDate
         )
         return PKStroke(
-            ink: stroke.ink,
+            ink: ink(pointSize: size),
             path: smoothedPath,
             transform: stroke.transform,
             mask: stroke.mask,
@@ -3806,7 +4139,8 @@ private enum StrokeSmoothing {
     }
 
     /// A pen stroke built from samples taken while the Pencil is still down.
-    static func smoothedStroke(from samples: [PKStrokePoint], ink: PKInk) -> PKStroke? {
+    static func smoothedStroke(from samples: [PKStrokePoint], toolWidth: CGFloat) -> PKStroke? {
+        let ink = ink(pointSize: pointSize(forToolWidth: toolWidth))
         guard samples.count >= 3, ink.inkType == .pen || ink.inkType == .monoline else { return nil }
         let raw = PKStroke(
             ink: ink,
@@ -3814,7 +4148,7 @@ private enum StrokeSmoothing {
             transform: .identity,
             mask: nil
         )
-        return smoothedPenStroke(from: raw)
+        return smoothedPenStroke(from: raw, toolWidth: toolWidth)
     }
 
     static func point(
@@ -3862,54 +4196,6 @@ private enum StrokeSmoothing {
             azimuth: azimuth,
             altitude: altitude,
             secondaryScale: 0
-        )
-    }
-
-    /// Keeps time, tilt, and ink extras from the original sample. Only the smoothed
-    /// position and the pressure-driven width move.
-    private static func copy(
-        _ point: PKStrokePoint,
-        location: CGPoint,
-        size: CGSize,
-        opacity: CGFloat,
-        force: CGFloat
-    ) -> PKStrokePoint {
-        if #available(iOS 27, *) {
-            return PKStrokePoint(
-                location: location,
-                timeOffset: point.timeOffset,
-                size: size,
-                opacity: opacity,
-                force: force,
-                azimuth: point.azimuth,
-                altitude: point.altitude,
-                secondaryScale: point.secondaryScale,
-                threshold: point.threshold,
-                lateralJitter: point.lateralJitter
-            )
-        }
-        if #available(iOS 26, *) {
-            return PKStrokePoint(
-                location: location,
-                timeOffset: point.timeOffset,
-                size: size,
-                opacity: opacity,
-                force: force,
-                azimuth: point.azimuth,
-                altitude: point.altitude,
-                secondaryScale: point.secondaryScale,
-                threshold: point.threshold
-            )
-        }
-        return PKStrokePoint(
-            location: location,
-            timeOffset: point.timeOffset,
-            size: size,
-            opacity: opacity,
-            force: force,
-            azimuth: point.azimuth,
-            altitude: point.altitude,
-            secondaryScale: point.secondaryScale
         )
     }
 }
