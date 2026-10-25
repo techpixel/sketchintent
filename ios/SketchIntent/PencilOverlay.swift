@@ -134,21 +134,26 @@ final class SketchCanvas: ObservableObject {
     }
 
     /// Renders the agent's code and places the image on the desktop the sketch came from.
-    func showAgentRender(_ render: AgentRender, placement: AgentPlacement) {
-        overlay?.showAgentRender(render, placement: placement)
+    /// `onPlaced` runs once the image is on the page.
+    func showAgentRender(_ render: AgentRender, placement: AgentPlacement, onPlaced: @escaping () -> Void = {}) {
+        overlay?.showAgentRender(render, placement: placement, onPlaced: onPlaced)
     }
 
-    /// Remembers the sketch that was just sent to the agent.
+    /// Remembers the ink, shapes and voice notes that were just sent, and pulses that ink
+    /// while the agent reads it.
     func markSent() {
         overlay?.markSent()
     }
 
-    /// Clears the ink, shapes and voice notes the agent acted on. Images the agent rendered
-    /// for that sketch stay. A sketch that changed after it was sent, or a different desktop,
-    /// is left alone. Returns true when the page is empty afterwards.
-    @discardableResult
-    func clearSentSketch() -> Bool {
-        overlay?.clearSentSketch() ?? false
+    /// Wipes what the agent read from the page it was drawn on. The agent's images and
+    /// anything added after sending stay. `onEmptied` gets that page's id when nothing is left on it.
+    func wipeSentInk(onEmptied: @escaping (String) -> Void) {
+        overlay?.wipeSentInk(onEmptied: onEmptied)
+    }
+
+    /// The agent stopped without answering. The sent ink stays and stops pulsing.
+    func cancelSent() {
+        overlay?.cancelSent()
     }
 
     fileprivate func attach(_ overlay: PencilOverlayView) {
@@ -608,10 +613,15 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     private var notes: [VoiceNote] = []
     private var notesBySpace: [String: [VoiceNote]] = [:]
     private var openNoteID: UUID?
-    /// The sketch as it was sent to the agent, so only that sketch is cleared when the agent finishes.
-    private var sent: (spaceID: String?, sketch: SketchUndoSnapshot, notes: [VoiceNote])?
-    /// What the agent drew on the sent sketch. Clearing that sketch keeps these.
-    private var agentAdditions: [AgentImage] = []
+    /// What the agent was sent, so only that is wiped once it answers.
+    private struct SentSketch {
+        var spaceID: String?
+        var strokes: [PKStroke]
+        var markIDs: Set<UUID>
+        var noteIDs: Set<UUID>
+    }
+    private var sent: SentSketch?
+    private let readingPulse = UIImageView()
     /// The agent's rendered guesses on this desktop, under the ink.
     private var agentImages: [AgentImage] = []
     private var agentImagesBySpace: [String: [AgentImage]] = [:]
@@ -927,13 +937,142 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     func markSent() {
-        sent = (currentSpaceID, sketchSnapshot(), notes)
-        agentAdditions = []
+        sent = SentSketch(
+            spaceID: currentSpaceID,
+            strokes: canvas.drawing.strokes,
+            markIDs: Set(shapeMarks.map(\.id)),
+            noteIDs: Set(notes.map(\.id))
+        )
+        refreshReadingPulse()
+    }
+
+    func cancelSent() {
+        sent = nil
+        refreshReadingPulse()
+    }
+
+    func wipeSentInk(onEmptied: @escaping (String) -> Void) {
+        guard let sentSketch = sent else { return }
+        // A stroke or drag in progress finishes first, so the wipe never cuts it off.
+        if sentSketch.spaceID == currentSpaceID,
+           penStrokeOpen || eraserOpen || shapeAdjust != nil || strokeAdjust != nil || lassoTransforming {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.wipeSentInk(onEmptied: onEmptied)
+            }
+            return
+        }
+        sent = nil
+        refreshReadingPulse()
+        if let emptied = wipe(sentSketch) {
+            onEmptied(emptied)
+        }
+    }
+
+    /// Returns the page's id when nothing is left on it.
+    private func wipe(_ sentSketch: SentSketch) -> String? {
+        func wasRead(_ stroke: PKStroke) -> Bool {
+            sentSketch.strokes.contains { sameStrokeGeometry([$0], [stroke]) }
+        }
+        guard sentSketch.spaceID == currentSpaceID else {
+            guard let space = sentSketch.spaceID else { return nil }
+            let all = drawings[space]?.strokes ?? []
+            let marks = shapesBySpace[space] ?? []
+            // A shape moved after sending is still one the agent read.
+            let movedShapes = Set(marks.filter { sentSketch.markIDs.contains($0.id) }.map(\.strokeIndex))
+            let strokes = all.enumerated().filter { !movedShapes.contains($0.offset) && !wasRead($0.element) }.map(\.element)
+            drawings[space] = PKDrawing(strokes: strokes)
+            var used = Set<Int>()
+            shapesBySpace[space] = marks.compactMap { mark in
+                guard !sentSketch.markIDs.contains(mark.id),
+                      let index = matchingStrokeIndex(for: mark.shape, in: strokes, excluding: used) else { return nil }
+                used.insert(index)
+                var rebound = mark
+                rebound.strokeIndex = index
+                return rebound
+            }
+            let remainingNotes = (notesBySpace[space] ?? []).filter { !sentSketch.noteIDs.contains($0.id) }
+            notesBySpace[space] = remainingNotes
+            let empty = strokes.isEmpty && remainingNotes.isEmpty && (agentImagesBySpace[space] ?? []).isEmpty
+            return empty ? space : nil
+        }
+        let before = sketchSnapshot()
+        let movedShapes = Set(shapeMarks.filter { sentSketch.markIDs.contains($0.id) }.map(\.strokeIndex))
+        let strokes = canvas.drawing.strokes.enumerated()
+            .filter { !movedShapes.contains($0.offset) && !wasRead($0.element) }
+            .map(\.element)
+        let remainingNotes = notes.filter { !sentSketch.noteIDs.contains($0.id) }
+        guard strokes.count != before.drawing.strokes.count || remainingNotes.count != notes.count else {
+            return nil
+        }
+        registerSketchUndo(before)
+        shapeMarks.removeAll { sentSketch.markIDs.contains($0.id) }
+        notes = remainingNotes
+        if let openNoteID, !notes.contains(where: { $0.id == openNoteID }) {
+            self.openNoteID = nil
+        }
+        selectedShapeID = nil
+        selectedStroke = nil
+        holdLockedStrokes = nil
+        isApplyingSmoothedStroke = true
+        canvas.drawing = PKDrawing(strokes: strokes)
+        isApplyingSmoothedStroke = false
+        rebindShapes()
+        if let currentSpaceID {
+            drawings[currentSpaceID] = canvas.drawing
+            shapesBySpace[currentSpaceID] = shapeMarks
+            notesBySpace[currentSpaceID] = notes
+        }
+        noteLayer.setSaved(notes: notes, openID: openNoteID)
+        canvasViewDrawingDidChange(canvas)
+        publishInk(immediate: true)
+        let empty = strokes.isEmpty && notes.isEmpty && agentImages.isEmpty
+        return empty ? (currentSpaceID ?? "") : nil
+    }
+
+    /// A blue glow under the ink the agent is reading, breathing until it answers.
+    /// It shows only on the page that ink was sent from.
+    private func refreshReadingPulse() {
+        readingPulse.layer.removeAnimation(forKey: "pulse")
+        guard let sent, sent.spaceID == currentSpaceID, !sent.strokes.isEmpty else {
+            readingPulse.isHidden = true
+            readingPulse.image = nil
+            return
+        }
+        let drawing = PKDrawing(strokes: sent.strokes)
+        let strokeBounds = drawing.bounds
+        guard !strokeBounds.isNull, !strokeBounds.isInfinite, strokeBounds.width > 0, strokeBounds.height > 0 else {
+            readingPulse.isHidden = true
+            return
+        }
+        let rect = strokeBounds.insetBy(dx: -24, dy: -24)
+        let scale = max(window?.screen.scale ?? traitCollection.displayScale, 1)
+        let glow = UIColor(named: "AgentBlue") ?? .systemBlue
+        let tinted = UIGraphicsImageRenderer(size: rect.size).image { context in
+            let ink = drawing.literalImage(from: rect, scale: scale)
+            ink.draw(at: .zero)
+            glow.setFill()
+            context.fill(CGRect(origin: .zero, size: rect.size), blendMode: .sourceIn)
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        readingPulse.image = tinted
+        readingPulse.frame = rect
+        readingPulse.isHidden = false
+        CATransaction.commit()
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 0.15
+        pulse.toValue = 0.9
+        pulse.duration = 0.9
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        pulse.isRemovedOnCompletion = false
+        readingPulse.layer.add(pulse, forKey: "pulse")
     }
 
     /// Renders the agent's code at its frame and places the image under the ink, on the
     /// desktop the sketch came from even when another one is showing. One undo removes it.
-    func showAgentRender(_ render: AgentRender, placement: AgentPlacement) {
+    func showAgentRender(_ render: AgentRender, placement: AgentPlacement, onPlaced: @escaping () -> Void) {
         let useScreen = render.space == "screen"
         let origin = (useScreen ? placement.screenOrigin : nil) ?? placement.sketchOrigin
         let perPoint = max((useScreen ? placement.screenPixelsPerPoint : nil) ?? placement.sketchPixelsPerPoint, 0.01)
@@ -952,6 +1091,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             self.agentRenderers.remove(renderer)
             guard let image else { return }
             self.placeAgentImage(AgentImage(id: UUID(), frame: frame, image: image), spaceID: target)
+            onPlaced()
         }
     }
 
@@ -964,11 +1104,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
         registerSketchUndo(sketchSnapshot())
         setAgentImages(agentImages + [image])
-        // The agent's image is not the person changing the sent sketch.
-        if let sentSketch = sent, sentSketch.spaceID == currentSpaceID {
-            sent = (sentSketch.spaceID, sketchSnapshot(), notes)
-            agentAdditions.append(image)
-        }
     }
 
     private func setAgentImages(_ images: [AgentImage]) {
@@ -978,25 +1113,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
         agentImageLayer.show(images)
         reportInk()
-    }
-
-    func clearSentSketch() -> Bool {
-        guard let sent else { return false }
-        self.sent = nil
-        let kept = agentAdditions
-        agentAdditions = []
-        guard sent.spaceID == currentSpaceID, sent.notes == notes, openNoteID == nil,
-              !penStrokeOpen, !sketchContentDiffers(sent.sketch, sketchSnapshot()) else { return false }
-        clearCurrentSketch()
-        notes = []
-        if let currentSpaceID {
-            notesBySpace[currentSpaceID] = []
-        }
-        noteLayer.setSaved(notes: [], openID: nil)
-        // The agent's rendered guess stays, so the person can mark it up and send it back.
-        // It still sits on the frozen picture it was drawn against.
-        setAgentImages(kept)
-        return kept.isEmpty
     }
 
     /// Drops the pen ink and fitted shapes on the desktop that is showing.
@@ -1068,6 +1184,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         agentImageLayer.isUserInteractionEnabled = false
         addSubview(agentImageLayer)
         addSubview(halo)
+        readingPulse.isUserInteractionEnabled = false
+        readingPulse.isHidden = true
+        readingPulse.contentMode = .topLeft
+        readingPulse.layer.shadowColor = (UIColor(named: "AgentBlue") ?? .systemBlue).cgColor
+        readingPulse.layer.shadowOpacity = 1
+        readingPulse.layer.shadowRadius = 8
+        readingPulse.layer.shadowOffset = .zero
+        addSubview(readingPulse)
 
         canvas.frame = bounds
         canvas.autoresizingMask = []
@@ -1323,6 +1447,7 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         noteLayer.setNotice(anchor: nil, text: "")
         noteLayer.setSaved(notes: notes, openID: nil)
         publishInk(immediate: true)
+        refreshReadingPulse()
     }
 
     private func placeLayers() {
@@ -1756,15 +1881,12 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 dictationInkToken = nil
             }
             let point = touch.preciseLocation(in: canvas)
-            if let box = selectedShapeBox(), let hit = lassoBoxHit(at: point, box: box),
-               let index = selectedShapeIndex(), shapeMarks.indices.contains(index) {
+            if let adjust = shapeAdjustHit(at: point) {
                 penHoldItem?.cancel()
                 penHoldSamples = []
                 pendingStrokeTap = nil
                 pendingTranscriptDismiss = nil
-                lassoSelection = [shapeMarks[index].strokeIndex]
-                boxDragStarted = Date()
-                beginLassoTransform(hit, at: point, box: box)
+                beginShapeAdjust(adjust, touch: touch)
                 return
             }
             pendingStrokeTap = nil
@@ -2156,11 +2278,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         return shapeMarks.firstIndex(where: { $0.id == selectedShapeID })
     }
 
-    private func selectedShapeBox() -> LassoBox? {
-        guard let index = selectedShapeIndex(), shapeMarks.indices.contains(index) else { return nil }
-        return LassoBox.fitting(shapeMarks[index].shape)
-    }
-
     private func shapeMarkIndex(for adjust: ShapeAdjust?) -> Int? {
         switch adjust {
         case let .move(index, _):
@@ -2174,20 +2291,21 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         }
     }
 
+    /// Only the selected shape answers, so a stroke drawn near another shape still draws.
     private func shapeAdjustHit(at point: CGPoint) -> ShapeAdjust? {
+        guard let selected = selectedShapeIndex(), shapeMarks.indices.contains(selected) else { return nil }
+        let mark = shapeMarks[selected]
         let rotateCandidate: (distance: CGFloat, index: Int)? = {
-            guard let index = selectedShapeIndex(), shapeMarks.indices.contains(index) else { return nil }
-            let handle = shapeMarks[index].shape.rotateHandle
+            guard mark.shape.showsRotateHandle else { return nil }
+            let handle = mark.shape.rotateHandle
             let distance = hypot(point.x - handle.x, point.y - handle.y)
-            return distance <= Self.rotateHandleRadius ? (distance, index) : nil
+            return distance <= Self.rotateHandleRadius ? (distance, selected) : nil
         }()
         var handleCandidate: (distance: CGFloat, index: Int, handle: Int)?
-        for (index, mark) in shapeMarks.enumerated() {
-            for (handle, location) in mark.shape.handles.enumerated() {
-                let distance = hypot(point.x - location.x, point.y - location.y)
-                if distance <= Self.shapeHandleRadius, handleCandidate == nil || distance < handleCandidate!.distance {
-                    handleCandidate = (distance, index, handle)
-                }
+        for (handle, location) in mark.shape.handles.enumerated() {
+            let distance = hypot(point.x - location.x, point.y - location.y)
+            if distance <= Self.shapeHandleRadius, handleCandidate == nil || distance < handleCandidate!.distance {
+                handleCandidate = (distance, selected, handle)
             }
         }
         switch (rotateCandidate, handleCandidate) {
@@ -2213,17 +2331,9 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         case (nil, nil):
             break
         }
-        var body: (distance: CGFloat, index: Int)?
-        for (index, mark) in shapeMarks.enumerated() {
-            let allowance = max(0, mark.width) / 2 + Self.inkHitPadding
-            let strokeDistance = mark.shape.distance(to: point)
-            guard strokeDistance <= allowance else { continue }
-            if body == nil || strokeDistance < body!.distance {
-                body = (strokeDistance, index)
-            }
-        }
-        if let body {
-            return .move(body.index, point)
+        let allowance = max(0, mark.width) / 2 + Self.inkHitPadding
+        if mark.shape.distance(to: point) <= allowance {
+            return .move(selected, point)
         }
         return nil
     }
@@ -2892,14 +3002,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             }
             return
         }
-        let box = LassoBox.fitting(mark.shape)
-        shapeHandles.handles = []
-        shapeHandles.rotateHandle = nil
-        shapeHandles.rotateAnchor = nil
-        shapeHandles.selectionCorners = box.corners
-        shapeHandles.selectionEdges = box.edgePoints
-        shapeHandles.selectionRotate = box.rotateHandle
-        shapeHandles.selectionRotateAnchor = box.topAnchor
+        // A corrected shape shows its own nodes, not a transform box.
+        shapeHandles.selectionCorners = []
+        shapeHandles.selectionEdges = []
+        shapeHandles.selectionRotate = nil
+        shapeHandles.selectionRotateAnchor = nil
+        shapeHandles.handles = mark.shape.handles
+        shapeHandles.rotateHandle = mark.shape.showsRotateHandle ? mark.shape.rotateHandle : nil
+        shapeHandles.rotateAnchor = mark.shape.showsRotateHandle ? mark.shape.rotateAnchor : nil
     }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {

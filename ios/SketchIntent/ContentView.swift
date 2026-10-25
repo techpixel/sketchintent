@@ -200,9 +200,15 @@ struct ContentView: View {
                 if reply.kind == .done || reply.kind == .error {
                     agentPlacements[reply.id] = nil
                 }
-                if intent.apply(reply), sketch.clearSentSketch() {
-                    frozenBySpace[client.spaceID ?? ""] = nil
-                    frozenBySpace[""] = nil
+                let working = intent.isWorking(on: reply.id)
+                if intent.apply(reply) {
+                    // The agent read the sketch, so its ink goes. Its images stay on the Canvas.
+                    sketch.wipeSentInk { space in
+                        frozenBySpace[space] = nil
+                        frozenBySpace[""] = nil
+                    }
+                } else if working, reply.kind == .error {
+                    sketch.cancelSent()
                 }
             }
             toolSelection.prepare()
@@ -337,17 +343,23 @@ struct ContentView: View {
     }
 
     /// An image from the agent's show_image tool, for a sketch it is still working on.
+    /// It always goes on the Canvas page, at the spot the sketch sat on screen, so the person
+    /// can mark it up there. Once it is on the page, the view moves to the Canvas.
     private func showAgentRender(_ reply: IntentReply) {
         guard intent.isWorking(on: reply.id),
-              let placement = agentPlacements[reply.id],
+              var placement = agentPlacements[reply.id],
               let data = reply.text.data(using: .utf8),
               let render = try? JSONDecoder().decode(AgentRender.self, from: data) else { return }
-        sketch.showAgentRender(render, placement: placement)
+        placement.spaceID = Self.canvasSketchID
+        sketch.showAgentRender(render, placement: placement) {
+            selectSurface(.canvas)
+        }
     }
 
     /// Stops the agent on the iPad and on the Mac.
     private func stopAgent() {
         guard let id = intent.stop() else { return }
+        sketch.cancelSent()
         client.cancelIntent(id)
     }
 

@@ -276,9 +276,9 @@ async function runIntent(turn: number, body: IntentBody, prompt: string, respons
       tool(
         "show_image",
         [
-          "Render code to an image and place it on the person's iPad canvas, under their ink, to get their feedback.",
+          "Render code to an image and add it to the Canvas page on the person's iPad, to get their feedback. The Canvas is a blank page apart from the Mac screen; the iPad switches to it once the image is placed, and the person annotates the image there.",
           "Use it for anything you want them to check: your reading of a sketch you are not confident about, a design you are proposing, or a result to approve before you act.",
-          "Build it in HTML, CSS, SVG, or a canvas script, and place it beside the part of the sketch it interprets.",
+          "Build it in HTML, CSS, SVG, or a canvas script. Coordinates pick the spot on the iPad's screen: the image lands on the Canvas where that part of the sketch sat.",
           "The person corrects it by sketching and adding notes on top, then sends again, and you see the image with their marks in the next sketch.",
           "The page is rendered at the image's size in points, with no scrolling and no network wait, so inline everything it needs.",
         ].join(" "),
@@ -303,7 +303,7 @@ async function runIntent(turn: number, body: IntentBody, prompt: string, respons
             content: [
               {
                 type: "text" as const,
-                text: "The iPad is rendering it on the canvas. The person will mark it up and send it back if it is wrong.",
+                text: "The iPad is adding it to its Canvas page. The person will mark it up there and send it back if it is wrong.",
               },
             ],
           };

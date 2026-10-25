@@ -22,6 +22,17 @@ enum FittedShape: Equatable {
         }
     }
 
+    /// A line turns by its ends and a circle looks the same at any angle, so only
+    /// boxes and curves get a rotate knob.
+    var showsRotateHandle: Bool {
+        switch self {
+        case .square, .rectangle, .curve:
+            return true
+        case .line, .circle:
+            return false
+        }
+    }
+
     func moved(by delta: CGPoint) -> FittedShape {
         switch self {
         case let .line(start, end):
