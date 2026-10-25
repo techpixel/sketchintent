@@ -16,8 +16,8 @@ enum SketchTool: Equatable, CaseIterable {
     /// Clockwise around the old dial. Kept so angles stay stable for every case.
     static let dialOrder: [SketchTool] = [.pen, .eraser, .voice, .lasso]
 
-    /// Top to bottom on the right-edge slider. Dictation is part of the pen.
-    static let edgeOrder: [SketchTool] = [.pen, .eraser, .lasso]
+    /// Top to bottom on the right-edge slider. Dictation is its own tool.
+    static let edgeOrder: [SketchTool] = [.pen, .eraser, .voice, .lasso]
 
     var nextOnDial: SketchTool {
         let order = Self.edgeOrder
@@ -38,7 +38,7 @@ enum SketchTool: Equatable, CaseIterable {
         switch self {
         case .pen: return "Pen"
         case .eraser: return "Eraser"
-        case .voice: return "Voice"
+        case .voice: return "Dictation"
         case .lasso: return "Lasso"
         }
     }
@@ -626,10 +626,10 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         desktopPan?.isEnabled = !accepts
     }
 
-    /// Pen, eraser, and lasso follow the Pencil. The Pencil never drives the Mac.
-    /// Dictation is a Pencil held still in one place while the pen is selected.
+    /// Pen, eraser, dictation, and lasso follow the Pencil. The Pencil never drives the Mac.
+    /// Dictation is the mic tool: a still hold records, and the pen only draws.
     /// A finger on the picture drives the Mac with the pen or the eraser, until the page has ink.
-    /// Lasso keeps the finger off the Mac.
+    /// Dictation and lasso keep the finger off the Mac.
     func apply(tool: SketchTool, strokeWidth: CGFloat = StrokeSettings.defaultWidth) {
         let width = StrokeSettings.clamped(strokeWidth)
         let widthChanged = self.strokeWidth != width
@@ -1188,69 +1188,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
         noteLayer.noteID(at: canvas.convert(canvasPoint, to: noteLayer))
     }
 
-    /// Starts the short wait that distinguishes a tap from a hold. Staying inside
-    /// `voiceSlop` records at this spot. A saved dot keeps the new text. Moving
-    /// off starts a normal pen stroke, which can still snap when the Pencil rests at its end.
-    private func beginStationaryDictation(at point: CGPoint, touch: UITouch, touches: [UITouch]) {
-        if voiceHold?.recording == true {
-            endVoiceHold(commit: true)
-        } else if voiceHold != nil {
-            voiceHoldItem?.cancel()
-            voiceHoldItem = nil
-            voiceHold = nil
-            dotDictation = nil
-        }
-        // The new stroke has to stay on the page until this hold actually arms.
-        dictationInkBaseline = nil
-        dictationInkToken = nil
-        tapDotCleanup = nil
-        penHoldItem?.cancel()
-        penHoldItem = nil
-        pendingStrokeTap = nil
-        selectedShapeID = nil
-        selectedStroke = nil
-        refreshShapeHandles()
-        let count = canvas.drawing.strokes.count
-        let noteID = voiceNoteID(at: point)
-        if let noteID {
-            dotDictation = DotDictation(noteID: noteID, anchor: point, strokeCount: count)
-        } else {
-            dotDictation = nil
-        }
-        stationaryCanvasAnchor = point
-        stationaryInkBaseline = count
-        penHoldSuspended = false
-        penHoldTouch = touch
-        penHoldStart = touch.timestamp
-        penHoldSamples = touches.map { penPoint(from: $0) }
-        penHoldAnchor = point
-        penHoldAnchorIndex = max(penHoldSamples.count - 1, 0)
-        voicePermissions.promptIfUndetermined()
-        recordHaptic.prepare()
-        let token = UUID()
-        let anchor = notes.first(where: { $0.id == noteID })?.anchor ?? canvas.convert(point, to: noteLayer)
-        voiceHold = VoiceHold(token: token, anchor: anchor, targetNoteID: noteID, placesNote: true)
-        let work = DispatchWorkItem { [weak self] in
-            self?.armVoiceHold(token: token)
-        }
-        voiceHoldItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.voiceHoldDelay, execute: work)
-    }
-
-    /// The Pencil moved before dictation armed. The pen stroke stays.
-    private func releaseDictationWatch() {
-        guard voiceHold?.armed != true, voiceHold?.recording != true else { return }
-        voiceHoldItem?.cancel()
-        voiceHoldItem = nil
-        voiceHold = nil
-        dotDictation = nil
-        stationaryCanvasAnchor = nil
-        stationaryInkBaseline = nil
-        dictationInkBaseline = nil
-        dictationInkToken = nil
-        tapDotCleanup = nil
-    }
-
     /// Drops the speck from a Pencil that stayed still, without cancelling that touch.
     /// Disabling PencilKit's drawing gesture here ends the touch, and the cancelled
     /// hold never reaches `startVoiceRecording`.
@@ -1456,9 +1393,8 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
     }
 
     /// Records the pen stroke under the Pencil. Resting at the end of a moving stroke corrects it.
-    /// Resting in one place starts dictation. A tap on a voice-note dot shows its transcript.
-    /// A tap off an open transcript hides it. A short tap on a snapped shape selects it.
-    /// A drag that starts on empty canvas still draws a new stroke.
+    /// A short tap on a voice-note dot shows its transcript. A tap off an open transcript hides it.
+    /// Dictation itself is the mic tool. A drag that starts on empty canvas still draws a new stroke.
     private func trackPenHold(phase: UITouch.Phase, touches: [UITouch]) {
         guard penToolIsDrawing, let touch = touches.last else { return }
         switch phase {
@@ -1486,24 +1422,13 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             if openNoteID != nil {
                 pendingTranscriptDismiss = PendingTranscriptDismiss(point: point, time: touch.timestamp)
             }
-            beginStationaryDictation(at: point, touch: touch, touches: touches)
+            penHoldTouch = touch
+            penHoldStart = touch.timestamp
+            penHoldSamples = touches.map { penPoint(from: $0) }
+            penHoldAnchor = point
+            penHoldAnchorIndex = max(penHoldSamples.count - 1, 0)
+            schedulePenHold()
         case .moved:
-            if voiceHold?.placesNote == true || dotDictation != nil {
-                if voiceHold?.armed == true || voiceHold?.recording == true {
-                    return
-                }
-                let point = touch.preciseLocation(in: canvas)
-                penHoldTouch = touch
-                penHoldSamples.append(contentsOf: touches.map { penPoint(from: $0) })
-                let anchor = stationaryCanvasAnchor ?? point
-                if hypot(point.x - anchor.x, point.y - anchor.y) > Self.voiceSlop {
-                    releaseDictationWatch()
-                    penHoldAnchor = point
-                    penHoldAnchorIndex = max(penHoldSamples.count - 1, 0)
-                    schedulePenHold()
-                }
-                return
-            }
             if shapeAdjust != nil {
                 updateShapeAdjust(to: touch.preciseLocation(in: canvas))
                 return
@@ -1535,33 +1460,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 schedulePenHold()
             }
         case .ended:
-            if voiceHold?.placesNote == true || dotDictation != nil || voiceHold?.targetNoteID != nil {
-                let noteID = dotDictation?.noteID ?? voiceHold?.targetNoteID
-                let recording = voiceHold?.recording == true
-                let dismiss = pendingTranscriptDismiss
-                let tapBaseline = stationaryInkBaseline
-                let point = touch.preciseLocation(in: canvas)
-                endVoiceHold(commit: recording)
-                pendingTranscriptDismiss = nil
-                if !recording, let noteID {
-                    openSavedNote(noteID)
-                } else if !recording,
-                          let dismiss,
-                          openNoteID != nil,
-                          hypot(point.x - dismiss.point.x, point.y - dismiss.point.y) <= Self.strokeTapSlop {
-                    openNoteID = nil
-                    noteLayer.setSaved(notes: notes, openID: nil)
-                    if dictationInkBaseline == nil, let tapBaseline {
-                        tapDotCleanup = (point, tapBaseline)
-                        removeTapDotIfPresent()
-                        if drawingGestureOpen {
-                            tapDotCleanup = (point, tapBaseline)
-                        }
-                    }
-                }
-                clearPenHoldTracking()
-                return
-            }
             if shapeAdjust != nil {
                 let baseline = shapeTapBaseline
                 finishShapeAdjust()
@@ -1578,6 +1476,14 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
                 return
             }
             let point = touch.preciseLocation(in: canvas)
+            let down = penHoldAnchor ?? point
+            if hypot(point.x - down.x, point.y - down.y) <= Self.strokeTapSlop,
+               let noteID = voiceNoteID(at: point) {
+                pendingTranscriptDismiss = nil
+                openSavedNote(noteID)
+                clearPenHoldTracking()
+                return
+            }
             var hideTranscript = false
             if let dismiss = pendingTranscriptDismiss {
                 pendingTranscriptDismiss = nil
@@ -1606,9 +1512,6 @@ final class PencilOverlayView: UIView, PKCanvasViewDelegate {
             clearPenHoldTracking()
         case .cancelled:
             if committingPenHold { return }
-            if voiceHold?.placesNote == true || dotDictation != nil || voiceHold?.targetNoteID != nil {
-                endVoiceHold(commit: false)
-            }
             pendingTranscriptDismiss = nil
             if shapeAdjust != nil {
                 let baseline = shapeTapBaseline

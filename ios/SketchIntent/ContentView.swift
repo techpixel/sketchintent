@@ -73,9 +73,10 @@ struct ContentView: View {
     }
 
     /// A finger drives the Mac with the pen or the eraser, until this desktop has a sketch.
-    /// Lasso keeps the finger off the Mac. A Pencil touch never uses it.
+    /// Dictation and lasso keep the finger off the Mac. A Pencil touch never uses it.
     private var sendsFingerPointer: Bool {
         !sketch.hasInk
+            && tool != .voice
             && tool != .lasso
             && hasCapturedFrameSize
             && canvasReady
